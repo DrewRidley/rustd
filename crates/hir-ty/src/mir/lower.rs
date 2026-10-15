@@ -2039,7 +2039,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Some(it) => it.as_ref(),
             None => {
                 // FIXME: rustc's ty is dependent on the adt type, maybe we need to do that as well
-                let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
+                let int_ty = if crate::mir::codegen::is_wasm32() {
+                    rustc_type_ir::IntTy::I64
+                } else {
+                    rustc_type_ir::IntTy::I128
+                };
+                let discr_ty = Ty::new_int(self.interner(), int_ty);
                 let tmp: Place<'_> = self
                     .temp(discr_ty, current, MirSpan::Unknown)
                     .expect("discr_ty is never unsized")

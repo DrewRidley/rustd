@@ -368,6 +368,10 @@ pub(super) struct Patch {
 
 /// An object that defines nothing.
 pub(super) fn empty_object() -> Result<Vec<u8>> {
+    if super::is_wasm32() {
+        return super::wasm::WasmObjectBuilder::default()
+            .finish(&cranelift_module::ModuleDeclarations::default());
+    }
     let builder =
         ObjectBuilder::new(target()?.clone(), "rustd", cranelift_module::default_libcall_names())?;
     ObjectModule::new(builder).finish().emit().map_err(|e| CodegenError::Backend(e.to_string()))

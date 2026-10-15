@@ -65,6 +65,30 @@ use super::{
 mod shim;
 
 macro_rules! from_bytes {
+    (usize, $value:expr) => {{
+        let val: &[u8] = &($value);
+        if let Ok(b) = <[u8; 4]>::try_from(val) {
+            u32::from_le_bytes(b) as usize
+        } else if let Ok(b) = <[u8; size_of::<usize>()]>::try_from(val) {
+            usize::from_le_bytes(b)
+        } else {
+            return Err(MirEvalError::InternalError(
+                "mismatched size in constructing usize".into(),
+            ));
+        }
+    }};
+    (isize, $value:expr) => {{
+        let val: &[u8] = &($value);
+        if let Ok(b) = <[u8; 4]>::try_from(val) {
+            i32::from_le_bytes(b) as isize
+        } else if let Ok(b) = <[u8; size_of::<isize>()]>::try_from(val) {
+            isize::from_le_bytes(b)
+        } else {
+            return Err(MirEvalError::InternalError(
+                "mismatched size in constructing isize".into(),
+            ));
+        }
+    }};
     ($ty:tt, $value:expr) => {
         ($ty::from_le_bytes(match ($value).try_into() {
             Ok(it) => it,
@@ -258,7 +282,12 @@ impl Interval {
         memory: &mut Evaluator<'a, 'db>,
         bytes: &[u8],
     ) -> Result<'db, ()> {
-        memory.write_memory(self.addr, bytes)
+        let slice = if bytes.len() > self.size && self.size > 0 {
+            &bytes[..self.size]
+        } else {
+            bytes
+        };
+        memory.write_memory(self.addr, slice)
     }
 
     fn write_from_interval<'a, 'db>(
@@ -310,14 +339,7 @@ impl IntervalOrOwned {
     }
 }
 
-#[cfg(target_pointer_width = "64")]
-const STACK_OFFSET: usize = 1 << 60;
-#[cfg(target_pointer_width = "64")]
-const HEAP_OFFSET: usize = 1 << 59;
-
-#[cfg(target_pointer_width = "32")]
 const STACK_OFFSET: usize = 1 << 30;
-#[cfg(target_pointer_width = "32")]
 const HEAP_OFFSET: usize = 1 << 29;
 
 impl Address {
@@ -335,8 +357,12 @@ impl Address {
         }
     }
 
-    fn to_bytes(&self) -> [u8; size_of::<usize>()] {
-        usize::to_le_bytes(self.to_usize())
+    fn to_bytes(&self) -> Vec<u8> {
+        if crate::mir::codegen::is_wasm32() {
+            (self.to_usize() as u32).to_le_bytes().to_vec()
+        } else {
+            usize::to_le_bytes(self.to_usize()).to_vec()
+        }
     }
 
     fn to_usize(&self) -> usize {
@@ -514,9 +540,6 @@ const EXECUTION_LIMIT: usize = 10_000_000;
 impl<'db> Evaluator<'db, 'db> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
-        if self.ptr_size() != size_of::<usize>() {
-            not_supported!("targets with different pointer size from host");
-        }
         let interval = self.interpret_mir(body, None.into_iter())?;
         let bytes = interval.get(self)?;
         let mut memory_map = self.create_memory_map(
@@ -1384,7 +1407,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let ty = self.place_ty(p, locals)?;
                 let bytes = self.eval_place(p, locals)?.get(self)?;
                 let result = self.compute_discriminant(ty, bytes)?;
-                Owned(result.to_le_bytes().to_vec())
+                if crate::mir::codegen::is_wasm32() {
+                    Owned((result as i64).to_le_bytes().to_vec())
+                } else {
+                    Owned(result.to_le_bytes().to_vec())
+                }
             }
             Rvalue::Repeat(it, len) => {
                 let len = match try_const_usize(self.db, len.as_ref()) {
@@ -2342,7 +2369,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 return Err(MirEvalError::StackOverflow);
             }
             if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind()
-                && let Some(addr) = bytes.get(..size_of::<usize>())
+                && let Some(addr) = bytes.get(..this.ptr_size())
             {
                 let addr = from_bytes!(usize, addr);
                 let pointee = this.static_memory.iter().find(|&&(start, size, _)| {
@@ -2369,7 +2396,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ) => {}
                 TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
                 TyKind::RawPtr(..) => {
-                    let Some(addr) = bytes.get(..size_of::<usize>()) else { return Ok(()) };
+                    let Some(addr) = bytes.get(..this.ptr_size()) else { return Ok(()) };
                     let addr = from_bytes!(usize, addr);
                     let allocation = this.allocations.iter().find_map(|allocations| {
                         let i = allocations.partition_point(|&(start, _)| start <= addr);
@@ -2538,10 +2565,10 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     // the address of something is taken to be one.
                     AdtId::UnionId(_) => {
                         let layout = this.layout(ty)?;
-                        if layout.align.abi.bytes_usize().is_multiple_of(size_of::<usize>()) {
+                        if layout.align.abi.bytes_usize().is_multiple_of(this.ptr_size()) {
                             let pointer =
                                 Ty::new_imm_ptr(this.interner(), Ty::new_unit(this.interner()));
-                            for word in bytes.chunks_exact(size_of::<usize>()) {
+                            for word in bytes.chunks_exact(this.ptr_size()) {
                                 rec(this, word, pointer, locals, mm, stack_depth_limit - 1)?;
                             }
                         }
@@ -2579,14 +2606,15 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     ) -> Result<'db, ()> {
         let layout = self.layout(ty)?;
         let my_size = self.size_of_sized(ty, locals, "value to patch address")?;
+        let ps = self.ptr_size();
         use rustc_type_ir::TyKind;
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
-            let current = from_bytes!(usize, self.read_memory(addr, size_of::<usize>())?);
+            let current = from_bytes!(usize, self.read_memory(addr, ps)?);
             if let Some((id, offset)) = source.static_at(current) {
                 let location = self.eval_static(id, locals)?;
-                let start = from_bytes!(usize, self.read_memory(location, size_of::<usize>())?);
-                return self.write_memory(addr, &(start + offset).to_le_bytes());
+                let start = from_bytes!(usize, self.read_memory(location, ps)?);
+                return self.write_memory(addr, &(start + offset).to_le_bytes()[..ps]);
             }
         }
         match ty.kind() {
@@ -2597,7 +2625,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let current = from_bytes!(usize, self.read_memory(addr, my_size)?);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &it.to_le_bytes())?;
+                                self.write_memory(addr, &it.to_le_bytes()[..ps])?;
                                 *it
                             }
                             None => current,
@@ -2618,14 +2646,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let current = from_bytes!(usize, current);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &it.to_le_bytes())?;
+                                self.write_memory(addr, &it.to_le_bytes()[..ps])?;
                                 *it
                             }
                             None => current,
                         };
                         let patched = Address::from_usize(patched);
                         if let TyKind::Slice(inner) = t.kind() {
-                            let len = from_bytes!(usize, metadata);
+                            let len = from_bytes!(usize, &metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;
                             for i in 0..len {
                                 self.patch_addresses(
@@ -2646,17 +2674,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             }
             // A raw pointer can point anywhere into the allocation that was kept for it.
             TyKind::RawPtr(..) => {
-                let current = from_bytes!(usize, self.read_memory(addr, size_of::<usize>())?);
+                let current = from_bytes!(usize, self.read_memory(addr, ps)?);
                 if let Some((start, _)) = source.memory_at(current)
                     && let Some(new_start) = patch_map.get(&start)
                 {
-                    self.write_memory(addr, &(new_start + (current - start)).to_le_bytes())?;
+                    self.write_memory(addr, &(new_start + (current - start)).to_le_bytes()[..ps])?;
                 }
             }
             TyKind::FnPtr(_, _) => {
                 let ty = ty_of_bytes(self.read_memory(addr, my_size)?)?;
                 let new_id = self.vtable_map.id(ty);
-                self.write_memory(addr, &new_id.to_le_bytes())?;
+                self.write_memory(addr, &new_id.to_le_bytes()[..ps])?;
             }
             TyKind::Adt(id, args) => match id.def_id() {
                 AdtId::StructId(s) => {

@@ -70,6 +70,8 @@ struct Args {
     cfg_test: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
+    /// Target triple (e.g. `wasm32-unknown-unknown`).
+    target: Option<String>,
 }
 
 impl Args {
@@ -98,6 +100,7 @@ impl Args {
         let mut isolate = None;
         let mut cfg_test = false;
         let mut features = Vec::new();
+        let mut target = None;
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -114,6 +117,7 @@ impl Args {
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
+                "--target" => target = Some(value()?),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
             }
@@ -133,6 +137,7 @@ impl Args {
             isolate,
             cfg_test,
             features,
+            target,
         })
     }
 }
@@ -1277,6 +1282,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             isolate: None,
             cfg_test: args.cfg_test,
             features: args.features.clone(),
+            target: args.target.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
@@ -1362,6 +1368,9 @@ fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket));
     }
     let args = Args::parse()?;
+    if args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
+        hir_ty::mir::codegen::WASM32_TARGET.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
@@ -1379,6 +1388,7 @@ fn main() -> anyhow::Result<()> {
     let cargo_config = CargoConfig {
         sysroot: Some(RustLibSource::Discover),
         set_test: args.cfg_test,
+        target: args.target.clone(),
         features: CargoFeatures::Selected {
             features: args.features.clone(),
             no_default_features: false,

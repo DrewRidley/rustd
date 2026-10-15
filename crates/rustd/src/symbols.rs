@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
 use rustc_hash::FxHashMap;
 
@@ -171,6 +170,10 @@ impl SymbolTable {
         names: &mut Vec<String>,
         seen: &mut rustc_hash::FxHashSet<String>,
     ) {
+        if data.starts_with(b"\0asm\x01\x00\x00\x00") {
+            Self::collect_wasm_names(data, names, seen);
+            return;
+        }
         // rlibs also hold `lib.rmeta`, which isn't an object file.
         let Ok(object) = object::File::parse(data) else { return };
         let is_macho = object.format() == object::BinaryFormat::MachO;
@@ -184,19 +187,175 @@ impl SymbolTable {
             }
             let Ok(name) = symbol.name() else { continue };
             let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
-            // The memory a static points to is a symbol that demangles to the static's path.
-            let is_v0 = name.starts_with("_R") && !name.starts_with("_RNn");
-            let is_legacy = name.starts_with("_ZN")
-                && name.ends_with('E')
-                && name.len() > 20
-                && &name.as_bytes()[name.len() - 20..name.len() - 17] == b"17h";
-            if !is_v0 && !is_legacy {
-                continue;
+            Self::push_rust_symbol(name, names, seen);
+        }
+    }
+
+    fn push_rust_symbol(
+        name: &str,
+        names: &mut Vec<String>,
+        seen: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        // The memory a static points to is a symbol that demangles to the static's path.
+        let is_v0 = name.starts_with("_R") && !name.starts_with("_RNn");
+        let is_legacy = name.starts_with("_ZN")
+            && name.ends_with('E')
+            && name.len() > 20
+            && &name.as_bytes()[name.len() - 20..name.len() - 17] == b"17h";
+        if !is_v0 && !is_legacy {
+            return;
+        }
+        let base = without_instantiating_crate(name);
+        if seen.insert(base.to_owned()) {
+            names.push(name.to_owned());
+        }
+    }
+
+    fn collect_wasm_names(
+        data: &[u8],
+        names: &mut Vec<String>,
+        seen: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        fn read_uleb(buf: &[u8], pos: &mut usize) -> Option<u32> {
+            let mut res = 0u32;
+            let mut shift = 0u32;
+            loop {
+                let &byte = buf.get(*pos)?;
+                *pos += 1;
+                res |= u32::from(byte & 0x7f).checked_shl(shift)?;
+                if byte & 0x80 == 0 {
+                    return Some(res);
+                }
+                shift += 7;
+                if shift >= 35 {
+                    return None;
+                }
             }
-            let base = without_instantiating_crate(name);
-            if seen.insert(base.to_owned()) {
-                names.push(name.to_owned());
+        }
+        fn read_str<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+            let len = read_uleb(buf, pos)? as usize;
+            let s = std::str::from_utf8(buf.get(*pos..*pos + len)?).ok()?;
+            *pos += len;
+            Some(s)
+        }
+
+        let mut pos = 8;
+        let mut func_imports = Vec::new();
+        let mut global_imports = Vec::new();
+        while pos < data.len() {
+            let Some(&sec_id) = data.get(pos) else { break };
+            pos += 1;
+            let Some(sec_len) = read_uleb(data, &mut pos) else { break };
+            let sec_end = pos.saturating_add(sec_len as usize);
+            if sec_end > data.len() {
+                break;
             }
+            if sec_id == 2 {
+                // Import section
+                let mut p = pos;
+                if let Some(count) = read_uleb(data, &mut p) {
+                    for _ in 0..count {
+                        let Some(_mod_name) = read_str(data, &mut p) else { break };
+                        let Some(field_name) = read_str(data, &mut p) else { break };
+                        let Some(&kind) = data.get(p) else { break };
+                        p += 1;
+                        match kind {
+                            0 => {
+                                let _ = read_uleb(data, &mut p);
+                                func_imports.push(field_name);
+                            }
+                            1 => {
+                                p += 1; // elem_type
+                                let Some(flags) = read_uleb(data, &mut p) else { break };
+                                let _ = read_uleb(data, &mut p);
+                                if flags & 1 != 0 {
+                                    let _ = read_uleb(data, &mut p);
+                                }
+                            }
+                            2 => {
+                                let Some(flags) = read_uleb(data, &mut p) else { break };
+                                let _ = read_uleb(data, &mut p);
+                                if flags & 1 != 0 {
+                                    let _ = read_uleb(data, &mut p);
+                                }
+                            }
+                            3 => {
+                                p += 2; // valtype + mutability
+                                global_imports.push(field_name);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            } else if sec_id == 0 {
+                let mut p = pos;
+                if let Some(sec_name) = read_str(data, &mut p)
+                    && sec_name == "linking"
+                {
+                    let _version = read_uleb(data, &mut p);
+                    while p < sec_end {
+                        let Some(&sub_ty) = data.get(p) else { break };
+                        p += 1;
+                        let Some(sub_len) = read_uleb(data, &mut p) else { break };
+                        let sub_end = p.saturating_add(sub_len as usize);
+                        if sub_end > sec_end {
+                            break;
+                        }
+                        if sub_ty == 8 {
+                            // WASM_SYMBOL_TABLE
+                            let mut sp = p;
+                            if let Some(count) = read_uleb(data, &mut sp) {
+                                for _ in 0..count {
+                                    let Some(&kind) = data.get(sp) else { break };
+                                    sp += 1;
+                                    let Some(flags) = read_uleb(data, &mut sp) else { break };
+                                    let is_undef = (flags & 0x10) != 0;
+                                    let is_local = (flags & 0x02) != 0;
+                                    let explicit_name = (flags & 0x40) != 0;
+                                    let sym_name = match kind {
+                                        0 | 2 | 4 | 5 => {
+                                            let Some(idx) = read_uleb(data, &mut sp) else { break };
+                                            if !is_undef || explicit_name {
+                                                let Some(s) = read_str(data, &mut sp) else {
+                                                    break;
+                                                };
+                                                Some(s)
+                                            } else if kind == 0 {
+                                                func_imports.get(idx as usize).copied()
+                                            } else if kind == 2 {
+                                                global_imports.get(idx as usize).copied()
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        1 => {
+                                            let Some(s) = read_str(data, &mut sp) else { break };
+                                            if !is_undef {
+                                                let _ = read_uleb(data, &mut sp);
+                                                let _ = read_uleb(data, &mut sp);
+                                                let _ = read_uleb(data, &mut sp);
+                                            }
+                                            Some(s)
+                                        }
+                                        3 => {
+                                            let _ = read_uleb(data, &mut sp);
+                                            None
+                                        }
+                                        _ => break,
+                                    };
+                                    if (!is_local || is_undef)
+                                        && let Some(name) = sym_name
+                                    {
+                                        Self::push_rust_symbol(name, names, seen);
+                                    }
+                                }
+                            }
+                        }
+                        p = sub_end;
+                    }
+                }
+            }
+            pos = sec_end;
         }
     }
 
