@@ -1,0 +1,5055 @@
+//! Differential-test corpus. Every `pub fn` here is compiled by rustd and called from the
+//! rustc-built `runner`; the output must match an all-rustc build.
+//!
+//! One module per backend feature area, so a bisected culprit names the area.
+#![feature(box_patterns)]
+
+pub mod scalars {
+    pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
+        let (product, overflow) = a.overflowing_mul(b);
+        (product, overflow, c.checked_mul(a as i128), (a >> 64).checked_mul(b >> 64))
+    }
+    pub fn arith(a: u32, b: u32) -> u32 {
+        (a + b) * 3 - (a / (b | 1)) % 7
+    }
+    pub fn signed(a: i64, b: i64) -> i64 {
+        (a - b) / 3 + (a % 5) - (b >> 2) + (a << 3)
+    }
+    pub fn bits(a: u16, b: u8) -> u16 {
+        (a ^ 0x5555) & !(b as u16) | (a >> (b & 7))
+    }
+    pub fn casts(a: i8, b: u64) -> (i64, u8, i32, u16) {
+        (a as i64, b as u8, a as i32 + b as i32, a as u16)
+    }
+    pub fn wrapping(a: u64, b: u64) -> u64 {
+        a.wrapping_mul(b).wrapping_add(a.rotate_left(7)) ^ b.wrapping_sub(a)
+    }
+    pub fn checked(a: u32, b: u32) -> (Option<u32>, Option<u32>, u32) {
+        (a.checked_add(b), a.checked_sub(b), a.saturating_sub(b))
+    }
+    pub fn wide(a: u128, b: u64) -> u128 {
+        a.wrapping_mul(b as u128) + 1
+    }
+    pub fn compare(a: i32, b: i32) -> (bool, bool, bool, bool) {
+        (a < b, a == b, a >= b, a != b)
+    }
+    pub fn counting(a: u64) -> (u32, u32, u32) {
+        (a.count_ones(), a.leading_zeros(), a.trailing_zeros())
+    }
+}
+
+pub mod control {
+    pub fn collatz(mut n: u64) -> u32 {
+        let mut steps = 0;
+        while n != 1 {
+            n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 };
+            steps += 1;
+        }
+        steps
+    }
+    pub fn classify(n: i32) -> &'static str {
+        match n {
+            i32::MIN..=-1 => "negative",
+            0 => "zero",
+            1..=9 => "small",
+            _ => "large",
+        }
+    }
+    pub fn nested(n: u32) -> u32 {
+        let mut acc = 0;
+        for i in 0..n {
+            for j in 0..i {
+                if (i + j) % 3 == 0 {
+                    continue;
+                }
+                acc += i * j;
+                if acc > 10_000 {
+                    return acc;
+                }
+            }
+        }
+        acc
+    }
+    pub fn fib(n: u32) -> u64 {
+        if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) }
+    }
+}
+
+pub mod aggregates {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Small(pub u8, pub u16);
+    #[derive(Debug, Clone, Copy)]
+    pub struct Pair { pub a: u32, pub b: u64 }
+    #[derive(Debug, Clone, Copy)]
+    pub struct Big { pub a: u64, pub b: [u32; 5], pub c: i8 }
+    #[derive(Debug, Clone, Copy)]
+    pub struct Odd(pub u8, pub u8, pub u8);
+
+    pub fn small(s: Small) -> Small {
+        Small(s.0 + 1, s.1 * 2)
+    }
+    pub fn pair(p: Pair, k: u32) -> Pair {
+        Pair { a: p.a ^ k, b: p.b + k as u64 }
+    }
+    pub fn big(b: &Big, k: u32) -> Big {
+        Big { a: b.a + 1, b: [b.b[0], k, b.b[2] + k, b.b[4], b.b[1]], c: -b.c }
+    }
+    pub fn big_by_value(mut b: Big) -> Big {
+        b.b[3] = b.a as u32;
+        b
+    }
+    pub fn odd(o: Odd) -> Odd {
+        Odd(o.2, o.0, o.1)
+    }
+    pub fn tuple(t: (u8, u32, u64)) -> (u64, u8, u32) {
+        (t.2 + 1, t.0 + 1, t.1 + 1)
+    }
+    pub fn array(a: [u16; 4]) -> [u16; 4] {
+        [a[3], a[2], a[1], a[0] + 1]
+    }
+    pub fn nested_field(p: &(Pair, Small)) -> u64 {
+        p.0.b + p.1.1 as u64
+    }
+    pub fn mutate(p: &mut Pair) {
+        p.a += 1;
+        p.b *= 2;
+    }
+}
+
+pub mod enums {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum Plain { A, B, C }
+    #[derive(Debug, Clone, Copy)]
+    pub enum Explicit { Low = 3, Mid = 70, High = 200 }
+    #[derive(Debug, Clone, Copy)]
+    pub enum Data { Unit, One(u32), Two { a: u8, b: u64 } }
+    #[derive(Debug)]
+    pub enum HexError { Invalid { c: char, index: usize }, OddLength, BadLength }
+
+    pub fn plain(n: u32) -> Plain {
+        match n % 3 { 0 => Plain::A, 1 => Plain::B, _ => Plain::C }
+    }
+    pub fn plain_back(p: Plain) -> u32 {
+        match p { Plain::A => 10, Plain::B => 20, Plain::C => 30 }
+    }
+    pub fn explicit(e: Explicit) -> u8 {
+        e as u8
+    }
+    pub fn data(n: u32) -> Data {
+        match n { 0 => Data::Unit, 1..=9 => Data::One(n * 2), _ => Data::Two { a: n as u8, b: n as u64 * 3 } }
+    }
+    pub fn data_back(d: Data) -> u64 {
+        match d { Data::Unit => 0, Data::One(x) => x as u64, Data::Two { a, b } => a as u64 + b }
+    }
+    pub fn option(n: u32) -> Option<u32> {
+        if n % 2 == 0 { Some(n / 2) } else { None }
+    }
+    pub fn option_ref(v: &Option<u64>) -> u64 {
+        match v { Some(x) => *x + 1, None => 0 }
+    }
+    pub fn niche_ref<'a>(flag: bool, v: &'a u32) -> Option<&'a u32> {
+        if flag { Some(v) } else { None }
+    }
+    pub fn niche_bool(n: u8) -> Option<bool> {
+        match n { 0 => None, 1 => Some(false), _ => Some(true) }
+    }
+    pub fn niche_bool_back(v: Option<bool>) -> u8 {
+        match v { None => 0, Some(false) => 1, Some(true) => 2 }
+    }
+    pub fn nested_niche(c: u8, index: usize) -> Result<u8, HexError> {
+        match c {
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'!' => Err(HexError::OddLength),
+            b'?' => Err(HexError::BadLength),
+            _ => Err(HexError::Invalid { c: c as char, index }),
+        }
+    }
+    pub fn nested_niche_back(r: &Result<u8, HexError>) -> u64 {
+        match r {
+            Ok(v) => *v as u64,
+            Err(HexError::OddLength) => 1000,
+            Err(HexError::BadLength) => 2000,
+            Err(HexError::Invalid { c, index }) => *c as u64 * 10_000 + *index as u64,
+        }
+    }
+    pub fn result(n: i32) -> Result<u32, i64> {
+        if n >= 0 { Ok(n as u32) } else { Err(n as i64 * 2) }
+    }
+    pub fn ordering(a: u32, b: u32) -> core::cmp::Ordering {
+        a.cmp(&b)
+    }
+}
+
+pub mod slices {
+    pub fn sum(xs: &[u32]) -> u64 {
+        let mut total = 0;
+        let mut i = 0;
+        while i < xs.len() {
+            total += xs[i] as u64;
+            i += 1;
+        }
+        total
+    }
+    pub fn sum_iter(xs: &[u32]) -> u64 {
+        let mut total = 0;
+        for x in xs {
+            total += *x as u64;
+        }
+        total
+    }
+    pub fn first_last(xs: &[u8]) -> Option<(u8, u8)> {
+        match xs {
+            [] => None,
+            [only] => Some((*only, *only)),
+            [first, .., last] => Some((*first, *last)),
+        }
+    }
+    pub fn reverse(xs: &mut [u16]) {
+        let n = xs.len();
+        let mut i = 0;
+        while i < n / 2 {
+            let tmp = xs[i];
+            xs[i] = xs[n - 1 - i];
+            xs[n - 1 - i] = tmp;
+            i += 1;
+        }
+    }
+    pub fn tail(xs: &[u32]) -> &[u32] {
+        &xs[1..]
+    }
+    pub fn window(xs: &[u32], from: usize, to: usize) -> u64 {
+        sum(&xs[from..to])
+    }
+    pub fn str_len(s: &str) -> usize {
+        s.len()
+    }
+    pub fn bytes_hash(s: &str) -> u32 {
+        let mut hash = 5381u32;
+        for b in s.as_bytes() {
+            hash = hash.wrapping_mul(33) ^ *b as u32;
+        }
+        hash
+    }
+    pub fn literal(n: u8) -> &'static str {
+        if n == 0 { "zero" } else { "nonzero" }
+    }
+    pub fn array_slice(a: &[u32; 6]) -> u64 {
+        sum(a) + sum(&a[2..4])
+    }
+    pub fn get(xs: &[u64], i: usize) -> Option<u64> {
+        xs.get(i).copied()
+    }
+    pub fn is_ascii_digit_run(s: &[u8]) -> usize {
+        s.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+}
+
+pub mod pointers {
+    pub struct Cursor { pub start: *const u8, pub end: *const u8 }
+
+    /// Ordering on raw pointers: RA used to lower this to a self-recursive `PartialOrd::lt`.
+    pub fn peek(c: &Cursor) -> Option<u8> {
+        if c.start < c.end { Some(unsafe { *c.start }) } else { None }
+    }
+    pub fn compare(a: *const u32, b: *const u32) -> (bool, bool, bool, bool) {
+        (a < b, a >= b, a == b, a != b)
+    }
+    pub fn advance(c: &mut Cursor, n: usize) -> usize {
+        c.start = unsafe { c.start.add(n) };
+        unsafe { c.end.offset_from(c.start) as usize }
+    }
+    pub fn write(p: *mut u64, v: u64) -> u64 {
+        unsafe {
+            let old = *p;
+            *p = v;
+            old
+        }
+    }
+}
+
+pub mod consts {
+    pub const LIMIT: u32 = 40 + 2;
+    pub static TABLE: [u8; 8] = [1, 1, 2, 3, 5, 8, 13, 21];
+    const NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
+    pub struct Config { pub scale: u32, pub name: &'static str }
+    const CONFIG: Config = Config { scale: 9, name: "cfg" };
+
+    pub fn limit(n: u32) -> u32 {
+        n.min(LIMIT)
+    }
+    pub fn table(i: usize) -> u8 {
+        TABLE[i % TABLE.len()]
+    }
+    pub fn name(i: usize) -> &'static str {
+        NAMES[i % 3]
+    }
+    pub fn config(n: u32) -> (u32, &'static str) {
+        (n * CONFIG.scale, CONFIG.name)
+    }
+    pub fn local_array(i: usize) -> u32 {
+        let squares = [0u32, 1, 4, 9, 16, 25];
+        squares[i % 6]
+    }
+    pub fn repeat(v: u16) -> [u16; 5] {
+        [v; 5]
+    }
+}
+
+pub mod generics {
+    fn pick<T>(first: bool, a: T, b: T) -> T {
+        if first { a } else { b }
+    }
+    fn swap<A: Copy, B: Copy>(pair: (A, B)) -> (B, A) {
+        (pair.1, pair.0)
+    }
+    #[inline]
+    fn add_one(x: u32) -> u32 {
+        x + 1
+    }
+    pub struct Counter { n: u32 }
+    impl Counter {
+        pub fn new(n: u32) -> Counter { Counter { n } }
+        pub fn bump(&mut self, by: u32) -> u32 { self.n += by; self.n }
+        pub fn get(&self) -> u32 { self.n }
+    }
+    pub trait Shape { fn area(&self) -> u64; fn double(&self) -> u64 { self.area() * 2 } }
+    pub struct Rect(pub u32, pub u32);
+    pub struct Square(pub u32);
+    impl Shape for Rect { fn area(&self) -> u64 { self.0 as u64 * self.1 as u64 } }
+    impl Shape for Square {
+        fn area(&self) -> u64 { self.0 as u64 * self.0 as u64 }
+        fn double(&self) -> u64 { 7 }
+    }
+    fn total<S: Shape>(s: &S) -> u64 {
+        s.area() + s.double()
+    }
+
+    pub fn picks(a: u64, b: u64) -> (u64, u8, (u16, u16)) {
+        (pick(true, a, b), pick(false, 1u8, 2u8), pick(a > b, (1, 2), (3, 4)))
+    }
+    pub fn swaps(a: u8, b: u64) -> (u64, u8) {
+        swap((a, b))
+    }
+    pub fn inline(x: u32) -> u32 {
+        add_one(add_one(x))
+    }
+    pub fn methods(n: u32) -> u32 {
+        let mut c = Counter::new(n);
+        c.bump(3);
+        c.bump(4) + c.get()
+    }
+    pub fn statics(w: u32, h: u32) -> u64 {
+        total(&Rect(w, h)) + total(&Square(w))
+    }
+    pub fn option_map(v: Option<u32>) -> u32 {
+        v.map(|x| x * 2).unwrap_or(7)
+    }
+    pub fn core_generics(a: u32, b: u32) -> (u32, u32) {
+        (core::cmp::max(a, b), core::mem::replace(&mut { a }, b))
+    }
+}
+
+pub mod closures {
+    pub fn capture(k: u32, xs: &[u32]) -> u32 {
+        let add = |x: u32| x + k;
+        let mut total = 0;
+        for x in xs {
+            total += add(*x);
+        }
+        total
+    }
+    pub fn capture_mut(n: u32) -> u32 {
+        let mut count = 0;
+        let mut bump = |by: u32| count += by;
+        bump(n);
+        bump(2);
+        count
+    }
+    pub fn iter_chain(xs: &[u32]) -> u32 {
+        xs.iter().filter(|x| **x % 2 == 1).map(|x| x * 3).sum()
+    }
+    pub fn fn_pointer(f: fn(u32) -> u32, x: u32) -> u32 {
+        f(f(x))
+    }
+}
+
+pub mod callables {
+    fn double(x: u32) -> u32 { x * 2 }
+    fn pair(x: u32) -> (u64, u64) { (x as u64, x as u64 + 1) }
+    fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(x) }
+    fn apply_mut<F: FnMut(u32)>(mut f: F, x: u32) { f(x); f(x + 1) }
+    fn apply_once<F: FnOnce() -> [u64; 3]>(f: F) -> [u64; 3] { f() }
+
+    pub fn reify(x: u32) -> u32 {
+        let f: fn(u32) -> u32 = double;
+        f(x) + apply(double, x)
+    }
+    pub fn reify_pair(x: u32) -> (u64, u64) {
+        let f: fn(u32) -> (u64, u64) = pair;
+        f(x)
+    }
+    pub fn generic_closure(k: u32, x: u32) -> u32 {
+        apply(|v| v * k, x) + apply(&|v| v + k, x)
+    }
+    pub fn generic_mut(x: u32) -> u32 {
+        let mut total = 0;
+        apply_mut(|v| total += v, x);
+        total
+    }
+    pub fn generic_once(a: u64) -> [u64; 3] {
+        let big = [a, a + 1, a + 2];
+        apply_once(move || big)
+    }
+    pub fn takes_fn(f: fn(u8, u8) -> u8, a: u8) -> u8 { f(a, 3) }
+}
+
+pub mod odd {
+    #[derive(Clone, Copy)]
+    pub struct B3(pub u8, pub u8, pub u8);
+    #[derive(Clone, Copy)]
+    pub struct B5(pub [u8; 5]);
+    #[derive(Clone, Copy)]
+    pub struct B6(pub u16, pub u16, pub u16);
+    #[derive(Clone, Copy)]
+    pub struct B7(pub [u8; 7]);
+
+    pub fn rot3(b: B3) -> B3 { B3(b.1, b.2, b.0) }
+    pub fn rot5(b: B5) -> B5 { B5([b.0[4], b.0[0], b.0[1], b.0[2], b.0[3]]) }
+    pub fn rot6(b: B6) -> B6 { B6(b.2, b.0, b.1) }
+    pub fn rot7(b: B7, x: u8) -> B7 { B7([x, b.0[0], b.0[1], b.0[2], b.0[3], b.0[4], b.0[5]]) }
+    pub fn chain(b: B3) -> u32 {
+        let r = rot3(rot3(b));
+        r.0 as u32 * 10000 + r.1 as u32 * 100 + r.2 as u32
+    }
+}
+
+pub mod dynamic {
+    pub trait Speak { fn speak(&self) -> u32; }
+    pub struct Dog(pub u32);
+    pub struct Cat;
+    impl Speak for Dog { fn speak(&self) -> u32 { self.0 } }
+    impl Speak for Cat { fn speak(&self) -> u32 { 9 } }
+
+    pub fn call(s: &dyn Speak) -> u32 {
+        s.speak() + 1
+    }
+    pub fn make(dog: bool) -> u32 {
+        let d = Dog(40);
+        let s: &dyn Speak = if dog { &d } else { &Cat };
+        s.speak()
+    }
+}
+
+pub mod objects {
+    use std::cell::Cell;
+    use std::fmt::{self, Display};
+
+    pub trait Base { fn base(&self) -> u32; fn twice(&self) -> u32 { self.base() * 2 } }
+    pub trait Named { fn name(&self) -> &'static str; }
+    pub trait Sized2: Sized { fn nope(&self) -> u32 { 0 } }
+    pub trait Mid: Base { fn mid(&self, x: u32) -> u32; }
+    /// Two supertraits with methods, a marker in between, and a method that is not in the vtable.
+    pub trait Top: Mid + Send + Named {
+        fn top(&mut self) -> u64;
+        fn skipped(&self) -> u32 where Self: Sized { 77 }
+        fn big(&self) -> [u64; 3];
+    }
+    pub trait Conv<T> { fn conv(&self, x: T) -> T; }
+
+    pub struct One(pub u32);
+    pub struct Two(pub u32, pub u64);
+    impl Base for One { fn base(&self) -> u32 { self.0 } }
+    impl Named for One { fn name(&self) -> &'static str { "one" } }
+    impl Mid for One { fn mid(&self, x: u32) -> u32 { self.0 + x } }
+    impl Top for One {
+        fn top(&mut self) -> u64 { self.0 += 1; self.0 as u64 }
+        fn big(&self) -> [u64; 3] { [self.0 as u64, 1, 2] }
+    }
+    impl Base for Two { fn base(&self) -> u32 { self.0 } fn twice(&self) -> u32 { 5 } }
+    impl Named for Two { fn name(&self) -> &'static str { "two" } }
+    impl Mid for Two { fn mid(&self, x: u32) -> u32 { self.0 * x } }
+    impl Top for Two {
+        fn top(&mut self) -> u64 { self.1 += 10; self.1 }
+        fn big(&self) -> [u64; 3] { [self.1, self.0 as u64, 0] }
+    }
+    impl Conv<u8> for One { fn conv(&self, x: u8) -> u8 { x.wrapping_add(self.0 as u8) } }
+    impl Conv<u64> for One { fn conv(&self, x: u64) -> u64 { x * self.0 as u64 } }
+    impl Display for One {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "One({})", self.0) }
+    }
+
+    /// Calls every kind of slot on an object somebody else made.
+    pub fn use_top(t: &mut dyn Top) -> (u32, u32, u32, u64, u64, usize) {
+        let big = t.big();
+        (t.base(), t.twice(), t.mid(3), t.top(), big[0] + big[1] + big[2], t.name().len())
+    }
+    /// Makes the objects for somebody else to call.
+    pub fn make_top(two: bool) -> Box<dyn Top> {
+        if two { Box::new(Two(3, 4)) } else { Box::new(One(7)) }
+    }
+    pub fn make_ref(one: &One) -> &dyn Top { one }
+    pub fn local(x: u32) -> u64 {
+        let mut one = One(x);
+        let t: &mut dyn Top = &mut one;
+        t.top() + t.mid(1) as u64 + t.twice() as u64
+    }
+    pub fn upcast_first(t: &dyn Top) -> &dyn Mid { t }
+    pub fn upcast_base(t: &dyn Top) -> &dyn Base { t }
+    pub fn upcast_named(t: &dyn Top) -> &dyn Named { t }
+    pub fn upcast_box(t: Box<dyn Top>) -> Box<dyn Named> { t }
+    pub fn use_named(n: &dyn Named) -> usize { n.name().len() }
+    pub fn generic_trait(one: &One) -> (u8, u64) {
+        let a: &dyn Conv<u8> = one;
+        let b: &dyn Conv<u64> = one;
+        (a.conv(250), b.conv(6))
+    }
+    pub fn boxed_sum(xs: &[Box<dyn Base>]) -> u32 {
+        let mut sum = 0;
+        for x in xs { sum += x.base(); }
+        sum
+    }
+    pub fn display(x: u32) -> String {
+        let d: &dyn Display = &One(x);
+        d.to_string()
+    }
+    pub fn show(d: &dyn Display) -> usize { d.to_string().len() }
+
+    pub struct Loud<'a>(pub &'a Cell<u64>, pub u64);
+    impl Drop for Loud<'_> {
+        fn drop(&mut self) { self.0.set(self.0.get() * 10 + self.1); }
+    }
+    pub trait Thing { fn id(&self) -> u64; }
+    impl Thing for Loud<'_> { fn id(&self) -> u64 { self.1 } }
+    impl Thing for u8 { fn id(&self) -> u64 { *self as u64 } }
+    pub fn make_thing<'a>(log: &'a Cell<u64>, loud: bool) -> Box<dyn Thing + 'a> {
+        if loud { Box::new(Loud(log, 4)) } else { Box::new(9u8) }
+    }
+    pub fn drop_thing(t: Box<dyn Thing + '_>) -> u64 { t.id() }
+
+    pub fn call_fn(f: &dyn Fn(u32, u32) -> u32, x: u32) -> u32 { f(x, 2) + f(1, x) }
+    pub fn call_fn_mut(f: &mut dyn FnMut(u64) -> u64) -> u64 { f(1); f(2); f(3) }
+    pub fn make_fn(k: u32) -> Box<dyn Fn(u32) -> u32> { Box::new(move |x| x * k + 1) }
+    pub fn make_fn_mut(mut acc: u64) -> Box<dyn FnMut(u64) -> u64> {
+        Box::new(move |x| { acc += x; acc })
+    }
+    pub fn make_fn_once(s: String) -> Box<dyn FnOnce(usize) -> usize> {
+        Box::new(move |x| s.len() + x)
+    }
+    pub fn local_fn(xs: &[u32], k: u32) -> u32 {
+        let f: &dyn Fn(u32) -> u32 = &|x| x + k;
+        let mut sum = 0;
+        for &x in xs { sum += f(x); }
+        sum
+    }
+}
+
+pub mod drops {
+    use std::cell::Cell;
+
+    /// Appends its digit to the log when dropped.
+    pub struct Noisy<'a>(pub &'a Cell<u64>, pub u64);
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() * 10 + self.1);
+        }
+    }
+    pub struct Pair<'a> { a: Noisy<'a>, b: Noisy<'a> }
+    pub enum Either<'a> { Left(Noisy<'a>), Right(Noisy<'a>, Noisy<'a>), Neither }
+
+    pub fn scope(log: &Cell<u64>) {
+        let _a = Noisy(log, 1);
+        let _b = Noisy(log, 2);
+        {
+            let _c = Noisy(log, 3);
+        }
+    }
+    pub fn moved(log: &Cell<u64>, keep: bool) -> Option<Noisy<'_>> {
+        let a = Noisy(log, 1);
+        let b = Noisy(log, 2);
+        if keep { Some(a) } else { drop(b); None }
+    }
+    pub fn fields(log: &Cell<u64>) {
+        let _p = Pair { a: Noisy(log, 4), b: Noisy(log, 5) };
+        let _t = (Noisy(log, 6), 0u8, Noisy(log, 7));
+    }
+    pub fn variants(log: &Cell<u64>, which: u8) {
+        let _e = match which {
+            0 => Either::Left(Noisy(log, 1)),
+            1 => Either::Right(Noisy(log, 2), Noisy(log, 3)),
+            _ => Either::Neither,
+        };
+    }
+    pub fn arrays(log: &Cell<u64>) {
+        let _xs = [Noisy(log, 1), Noisy(log, 2), Noisy(log, 3)];
+    }
+    pub fn boxes(log: &Cell<u64>) {
+        let _b = Box::new(Noisy(log, 8));
+        let _v = vec![Noisy(log, 1), Noisy(log, 2)];
+    }
+    pub fn param(_n: Noisy<'_>, log: &Cell<u64>) {
+        let _late = Noisy(log, 9);
+    }
+    pub fn looped(log: &Cell<u64>, n: u64) {
+        for i in 0..n {
+            let _x = Noisy(log, i + 1);
+        }
+    }
+    fn make(log: &Cell<u64>, n: u64) -> Noisy<'_> {
+        Noisy(log, n)
+    }
+    /// Temporaries die at the end of their statement, before the next one runs.
+    pub fn statement_temps(log: &Cell<u64>) -> u64 {
+        let a = make(log, 1).1;
+        let seen = log.get();
+        make(log, 2).1;
+        let _keep = make(log, 3);
+        a + seen * 100 + log.get() * 10000
+    }
+    /// A temporary in the tail expression dies as the function returns.
+    pub fn tail_temp(log: &Cell<u64>) -> u64 {
+        make(log, 4).1 + log.get()
+    }
+    pub fn tail_temp_block(log: &Cell<u64>) -> u64 {
+        let n = { make(log, 5).1 };
+        n + log.get() * 10
+    }
+    pub fn tail_temp_call(cell: &std::cell::RefCell<Vec<u64>>, n: u64) -> usize {
+        fn add(cell: &std::cell::RefCell<Vec<u64>>, n: u64) -> usize {
+            let id = cell.borrow().len();
+            cell.borrow_mut().push(n);
+            id
+        }
+        fn add2(cell: &std::cell::RefCell<Vec<u64>>, n: u64) -> usize {
+            cell.borrow_mut().len() + n as usize
+        }
+        add(cell, n) + add(cell, n + 1) + add2(cell, n) + add2(cell, n)
+    }
+    pub fn condition_temp(log: &Cell<u64>) -> u64 {
+        if make(log, 6).1 == 6 {
+            log.get() + 1
+        } else {
+            0
+        }
+    }
+    pub fn match_temp(log: &Cell<u64>) -> u64 {
+        match make(log, 7).1 {
+            7 => log.get() + 1,
+            _ => 0,
+        }
+    }
+    pub fn reassigned(log: &Cell<u64>) {
+        let mut a = make(log, 1);
+        a = make(log, 2);
+        let _b = make(log, 3);
+        a.1 += 0;
+    }
+    pub fn partial_move(log: &Cell<u64>) -> Noisy<'_> {
+        let p = Pair { a: make(log, 4), b: make(log, 5) };
+        let _late = make(log, 6);
+        p.a
+    }
+    /// `*b;` moves the contents out and drops them, and the box can be filled again.
+    pub fn box_refilled(log: &Cell<u64>) {
+        let mut b = Box::new(make(log, 1));
+        *b;
+        let _mid = make(log, 2);
+        *b = make(log, 3);
+    }
+    /// What a pattern leaves behind in an enum or an array is still dropped.
+    pub fn left_behind(log: &Cell<u64>) {
+        let pair = Some((make(log, 1), make(log, 2)));
+        match pair {
+            Some((_taken, _)) => {}
+            None => {}
+        }
+        let [_first, ..] = [make(log, 3), make(log, 4), make(log, 5)];
+    }
+    /// Bindings drop in the reverse of the order the pattern names them, whichever
+    /// alternative matched, and those of a later parameter go first.
+    pub fn binding_order(log: &Cell<u64>, first: bool) {
+        let ((true, _x, _y) | (false, _y, _x)) = (first, make(log, 1), make(log, 2));
+        (|_a, (Ok(_b) | Err(_b)), _c| {})(make(log, 3), Ok::<_, Noisy<'_>>(make(log, 4)), make(log, 5));
+    }
+    fn next<'a>(n: &Noisy<'a>) -> Noisy<'a> {
+        make(n.0, n.1 + 1)
+    }
+    /// Before the 2024 edition the temporaries in a block's tail outlive its locals.
+    pub fn tail_temporaries(log: &Cell<u64>) -> u64 {
+        let a = make(log, 1);
+        let b = {
+            let _local = make(log, 5);
+            next(&next(&a)).1
+        };
+        b + next(&a).1
+    }
+    /// An arm's bindings are dropped when the arm ends, and a guard's temporaries before the
+    /// arm is entered. A guard that fails gives the value back for the next arm.
+    pub fn arms(log: &Cell<u64>, pick: u64) {
+        let pair = Some((make(log, 1), make(log, 2)));
+        let _late = make(log, 3);
+        match pair {
+            Some((taken, _)) if next(&taken).1 == pick => log.set(log.get() * 10 + 7),
+            Some(whole) => log.set(log.get() * 10 + whole.1.1 + 6),
+            None => {}
+        }
+    }
+    /// What `if let` binds is dropped at the end of the branch, not of the function.
+    pub fn if_let(log: &Cell<u64>, some: bool) {
+        let _outer = make(log, 1);
+        if let Some(_inner) = some.then(|| make(log, 2)) {
+            log.set(log.get() * 10 + 3);
+        } else {
+            log.set(log.get() * 10 + 4);
+        }
+        log.set(log.get() * 10 + 5);
+    }
+    pub fn strings(n: usize) -> usize {
+        let s = "ab".repeat(n);
+        let t = s.clone();
+        let v: Vec<String> = vec![s, t];
+        v.len() + v[0].len()
+    }
+}
+
+pub mod heap {
+    pub fn boxed(n: u64) -> Box<u64> {
+        Box::new(n + 1)
+    }
+    pub fn vec(n: u32) -> Vec<u32> {
+        let mut v = Vec::new();
+        for i in 0..n {
+            v.push(i * i);
+        }
+        v
+    }
+    pub fn string(n: u32) -> String {
+        let mut s = String::from("n=");
+        for _ in 0..n {
+            s.push('x');
+        }
+        s
+    }
+    pub fn consume(v: Vec<u32>) -> usize {
+        v.len()
+    }
+    pub fn clears(n: usize) -> usize {
+        let mut empty: Vec<Vec<Option<std::sync::Arc<str>>>> = Vec::new();
+        empty.clear();
+        let mut full = vec![vec![Some(std::sync::Arc::<str>::from("a")), None]; n];
+        full.clear();
+        full.push(vec![]);
+        empty.len() + full.len()
+    }
+    /// A `?Sized` last field stays last, even where sorting by size would move it first.
+    pub fn unsizable_tail(cell: &std::cell::RefCell<[u64; 14]>, lock: &std::sync::Mutex<(u128, u8)>) -> u64 {
+        *lock.lock().unwrap() = (7, 1);
+        cell.borrow_mut()[13] += 1;
+        cell.borrow()[0] + cell.borrow()[13]
+    }
+    pub trait Named {
+        fn name(&self) -> usize;
+    }
+    impl Named for String {
+        fn name(&self) -> usize {
+            self.len()
+        }
+    }
+    pub fn shared(text: &str) -> (std::sync::Arc<dyn Named>, Box<dyn Fn() -> usize>) {
+        let shared: std::sync::Arc<dyn Named> = std::sync::Arc::new(text.to_owned());
+        let call = {
+            let shared = std::sync::Arc::clone(&shared);
+            let call: Box<dyn Fn() -> usize> = Box::new(move || shared.name());
+            call
+        };
+        (shared, call)
+    }
+    pub fn hashmap() -> std::collections::HashMap<std::sync::Arc<str>, u32> {
+        std::collections::HashMap::new()
+    }
+    pub fn hashmaps(n: usize) -> Vec<std::collections::HashMap<std::sync::Arc<str>, u32>> {
+        let mut maps = vec![];
+        for _ in 0..n {
+            maps.push(std::collections::HashMap::new());
+        }
+        maps
+    }
+    pub fn format(a: u32, b: &str) -> String {
+        format!("{a}-{b}")
+    }
+}
+
+pub mod simd {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    pub fn ascii(s: &str) -> bool {
+        s.is_ascii()
+    }
+    pub fn ascii_bytes(b: &[u8]) -> bool {
+        b.is_ascii()
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn find(hay: &[u8; 16], needle: u8) -> i32 {
+        unsafe {
+            let hay = _mm_loadu_si128(hay.as_ptr().cast());
+            _mm_movemask_epi8(_mm_cmpeq_epi8(hay, _mm_set1_epi8(needle as i8)))
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn shuffle(a: &[u8; 16], b: &[u8; 16]) -> ([u8; 16], i32) {
+        unsafe {
+            let x = _mm_lddqu_si128(a.as_ptr().cast());
+            let y = _mm_lddqu_si128(b.as_ptr().cast());
+            let z = _mm_shuffle_epi8(x, _mm_max_epu8(y, _mm_srli_epi16::<3>(x)));
+            let z = _mm_andnot_si128(_mm_slli_epi16::<1>(y), _mm_min_epi8(z, x));
+            let mut out = [0; 16];
+            _mm_storeu_si128(out.as_mut_ptr().cast(), z);
+            (out, _mm_extract_epi16::<3>(z))
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn mix(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+        unsafe {
+            let x = _mm_loadu_si128(a.as_ptr().cast());
+            let y = _mm_loadu_si128(b.as_ptr().cast());
+            let z = _mm_xor_si128(_mm_and_si128(x, y), _mm_or_si128(x, _mm_add_epi8(x, y)));
+            let mut out = [0; 16];
+            _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_sub_epi8(z, _mm_cmpgt_epi8(x, y)));
+            out
+        }
+    }
+}
+
+pub mod statics {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(5);
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    static LOW: AtomicI32 = AtomicI32::new(0);
+    static mut PLAIN: [u32; 3] = [1, 2, 3];
+
+    pub fn bump(n: u64) -> u64 {
+        COUNTER.fetch_add(n, Ordering::Relaxed);
+        COUNTER.fetch_sub(1, Ordering::SeqCst);
+        COUNTER.fetch_or(1 << 40, Ordering::AcqRel);
+        COUNTER.load(Ordering::Acquire)
+    }
+    pub fn once() -> (bool, bool, bool) {
+        let first = FLAG.swap(true, Ordering::SeqCst);
+        let second = FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed);
+        let third = FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed);
+        (first, second.is_ok(), third.is_ok())
+    }
+    pub fn lowest(n: i32) -> i32 {
+        LOW.fetch_min(n, Ordering::Relaxed);
+        LOW.fetch_xor(0, Ordering::Relaxed);
+        LOW.load(Ordering::Relaxed)
+    }
+    pub fn local(n: usize) -> usize {
+        let a = AtomicUsize::new(n);
+        a.store(a.load(Ordering::Relaxed) * 3, Ordering::Release);
+        a.fetch_max(10, Ordering::Relaxed);
+        a.fetch_and(!1, Ordering::Relaxed);
+        a.into_inner()
+    }
+    pub fn plain(i: usize, n: u32) -> u32 {
+        unsafe {
+            PLAIN[i] += n;
+            PLAIN[0] + PLAIN[1] + PLAIN[2]
+        }
+    }
+}
+
+pub mod floats {
+    pub fn arith(a: f64, b: f64) -> (f64, f64, f64, f64, f64) {
+        (a + b, a - b, a * b, a / b, a % b)
+    }
+    pub fn single(a: f32, b: f32) -> (f32, f32, bool, bool) {
+        (a * b + 0.5, -a % b, a < b, a == b)
+    }
+    pub fn compare(a: f64, b: f64) -> u8 {
+        (a < b) as u8 | ((a <= b) as u8) << 1 | ((a > b) as u8) << 2 | ((a >= b) as u8) << 3 | ((a != b) as u8) << 4
+    }
+    pub fn to_int(x: f64) -> (i64, u64, i32, u8, i8, u16) {
+        (x as i64, x as u64, x as i32, x as u8, x as i8, x as u16)
+    }
+    pub fn from_int(a: i64, b: u64, c: u8, d: i16) -> (f64, f64, f32, f64, f32) {
+        (a as f64, b as f64, c as f32, d as f64, b as f32)
+    }
+    pub fn widen(x: f32, y: f64) -> (f64, f32) {
+        (x as f64, y as f32)
+    }
+    pub fn bits(x: f64) -> (u64, f64, bool) {
+        (x.to_bits(), f64::from_bits(x.to_bits() ^ (1 << 63)), x.is_nan())
+    }
+    #[derive(Clone, Copy)]
+    pub struct Point {
+        pub x: f64,
+        pub y: f64,
+    }
+    pub fn point(p: Point, scale: f32) -> Point {
+        Point { x: p.x * scale as f64, y: -p.y }
+    }
+    pub fn mixed(n: u32, x: f32) -> (u32, f32) {
+        (n + 1, x + n as f32)
+    }
+    pub fn sum(values: &[f64]) -> f64 {
+        let mut total = 0.0;
+        for v in values {
+            total += *v;
+        }
+        total
+    }
+}
+
+pub mod locations {
+    use std::panic::Location;
+
+    #[track_caller]
+    fn here() -> &'static Location<'static> {
+        Location::caller()
+    }
+    #[track_caller]
+    fn through() -> &'static Location<'static> {
+        here()
+    }
+    /// The same location reaches both, however deep the tracked chain is.
+    pub fn tracked() -> bool {
+        let (a, b) = (here(), through());
+        a.file() == b.file() && !a.file().is_empty()
+    }
+    pub fn unwraps(x: Option<u8>, y: Result<u8, u8>) -> u8 {
+        x.unwrap() + y.unwrap() + x.expect("some")
+    }
+    pub fn borrows(cell: &std::cell::RefCell<u8>) -> u8 {
+        *cell.borrow_mut() += 1;
+        *cell.borrow()
+    }
+}
+
+pub mod misc {
+    pub fn big_repeat(seed: u8) -> u32 {
+        let table = [seed; 4096];
+        let wide = [(seed as u32, 7u16); 100];
+        table.iter().map(|&b| b as u32).sum::<u32>() + wide[99].0 + wide[50].1 as u32
+    }
+    pub enum Shape {
+        Circle(u32),
+        Rect(u32, u32),
+    }
+    pub struct Wrapper(pub u32, pub bool);
+    pub fn constructors(values: &[u32]) -> (u32, u32, u32) {
+        let options: Vec<Option<u32>> = values.iter().copied().map(Some).collect();
+        let shapes: Vec<Shape> = values.iter().copied().map(Shape::Circle).collect();
+        let wrapped = values.first().copied().map(|v| (v, true)).map(|(a, b)| Wrapper(a, b));
+        let area: u32 = shapes
+            .iter()
+            .map(|s| match s {
+                Shape::Circle(r) => 3 * r * r,
+                Shape::Rect(w, h) => w * h,
+            })
+            .sum();
+        (options.iter().flatten().sum(), area, wrapped.map_or(0, |w| w.0 + w.1 as u32))
+    }
+    pub fn lines(text: &str) -> (usize, usize) {
+        (text.lines().count(), text.lines().map(str::len).sum())
+    }
+    pub fn keyword(name: &str) -> u32 {
+        match name {
+            "alpha" => 1,
+            "beta" | "gamma" => 2,
+            "" => 3,
+            "alphabet" => 4,
+            _ => 0,
+        }
+    }
+    pub fn barrier(mut x: u64) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("/*{0}*/", inout(reg) x);
+        }
+        x = x.wrapping_mul(3);
+        x
+    }
+    fn target(x: u32) -> u32 {
+        x + 1
+    }
+    pub fn fn_item_cast(x: u32) -> (bool, u32) {
+        let raw = target as *const ();
+        let addr = target as usize;
+        let back: fn(u32) -> u32 = unsafe { core::mem::transmute(raw) };
+        (raw as usize == addr, back(x))
+    }
+    pub fn float_math(x: f64, y: f32) -> (f64, f64, f64, f64, f64, f32, f64, f64) {
+        (x.abs(), x.sqrt(), x.floor(), x.ceil(), x.round(), y.abs().trunc(), x.copysign(-1.0), x.max(2.5).min(100.0))
+    }
+    fn double(x: u32) -> u32 {
+        x * 2
+    }
+    fn triple(x: u32) -> u32 {
+        x * 3
+    }
+    static TABLE: [fn(u32) -> u32; 2] = [double, triple];
+    static LAZY: core::sync::atomic::AtomicPtr<()> = core::sync::atomic::AtomicPtr::new(double as *mut ());
+    pub fn fn_statics(x: u32) -> (u32, u32, u32) {
+        use core::sync::atomic::Ordering;
+        let first: fn(u32) -> u32 = unsafe { core::mem::transmute(LAZY.load(Ordering::Relaxed)) };
+        LAZY.store(triple as *mut (), Ordering::Relaxed);
+        let second: fn(u32) -> u32 = unsafe { core::mem::transmute(LAZY.load(Ordering::Relaxed)) };
+        (TABLE[0](x) + TABLE[1](x), first(x), second(x))
+    }
+}
+
+/// Functions with the C calling convention, called from the rustc-built runner.
+pub mod foreign {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Big {
+        pub a: u64,
+        pub b: u64,
+        pub c: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Mixed {
+        pub a: f64,
+        pub b: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Small {
+        pub a: u8,
+        pub b: u8,
+        pub c: u8,
+    }
+
+    pub extern "C" fn big(x: Big, n: u64) -> u64 {
+        x.a + 2 * x.b + 3 * x.c + n
+    }
+
+    pub extern "C" fn make_big(n: u64) -> Big {
+        Big { a: n, b: n + 1, c: n + 2 }
+    }
+
+    pub extern "C" fn mixed(x: Mixed, y: Mixed) -> Mixed {
+        Mixed { a: x.a + y.a, b: x.b * y.b }
+    }
+
+    pub extern "C" fn small(x: Small, flag: bool, y: i8) -> Small {
+        Small { a: x.c, b: x.b + flag as u8, c: x.a.wrapping_add(y as u8) }
+    }
+
+    pub extern "C" fn wide(x: u128, y: i16) -> i128 {
+        x as i128 - y as i128
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Floats {
+        pub a: f32,
+        pub b: [f32; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Nested {
+        pub tag: u8,
+        pub inner: (u16, f64),
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Two {
+        pub a: u64,
+        pub b: u64,
+    }
+
+    pub extern "C" fn floats(x: Floats, scale: f32) -> Floats {
+        Floats { a: x.b[1] * scale, b: [x.a, x.b[0] + scale] }
+    }
+
+    pub extern "C" fn nested(x: Nested) -> Nested {
+        Nested { tag: x.tag + 1, inner: (x.inner.0 * 2, x.inner.1 / 2.0) }
+    }
+
+    /// `two` no longer fits the integer registers and goes to the stack whole; `last` still
+    /// gets the one that is left.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn spill(a: u64, b: u64, c: u64, d: u64, e: u64, two: Two, last: u64) -> Two {
+        Two { a: a + b + c + d + e + two.a, b: two.b * last }
+    }
+
+    pub fn through_pointer(f: extern "C" fn(Floats, f32) -> Floats, g: extern "C" fn(u64) -> Big) -> f32 {
+        let x = f(Floats { a: 1.0, b: [2.0, 3.0] }, 0.5);
+        x.a + x.b[0] + x.b[1] + g(3).c as f32
+    }
+
+    pub fn call_c(text: &[u8]) -> usize {
+        unsafe extern "C" {
+            fn strlen(s: *const u8) -> usize;
+            fn div(a: i32, b: i32) -> Div;
+        }
+        #[repr(C)]
+        struct Div {
+            quot: i32,
+            rem: i32,
+        }
+        let d = unsafe { div(47, 5) };
+        let len = unsafe { strlen(text.as_ptr()) };
+        len + (d.quot * 10 + d.rem) as usize
+    }
+}
+
+pub mod shapes {
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Kind {
+        Plain,
+        Word,
+        Line,
+    }
+
+    #[derive(Clone)]
+    pub struct ByteMap {
+        pub map: [Kind; 256],
+    }
+
+    pub fn byte_map() -> ByteMap {
+        let mut map = [Kind::Plain; 256];
+        map[b'a' as usize] = Kind::Word;
+        map[b'\n' as usize] = Kind::Line;
+        ByteMap { map }.clone()
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct State(pub Arc<[u8]>);
+
+    #[derive(Clone, Debug)]
+    pub struct Names(pub Arc<str>, pub Vec<Option<Arc<str>>>);
+
+    pub fn state(bytes: &[u8]) -> State {
+        State(Arc::from(bytes))
+    }
+
+    pub fn names(text: &str) -> Names {
+        let name: Arc<str> = Arc::from(text);
+        Names(Arc::clone(&name), vec![None, Some(name)])
+    }
+
+    /// Passes its own lifetime on to the generic iterators it calls.
+    pub struct SetBits<'a> {
+        pub it: core::iter::Enumerate<core::slice::Iter<'a, bool>>,
+    }
+
+    impl<'a> Iterator for SetBits<'a> {
+        type Item = usize;
+
+        fn next(&mut self) -> Option<usize> {
+            self.it.by_ref().find_map(|(i, &set)| set.then_some(i))
+        }
+    }
+
+    pub fn wide_pointers(a: &[u8], b: &[u8]) -> (bool, bool, bool, bool) {
+        let (short, long): (*const [u8], *const [u8]) = (&a[..1], a);
+        let other: *const [u8] = b;
+        (short == long, short < long, long == a as *const [u8], (long < other) == (other > long))
+    }
+
+    pub fn same(a: &State, b: &State) -> (bool, bool, bool) {
+        (a == b, a < b, Arc::ptr_eq(&a.0, &b.0))
+    }
+}
+
+/// A unit struct is a value like any other: naming it makes one, which has to be dropped.
+pub mod unit_drops {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Unit;
+    impl Drop for Unit {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Unit {
+        fn this() -> Self {
+            Self
+        }
+    }
+
+    pub fn count() -> [usize; 4] {
+        let mut seen = [0; 4];
+        {
+            Unit;
+        }
+        seen[0] = DROPS.load(Ordering::Relaxed);
+        {
+            let _ = Unit;
+        }
+        seen[1] = DROPS.load(Ordering::Relaxed);
+        {
+            let _unit = Unit;
+        }
+        seen[2] = DROPS.load(Ordering::Relaxed);
+        Unit::this();
+        seen[3] = DROPS.load(Ordering::Relaxed);
+        seen
+    }
+}
+
+/// Operands are read when they are evaluated, not when the operation runs.
+pub fn operand_order() -> (i32, i32) {
+    let x = &mut 1;
+    let sum = *x + {
+        *x = 2;
+        1
+    };
+    let mut boxed: Box<i32> = Box::new(3);
+    #[allow(clippy::self_assignment)]
+    {
+        boxed = boxed;
+    }
+    (sum, *boxed)
+}
+
+/// A temporary in a format argument lives until the end of the statement that prints it.
+pub fn format_temporaries(x: i32) -> String {
+    fn boxed(x: i32) -> Option<Box<i32>> {
+        Some(Box::new(x))
+    }
+    format!("{} {:?}", boxed(x).unwrap(), vec![x + 1])
+}
+
+pub fn exclusive_ranges(x: u32) -> [bool; 3] {
+    [matches!(x, 6..7), matches!(x, 6..=7), matches!(x, ..7)]
+}
+
+pub mod const_pointers {
+    static mut COUNTER: u32 = 42;
+    struct Ptr(*mut u32);
+    unsafe impl Sync for Ptr {}
+    static TO_STATIC: Ptr = Ptr(&raw mut COUNTER);
+    static mut SLICE: &mut [isize] = &mut [1];
+    type Big = [u64; 4];
+    const BIG: &Big = &[13, 14, 10, 13];
+    const PAIR: &(isize, &Big) = &(15, BIG);
+    const NUMS: [u32; 2] = [7, 9];
+    #[repr(align(4))]
+    struct Aligned;
+    const ZST: *const () = (&Aligned as *const Aligned as *const ()).wrapping_byte_add(2);
+
+    fn element(i: usize) -> &'static u32 {
+        &NUMS[i]
+    }
+
+    fn field() -> &'static u32 {
+        &(42, 1).0
+    }
+
+    /// A static that points to another static, to memory it may write, and constants that
+    /// share what they point to.
+    #[allow(static_mut_refs)]
+    pub fn run() -> (u32, isize, bool, u32, u32, usize, usize) {
+        unsafe {
+            *TO_STATIC.0 += 1;
+            SLICE[0] += 1;
+            let unit: &'static () = &();
+            (
+                COUNTER,
+                SLICE[0],
+                std::ptr::eq(BIG, PAIR.1),
+                *element(1),
+                *field(),
+                ZST.addr(),
+                unit as *const () as usize,
+            )
+        }
+    }
+}
+
+pub mod promoted {
+    use std::hash::{Hash, Hasher};
+
+    trait Any {}
+    impl<T> Any for T {}
+
+    fn same(a: *const dyn Any, b: *const dyn Any) -> bool {
+        a == b
+    }
+
+    fn sum() -> &'static (u8, u16) {
+        &(1, 2 + 3)
+    }
+
+    #[derive(Hash)]
+    enum Single {
+        Only(u8),
+    }
+
+    struct Bytes(Vec<u8>);
+    impl Hasher for Bytes {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend(bytes);
+        }
+    }
+
+    /// Equal promoted constants are one object, arithmetic on literals is promoted, two impls
+    /// of one trait for `String` are different functions, and an enum with one variant
+    /// hashes no discriminant.
+    pub fn run() -> (bool, (u8, u16), bool, bool, Vec<u8>) {
+        let text = "foo".to_string();
+        let mut bytes = Bytes(Vec::new());
+        Single::Only(17).hash(&mut bytes);
+        (same(&0u8, &0u8), *sum(), text == "foo".to_string(), text == "foo", bytes.0)
+    }
+}
+
+pub mod evaluation_order {
+    fn log(order: &mut Vec<u8>, tag: u8) -> u32 {
+        order.push(tag);
+        tag as u32
+    }
+
+    struct Pair {
+        a: u32,
+        b: u32,
+    }
+
+    /// The right-hand side of `+=` on integers runs first, and the base of a struct literal
+    /// runs last.
+    pub fn run() -> (Vec<u8>, u32, u32) {
+        let mut order = Vec::new();
+        let mut xs = [0u32; 4];
+        xs[log(&mut order, 1) as usize] += log(&mut order, 2);
+        let pair = Pair { a: log(&mut order, 3), ..Pair { a: 0, b: log(&mut order, 4) } };
+        (order, xs[1], pair.a + pair.b)
+    }
+}
+
+pub mod pattern_alternatives {
+    /// A guard that fails is run again for the next alternative of an or-pattern.
+    pub fn guard(pair: (u32, u32)) -> (u32, u32) {
+        let mut guards = 0;
+        let found = match pair {
+            (a, _) | (_, a)
+                if {
+                    guards += 1;
+                    a > 10
+                } =>
+            {
+                a
+            }
+            _ => 0,
+        };
+        (found, guards)
+    }
+
+    pub fn slices(xs: [u8; 5]) -> (u8, [u8; 2], u8, u8) {
+        let [a, middle @ .., d, e] = xs;
+        (a, middle, d, e)
+    }
+}
+
+pub mod unsized_tail {
+    use std::cell::Cell;
+    use std::mem::{align_of_val, size_of_val};
+
+    pub trait Get {
+        fn get(&self) -> u64;
+    }
+    impl Get for u64 {
+        fn get(&self) -> u64 {
+            *self
+        }
+    }
+    impl Get for u8 {
+        fn get(&self) -> u64 {
+            *self as u64
+        }
+    }
+    struct Noisy<'a>(u8, &'a Cell<u32>);
+    impl Get for Noisy<'_> {
+        fn get(&self) -> u64 {
+            self.0 as u64
+        }
+    }
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.1.set(self.1.get() * 10 + self.0 as u32);
+        }
+    }
+
+    struct Tail<T: ?Sized> {
+        head: u16,
+        tail: T,
+    }
+
+    #[repr(C, packed(2))]
+    struct Packed<T: ?Sized>(u8, std::mem::ManuallyDrop<T>);
+
+    /// The offset of a `dyn` field depends on the alignment in its vtable.
+    pub fn field(wide: u64, narrow: u8) -> (u64, u64, u64, usize, usize) {
+        let a: &Tail<dyn Get> = &Tail { head: 1, tail: wide };
+        let b: &Tail<dyn Get> = &Tail { head: 2, tail: narrow };
+        let nested: &Tail<Tail<dyn Get>> = &Tail { head: 3, tail: Tail { head: 4, tail: wide } };
+        (
+            a.tail.get() + a.head as u64,
+            b.tail.get() + b.head as u64,
+            nested.tail.tail.get() + nested.tail.head as u64,
+            size_of_val(a) * 100 + align_of_val(a),
+            size_of_val(b) * 100 + align_of_val(b),
+        )
+    }
+
+    pub fn packed(value: u64) -> (usize, usize, isize) {
+        let p: &Packed<dyn Get> = &Packed(0, std::mem::ManuallyDrop::new(value));
+        let offset = unsafe {
+            (&raw const p.1).cast::<u8>().offset_from(&raw const p.0)
+        };
+        (size_of_val(p), align_of_val(p), offset)
+    }
+
+    pub fn drop_tail(value: u8) -> u32 {
+        let log = Cell::new(0);
+        let boxed: Box<Tail<dyn Get + '_>> = Box::new(Tail { head: 0, tail: Noisy(value, &log) });
+        let seen = boxed.tail.get() as u32;
+        drop(boxed);
+        log.get() * 100 + seen
+    }
+
+    pub fn run() -> ((u64, u64, u64, usize, usize), (usize, usize, isize), u32) {
+        (field(11, 5), packed(7), drop_tail(3))
+    }
+}
+
+pub mod upcast_generic {
+    pub trait Named<T: Default + ToString> {
+        fn name(&self) -> String {
+            T::default().to_string()
+        }
+    }
+    pub trait Both<T: Default + ToString>: Named<i32> + Named<T> {}
+
+    struct S;
+    impl Named<i32> for S {}
+    impl Named<bool> for S {}
+    impl Both<bool> for S {}
+
+    /// Two supertraits that differ only in their arguments have separate vtables.
+    pub fn run() -> (String, String) {
+        let both: &dyn Both<bool> = &S;
+        let int = both as &dyn Named<i32>;
+        let boolean = both as &dyn Named<bool>;
+        (int.name(), boolean.name())
+    }
+}
+
+pub mod packed_drop {
+    use std::cell::Cell;
+
+    thread_local!(static ODD: Cell<u32> = const { Cell::new(0) });
+
+    struct Aligned(u16);
+    impl Drop for Aligned {
+        fn drop(&mut self) {
+            let odd = std::hint::black_box(self as *mut Aligned as usize) % 2;
+            ODD.with(|it| it.set(it.get() * 10 + odd as u32 + self.0 as u32));
+        }
+    }
+    struct Other;
+    impl Drop for Other {
+        fn drop(&mut self) {}
+    }
+    struct Pair {
+        a: Aligned,
+        b: Other,
+    }
+    #[repr(packed)]
+    struct Misalign(u8, Pair);
+    #[repr(packed)]
+    struct Whole(u8, Aligned);
+
+    /// A destructor never sees a misaligned `self`, with or without a partial move.
+    pub fn run() -> u32 {
+        let m: ([u16; 0], Misalign) = ([], Misalign(0, Pair { a: Aligned(2), b: Other }));
+        let _b = m.1.1.b;
+        let w: ([u16; 0], Whole) = ([], Whole(0, Aligned(4)));
+        drop(w);
+        drop(m.1.1.a);
+        ODD.with(|it| it.get())
+    }
+}
+
+pub mod array_move {
+    use std::cell::RefCell;
+
+    struct Loud<'a>(u32, &'a RefCell<Vec<u32>>);
+    impl Drop for Loud<'_> {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    fn take<'a>([a, ref mut b, ref rest @ .., ref c, d]: [Loud<'a>; 6]) -> u32 {
+        a.0 + b.0 + rest.len() as u32 + c.0 + d.0
+    }
+
+    /// Moving the first and last element out of an array parameter leaves the middle to drop.
+    pub fn run() -> (u32, Vec<u32>) {
+        let log = RefCell::new(Vec::new());
+        let mk = |v| Loud(v, &log);
+        let sum = take([mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)]);
+        (sum, log.into_inner())
+    }
+}
+
+/// Overflow checks on signed integers when a constant is evaluated.
+pub mod const_overflow {
+    const SUB: Option<i8> = (-127i8).checked_sub(2);
+    const ADD: Option<i8> = 127i8.checked_add(2);
+    const MUL: Option<i8> = (-127i8).checked_mul(-99);
+    const FITS: Option<i8> = (-5i8).checked_mul(3);
+    const WIDE: (i128, bool) = i128::MIN.overflowing_sub(1);
+    const UNSIGNED: (u8, bool) = 3u8.overflowing_sub(5);
+    const DIV: Option<i8> = (i8::MIN + 1).checked_div(-1);
+    const REM: Option<i8> = (-7i8).checked_rem(2);
+    const SHR: i8 = (-64i8) >> 3;
+    const SATURATED: (i8, i8, u128, u8) = (
+        100i8.saturating_add(100),
+        (-100i8).saturating_sub(100),
+        u128::MAX.saturating_add(1),
+        3u8.saturating_sub(5),
+    );
+
+    pub fn run() -> (Option<i8>, Option<i8>, Option<i8>, Option<i8>, bool, (u8, bool)) {
+        (SUB, ADD, MUL, FITS, WIDE.1, UNSIGNED)
+    }
+
+    pub fn more() -> (Option<i8>, Option<i8>, i8, (i8, i8, u128, u8)) {
+        (DIV, REM, SHR, SATURATED)
+    }
+}
+
+/// A panic unwinds through frames that own values, and each is dropped once.
+pub mod unwind_cleanup {
+    use std::cell::RefCell;
+    use std::panic::{self, AssertUnwindSafe};
+
+    struct Noisy<'a>(&'a RefCell<Vec<u32>>, u32);
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+
+    #[inline(never)]
+    fn inner(log: &RefCell<Vec<u32>>, fail: bool) -> u32 {
+        let _a = Noisy(log, 1);
+        let moved = Noisy(log, 2);
+        let _b = Noisy(log, 3);
+        drop(moved);
+        let pair = (Noisy(log, 4), Noisy(log, 5));
+        let _kept = pair.0;
+        if fail {
+            panic!("unwinding with {} values live", log.borrow().len());
+        }
+        6
+    }
+
+    #[inline(never)]
+    fn outer(log: &RefCell<Vec<u32>>, fail: bool) -> u32 {
+        let _o = Noisy(log, 10);
+        let boxed = Box::new(Noisy(log, 11));
+        let n = inner(log, fail);
+        drop(boxed);
+        n
+    }
+
+    struct Failing<'a>(Noisy<'a>, Noisy<'a>);
+    impl Drop for Failing<'_> {
+        fn drop(&mut self) {
+            panic!("a destructor that fails after {} drops", (self.0).0.borrow().len());
+        }
+    }
+
+    #[inline(never)]
+    fn scopes(log: &RefCell<Vec<u32>>) {
+        let _first = Noisy(log, 20);
+        let _second = Noisy(log, 21);
+        {
+            let _inner = Noisy(log, 22);
+            let _failing = Failing(Noisy(log, 23), Noisy(log, 24));
+            let _last = Noisy(log, 25);
+        }
+        let _unreached = Noisy(log, 26);
+    }
+
+    /// A destructor that panics still has its fields dropped, and the scopes around it unwind
+    /// innermost first.
+    pub fn failing_drop() -> (Vec<u32>, bool) {
+        let log = RefCell::new(Vec::new());
+        let caught = panic::catch_unwind(AssertUnwindSafe(|| scopes(&log))).is_err();
+        (log.into_inner(), caught)
+    }
+
+    pub fn run() -> (Vec<u32>, Vec<u32>, bool) {
+        let (ok, failed) = (RefCell::new(Vec::new()), RefCell::new(Vec::new()));
+        outer(&ok, false);
+        let caught = panic::catch_unwind(AssertUnwindSafe(|| outer(&failed, true))).is_err();
+        (ok.into_inner(), failed.into_inner(), caught)
+    }
+}
+
+/// Closures that each capture one field of an enum with a single variant.
+pub mod capture_enum_field {
+    #[derive(Debug, PartialEq)]
+    pub enum Color {
+        Rgb(u8, u8, u8),
+    }
+
+    pub fn run() -> Color {
+        let mut color = Color::Rgb(9, 9, 9);
+        let mut red = |v| {
+            let Color::Rgb(ref mut r, _, _) = color;
+            *r = v;
+        };
+        let mut blue = |v| {
+            let Color::Rgb(_, _, ref mut b) = color;
+            *b = v;
+        };
+        red(1);
+        blue(3);
+        color
+    }
+}
+
+/// A method call that borrows a constant uses the constant where it is, not a copy on the stack.
+pub mod autoref_promoted {
+    const BIG: [u8; 32 * 1024 * 1024] = [42; 32 * 1024 * 1024];
+    const SMALL: [u16; 3] = [1, 2, 3];
+
+    pub fn run() -> (usize, Option<&'static u16>, bool) {
+        (BIG.len(), SMALL.last(), std::ptr::eq(SMALL.as_ptr(), SMALL.as_ptr()))
+    }
+}
+
+/// A borrowed array of `Self::Variant`s outlives the function, as `derive(ValueEnum)` relies on.
+pub mod promoted_self_variant {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum Kind {
+        Webview,
+        Native,
+    }
+
+    impl Kind {
+        fn all<'a>() -> &'a [Self] {
+            &[Self::Webview, Self::Native]
+        }
+    }
+
+    #[inline(never)]
+    fn clobber() -> [u64; 8] {
+        std::hint::black_box([u64::MAX; 8])
+    }
+
+    pub fn run() -> (Vec<Kind>, u64) {
+        let all = Kind::all();
+        let noise = clobber();
+        (all.to_vec(), noise[0])
+    }
+}
+
+/// Two statics that point at each other, and a static in a function body whose value is made
+/// by a closure on first use.
+pub mod static_cycle {
+    use std::sync::LazyLock;
+
+    pub struct Site {
+        meta: &'static Meta,
+        id: u32,
+    }
+    pub struct Meta {
+        name: &'static str,
+        site: &'static Site,
+    }
+
+    fn pair() -> (&'static Site, &'static Meta) {
+        static SITE: Site = Site { meta: &META, id: 7 };
+        static META: Meta = Meta { name: "event", site: &SITE };
+        (&SITE, &META)
+    }
+
+    fn settings() -> &'static Vec<String> {
+        static SETTINGS: LazyLock<Vec<String>> =
+            LazyLock::new(|| vec!["a".to_string(), "b".to_string()]);
+        &SETTINGS
+    }
+
+    pub fn run() -> (u32, &'static str, bool, bool, Vec<String>, bool) {
+        let (site, meta) = pair();
+        (
+            meta.site.id,
+            site.meta.name,
+            std::ptr::eq(site.meta, meta),
+            std::ptr::eq(meta.site, site),
+            settings().clone(),
+            std::ptr::eq(settings(), settings()),
+        )
+    }
+}
+
+/// An `async` block keeps what lives across an `.await`, borrowed locals included, and not
+/// the large temporaries in between.
+pub mod async_frames {
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::task::{Context, Poll, Waker};
+
+    struct Twice(bool);
+    impl Future for Twice {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if std::mem::replace(&mut self.0, true) { Poll::Ready(()) } else { Poll::Pending }
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            // Whatever a suspended future left on `poll`'s stack is gone by the next call.
+            std::hint::black_box([u64::MAX; 64]);
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    fn checksum(bytes: &[u8]) -> u64 {
+        bytes.iter().map(|&it| it as u64).sum()
+    }
+
+    async fn leaf(seed: u8) -> u64 {
+        let scratch = [seed; 4096];
+        let before = checksum(&scratch);
+        Twice(false).await;
+        let after = [seed.wrapping_add(1); 4096];
+        before + checksum(&after)
+    }
+
+    async fn borrows(seed: u8) -> u64 {
+        let kept = [seed; 64];
+        let view = &kept[1..];
+        let mut total = String::from("t");
+        let grows = &mut total;
+        Twice(false).await;
+        grows.push('u');
+        let moved = total;
+        Twice(false).await;
+        checksum(view) + moved.len() as u64
+    }
+
+    async fn nested(depth: u8) -> u64 {
+        let mut total = 0;
+        for round in 0..3 {
+            let step = if round == depth { borrows(round).await } else { leaf(round).await };
+            total += step;
+        }
+        let pinned = Box::pin(async move { leaf(depth).await + total });
+        pinned.await
+    }
+
+    /// The futures of the arms never exist at once and share the memory of the future
+    /// awaiting them; the ones awaited in turn while `kept` is borrowed do too.
+    async fn arms(which: u8) -> u64 {
+        let kept = [which; 32];
+        let first = match which {
+            0 => leaf(1).await,
+            1 => leaf(2).await + leaf(3).await,
+            2 => borrows(4).await,
+            _ => leaf(5).await,
+        };
+        let view = &kept[..4];
+        let second = leaf(first as u8).await;
+        let third = leaf(second as u8).await;
+        first + second + third + checksum(view)
+    }
+
+    pub fn shared() -> (Vec<u64>, bool) {
+        let size = std::mem::size_of_val(&arms(0));
+        ((0..4).map(|which| block_on(arms(which))).collect(), size < 2 * 4096)
+    }
+
+    pub fn run() -> (u64, u64, u64) {
+        (block_on(leaf(3)), block_on(borrows(5)), block_on(nested(1)))
+    }
+}
+
+/// `Box<dyn FnMut>` forwards its arguments to the closure as the tuple it was called with.
+pub mod boxed_fn_tuple {
+    fn join(key: String, val: String, n: u8) -> String {
+        format!("{key}={val}/{n}")
+    }
+
+    pub fn run() -> (String, u32, String) {
+        let mut seen = 0;
+        let mut two: Box<dyn FnMut(String, String, u8) -> String> = Box::new(|a, b, n| {
+            seen += 1;
+            join(a, b, n)
+        });
+        let joined = two("k".to_string(), "v".to_string(), 7);
+        drop(two);
+        let none: Box<dyn Fn() -> String> = Box::new(|| "none".to_string());
+        (joined, seen, none())
+    }
+}
+
+/// `line!()`, `column!()` and `file!()` are where the outermost macro is called.
+pub mod builtin_location {
+    macro_rules! here {
+        () => {
+            (line!(), column!(), file!())
+        };
+    }
+
+    macro_rules! column_of {
+        ($e:expr) => {
+            ($e, column!())
+        };
+    }
+
+    /// A macro call passed to another macro is where it was written.
+    pub fn passed() -> (u32, u32) {
+        column_of!(column_of!(7).1)
+    }
+
+    pub fn run() -> ((u32, u32, &'static str), (u32, u32, &'static str), u32) {
+        let direct = (line!(), column!(), file!());
+        let nested = here!();
+        assert_eq!(nested.0, line!() - 1, "in {}", file!());
+        (direct, nested, line!() + 1)
+    }
+}
+
+/// `stringify!` spaces tokens the way rustc does.
+pub mod stringify_spacing {
+    macro_rules! ty {
+        (<$t:ty>) => {
+            stringify!($t)
+        };
+    }
+    macro_rules! expr {
+        ($e:expr) => {
+            stringify!($e)
+        };
+    }
+    macro_rules! list {
+        ($($e:ident),*) => {
+            stringify!($($e),*)
+        };
+    }
+
+    pub fn run() -> Vec<&'static str> {
+        vec![
+            stringify!(std::option),
+            stringify!(a , b,c),
+            stringify!(f(x).y.0 + #[attr] g ( 1 )),
+            stringify!({ foo += 1; eprintln!("before"); 7331 }),
+            stringify!(let (a, b) = &'a mut x;),
+            stringify!(fn f<T: Tr>(x: Vec<T>) -> [u8; 3] {}),
+            ty!(<Vec<i32>>),
+            list!(a, b, c),
+            stringify!(("Yeah",)),
+            stringify!(1u8),
+            stringify!(r#struct . r#fn),
+            expr!(1 + 2),
+            expr!(Point { x: 42 }),
+            expr!(&a),
+        ]
+    }
+}
+
+/// Raw identifiers mean what the plain ones do, except to a macro matching on them.
+pub mod raw_identifiers {
+    #[r#repr(r#C, r#packed)]
+    pub struct Packed {
+        pub a: bool,
+        pub b: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Keyword {
+        pub r#struct: u32,
+    }
+
+    macro_rules! which {
+        (a) => {
+            6
+        };
+        (r#a) => {
+            7
+        };
+    }
+
+    pub fn run() -> (usize, String, u32, u32) {
+        let keyword = Keyword { r#struct: 3 };
+        (std::mem::size_of::<Packed>(), format!("{:?}", keyword.clone()), which!(a), which!(r#a))
+    }
+}
+
+/// A derive calls the trait's own methods, whatever else is in scope under those names.
+pub mod derive_ufcs {
+    use std::fmt;
+
+    #[derive(Debug, Clone)]
+    pub struct Named {
+        pub bar: u8,
+        pub baz: (),
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Tuple(pub u8);
+
+    #[derive(Debug, Clone)]
+    pub struct Unit;
+
+    pub trait Shadow {
+        fn debug_struct(&self, _: &str) -> u8 {
+            panic!("got into debug_struct")
+        }
+        fn debug_tuple(&self, _: &str) -> u8 {
+            panic!("got into debug_tuple")
+        }
+        fn write_str(&self, _: &str) -> u8 {
+            panic!("got into write_str")
+        }
+        fn clone(&self) -> u8 {
+            panic!("got into clone")
+        }
+    }
+    impl Shadow for &mut fmt::Formatter<'_> {}
+    impl Shadow for &u8 {}
+    impl Shadow for &() {}
+
+    pub fn run() -> String {
+        let named = Named { bar: 1, baz: () };
+        format!("{:?} {:?} {:?}", named.clone(), Tuple(2).clone(), Unit.clone())
+    }
+}
+
+/// `Clone` of the types that have no impl written anywhere.
+pub mod builtin_clone {
+    fn twice(n: u8) -> u8 {
+        n * 2
+    }
+
+    pub fn run() -> ((String, u8), [String; 2], u8, ((), (Vec<u8>,))) {
+        let pair = ("a".to_string(), 1u8);
+        let array = ["b".to_string(), "c".to_string()];
+        let pointer: fn(u8) -> u8 = twice;
+        let nested = ((), (vec![1u8, 2],));
+        (Clone::clone(&pair), array.clone(), Clone::clone(&pointer)(4), nested.clone())
+    }
+}
+
+/// A guard that fails gives back what the pattern took, and `&&` drops as it goes.
+pub mod guard_moves {
+    use std::cell::RefCell;
+
+    struct Noisy<'a>(&'a RefCell<Vec<u32>>, u32);
+
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+
+    impl Noisy<'_> {
+        fn yes(&self) -> bool {
+            true
+        }
+    }
+
+    fn failed(log: &RefCell<Vec<u32>>) -> u32 {
+        match (Noisy(log, 2), Noisy(log, 3)) {
+            (_x, _y) if let _z = Noisy(log, 1) && false => 0,
+            (x, _) if x.1 == 7 => 1,
+            (_, y) => y.1,
+        }
+    }
+
+    fn chain(log: &RefCell<Vec<u32>>) -> u32 {
+        if Noisy(log, 1).yes()
+            && let Some(_v) = Some(Noisy(log, 5))
+            && Noisy(log, 2).yes()
+            && let Some(_) = Some(Noisy(log, 4)).as_ref()
+        {
+            log.borrow_mut().push(3);
+        }
+        (Noisy(log, 6).yes() || Noisy(log, 99).yes()) as u32
+    }
+
+    pub fn run() -> (u32, u32, Vec<u32>) {
+        let log = RefCell::new(Vec::new());
+        let (a, b) = (failed(&log), chain(&log));
+        (a, b, log.into_inner())
+    }
+}
+
+/// Dividing by zero and `MIN / -1` panic and unwind.
+pub mod division_panics {
+    use std::hint::black_box;
+    use std::panic;
+
+    pub fn run() -> (Vec<bool>, i128, u8, i64) {
+        let caught = vec![
+            panic::catch_unwind(|| black_box(1i32) / black_box(0)).is_err(),
+            panic::catch_unwind(|| black_box(1u8) % black_box(0)).is_err(),
+            panic::catch_unwind(|| black_box(i8::MIN) / black_box(-1)).is_err(),
+            panic::catch_unwind(|| black_box(i64::MIN) % black_box(-1)).is_err(),
+            panic::catch_unwind(|| black_box(i128::MIN) / black_box(-1)).is_err(),
+            panic::catch_unwind(|| black_box(i16::MIN) / black_box(1)).is_err(),
+        ];
+        (caught, black_box(i128::MIN + 1) / black_box(-1), black_box(7u8) % black_box(4), black_box(-7i64) / 2)
+    }
+}
+
+/// What a panic unwinds through is dropped: the captures of a closure called by value, and the
+/// part of a tuple or an array that was already cloned.
+pub mod unwind_owned {
+    use std::panic::{self, AssertUnwindSafe};
+    use std::rc::Rc;
+
+    struct Flag<'a>(&'a mut bool);
+
+    impl Drop for Flag<'_> {
+        fn drop(&mut self) {
+            *self.0 = true;
+        }
+    }
+
+    fn call<T: FnOnce()>(t: T) {
+        t()
+    }
+
+    struct Seventh(Rc<()>);
+
+    impl Clone for Seventh {
+        fn clone(&self) -> Self {
+            if Rc::strong_count(&self.0) == 7 {
+                panic!("oops");
+            }
+            Seventh(self.0.clone())
+        }
+    }
+
+    pub fn run() -> (bool, bool, usize, usize) {
+        let mut dropped = false;
+        let caught = {
+            let flag = Flag(&mut dropped);
+            panic::catch_unwind(AssertUnwindSafe(move || {
+                let inner = move || {
+                    let _flag = &flag;
+                    panic!()
+                };
+                call(inner);
+            }))
+            .is_err()
+        };
+
+        let counter = Rc::new(());
+        let c = counter.clone();
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _ = (Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)).clone();
+        }));
+        let tuple = Rc::strong_count(&counter);
+        let c = counter.clone();
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _ = [Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)].clone();
+        }));
+        (caught, dropped, tuple, Rc::strong_count(&counter))
+    }
+}
+
+/// Derives on a `Copy` type copy it, and on a packed type they copy the fields out before
+/// calling anything on them.
+pub mod derive_copy_packed {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub static CLONED: AtomicU32 = AtomicU32::new(0);
+    pub static MISALIGNED: AtomicU32 = AtomicU32::new(0);
+
+    #[derive(Copy)]
+    pub struct Liar;
+
+    impl Clone for Liar {
+        fn clone(&self) -> Self {
+            CLONED.fetch_add(1, Ordering::SeqCst);
+            *self
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct Innocent(pub Liar);
+
+    #[derive(Clone)]
+    pub struct Honest(pub Liar);
+
+    #[derive(Copy, Clone, Debug, Hash, PartialOrd)]
+    pub struct Aligned(pub usize);
+
+    impl PartialEq for Aligned {
+        fn eq(&self, other: &Self) -> bool {
+            for it in [self, other] {
+                if it as *const Aligned as usize % std::mem::align_of::<Aligned>() != 0 {
+                    MISALIGNED.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            self.0 == other.0
+        }
+    }
+
+    #[repr(packed)]
+    #[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Hash)]
+    pub struct Packed(pub Aligned, pub Aligned);
+
+    #[derive(PartialEq)]
+    #[repr(C)]
+    pub struct Dealigned<T>(pub u8, pub T);
+
+    pub fn run() -> (u32, u32, bool, bool, String, u32) {
+        let _ = Innocent(Liar).clone();
+        let copied = CLONED.load(Ordering::SeqCst);
+        let _ = Honest(Liar).clone();
+        let a = Dealigned(0, Packed(Aligned(1), Aligned(2)));
+        let b = Dealigned(0, Packed(Aligned(1), Aligned(3)));
+        (
+            copied,
+            CLONED.load(Ordering::SeqCst),
+            a == a,
+            a.1 < b.1,
+            format!("{:?}", b.1),
+            MISALIGNED.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// A constant whose pointer sits in a union, where its type does not show it.
+pub mod union_pointer {
+    use std::mem::MaybeUninit;
+
+    type Byte = MaybeUninit<u8>;
+
+    const unsafe fn memcpy(dst: *mut Byte, src: *const Byte, n: usize) {
+        let mut i = 0;
+        while i < n {
+            unsafe { *dst.add(i) = *src.add(i) };
+            i += 1;
+        }
+    }
+
+    const COPIED: MaybeUninit<*const i32> = unsafe {
+        let ptr = &42;
+        let mut ptr2 = MaybeUninit::new(std::ptr::null::<i32>());
+        memcpy(&mut ptr2 as *mut _ as *mut _, &ptr as *const _ as *const _, size_of::<&i32>());
+        ptr2
+    };
+    const DIRECT: MaybeUninit<(u64, &'static u8)> = MaybeUninit::new((7, &9));
+
+    pub fn run() -> (i32, u64, u8) {
+        let direct = unsafe { DIRECT.assume_init() };
+        (unsafe { COPIED.assume_init().read() }, direct.0, *direct.1)
+    }
+}
+
+/// Items in the body of an `async fn`, which rustc names through the closure the body is.
+pub mod async_items {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    async fn outer(n: u32) -> u32 {
+        static TABLE: [u32; 3] = [3, 5, 7];
+        fn double(n: u32) -> u32 {
+            n * 2
+        }
+        async fn inner(n: u32) -> u32 {
+            fn triple(n: u32) -> u32 {
+                n * 3
+            }
+            triple(n) + 1
+        }
+        let scale = |n: u32| {
+            fn in_closure(n: u32) -> u32 {
+                n + 100
+            }
+            in_closure(n)
+        };
+        double(n) + inner(n).await + TABLE[n as usize % 3] + scale(n)
+    }
+
+    pub fn run() -> u32 {
+        let mut future = pin!(outer(4));
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => value,
+            Poll::Pending => 0,
+        }
+    }
+}
+
+pub mod async_basic {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    struct Noisy(&'static str, Log);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    /// Pending the given number of times, then ready.
+    struct Countdown(u32);
+
+    impl Future for Countdown {
+        type Output = u32;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+            if self.0 == 0 {
+                return Poll::Ready(7);
+            }
+            self.0 -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> (F::Output, u32) {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut polls = 1;
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return (value, polls);
+            }
+            polls += 1;
+        }
+    }
+
+    async fn add(a: u32, b: u32) -> u32 {
+        a + Countdown(b).await
+    }
+
+    async fn sum(values: &[u32], log: Log) -> u32 {
+        let _whole = Noisy("sum", log.clone());
+        let mut total = 0;
+        for &value in values {
+            let _each = Noisy("step", log.clone());
+            total = add(total, value).await;
+        }
+        total
+    }
+
+    pub fn run() -> (u32, u32, (u32, u32), (u32, u32), Vec<&'static str>, Vec<&'static str>) {
+        let (plain, _) = block_on(async { 5 });
+        let captured = String::from("abc");
+        let (moved, _) = block_on(async move { captured.len() as u32 + Countdown(2).await });
+        let log = Log::default();
+        let summed = block_on(sum(&[1, 2, 0], log.clone()));
+        let boxed: Pin<Box<dyn Future<Output = u32>>> = Box::pin(add(1, 3));
+        let dynamic = block_on(boxed);
+
+        // Dropped before it ran, and dropped while it waits.
+        let dropped = Log::default();
+        let never = sum(&[1], dropped.clone());
+        let guard = Noisy("captured", dropped.clone());
+        let unresumed = async move {
+            let _guard = guard;
+        };
+        drop(unresumed);
+        {
+            let mut waiting = pin!(never);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            dropped.borrow_mut().push("polled");
+        }
+        dropped.borrow_mut().push("end");
+        let first = log.borrow().clone();
+        let second = dropped.borrow().clone();
+        (plain, moved, summed, dynamic, first, second)
+    }
+}
+
+pub mod async_more {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::{Pin, pin};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    type Log = Rc<RefCell<Vec<String>>>;
+
+    struct Noisy(&'static str, Log);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0.to_string());
+        }
+    }
+
+    struct Yield(bool);
+
+    impl Future for Yield {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                return Poll::Ready(());
+            }
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    trait Named {
+        fn name(&self) -> String;
+    }
+
+    impl Named for u8 {
+        fn name(&self) -> String {
+            format!("u8:{self}")
+        }
+    }
+
+    impl Named for &str {
+        fn name(&self) -> String {
+            format!("str:{self}")
+        }
+    }
+
+    async fn generic<T: Named>(value: T, log: Log) -> usize {
+        let name = value.name();
+        Yield(false).await;
+        log.borrow_mut().push(name.clone());
+        name.len()
+    }
+
+    async fn borrows(text: &mut String) -> &str {
+        text.push('!');
+        Yield(false).await;
+        text.push('?');
+        &text[1..]
+    }
+
+    async fn branches(n: u32, log: Log) -> Result<u32, String> {
+        let _guard = Noisy("branches", log.clone());
+        let mut seen = 0;
+        loop {
+            if seen == n {
+                break;
+            }
+            let _step = Noisy("iter", log.clone());
+            Yield(false).await;
+            seen += 1;
+            if seen == 3 {
+                return Err(format!("stopped at {seen}"));
+            }
+        }
+        match seen {
+            0 => Ok(0),
+            other => {
+                let doubled = async { other * 2 }.await;
+                Ok(doubled)
+            }
+        }
+    }
+
+    async fn panics(log: Log) -> u32 {
+        let _outer = Noisy("panic-outer", log.clone());
+        Yield(false).await;
+        let _inner = Noisy("panic-inner", log.clone());
+        if log.borrow().len() < 100 {
+            panic!("in poll");
+        }
+        1
+    }
+
+    fn boxed(depth: u32) -> Pin<Box<dyn Future<Output = u32>>> {
+        Box::pin(async move {
+            if depth == 0 {
+                return 1;
+            }
+            Yield(false).await;
+            boxed(depth - 1).await + depth
+        })
+    }
+
+    struct Counting(std::sync::atomic::AtomicU32);
+
+    impl std::task::Wake for Counting {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct WakeTwice(u32);
+
+    impl Future for WakeTwice {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 == 2 {
+                return Poll::Ready(());
+            }
+            self.0 += 1;
+            cx.waker().clone().wake();
+            Poll::Pending
+        }
+    }
+
+    /// A waker is a pointer to a promoted table of functions.
+    fn wakes() -> u32 {
+        let counting = std::sync::Arc::new(Counting(Default::default()));
+        let waker = Waker::from(counting.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut future = pin!(async { WakeTwice(0).await });
+        while future.as_mut().poll(&mut cx).is_pending() {}
+        counting.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    trait Greets {
+        async fn name() -> String {
+            "default".to_owned()
+        }
+
+        async fn greet() -> String {
+            format!("hello {}", Self::name().await)
+        }
+    }
+
+    struct Plain;
+    struct Custom;
+
+    impl Greets for Plain {}
+
+    impl Greets for Custom {
+        async fn name() -> String {
+            Yield(false).await;
+            "custom".to_owned()
+        }
+    }
+
+    async fn join(log: Log) -> (usize, usize) {
+        let a = generic(7u8, log.clone());
+        let b = generic("xyz", log.clone());
+        let second = b.await;
+        (a.await, second)
+    }
+
+    pub fn run() -> Vec<String> {
+        let log = Log::default();
+        let mut out = Vec::new();
+        out.push(format!("{:?}", block_on(join(log.clone()))));
+        let mut text = String::from("ab");
+        out.push(block_on(borrows(&mut text)).to_string());
+        out.push(format!("{:?}", block_on(branches(0, log.clone()))));
+        out.push(format!("{:?}", block_on(branches(2, log.clone()))));
+        out.push(format!("{:?}", block_on(branches(5, log.clone()))));
+        out.push(format!("{}", block_on(boxed(4))));
+        let caught = catch_unwind(AssertUnwindSafe(|| block_on(panics(log.clone()))));
+        out.push(format!("{}", caught.is_err()));
+        let closure = |x: u32| async move { x + 1 };
+        out.push(format!("{}", block_on(closure(4))));
+        out.push(format!("{}", wakes()));
+        out.push(block_on(Plain::greet()));
+        out.push(block_on(Custom::greet()));
+        out.extend(log.borrow().iter().cloned());
+        out
+    }
+}
+
+pub mod const_patterns {
+    #[derive(PartialEq, Eq, Debug, Clone, Copy)]
+    pub enum Shape { Dot, Line(u8, u8), Named(&'static str), Many(&'static [u16]) }
+    #[derive(PartialEq, Eq)]
+    pub struct Pair(pub i32, pub Option<Shape>);
+    const A: Shape = Shape::Line(1, 2);
+    const B: Shape = Shape::Named("bee");
+    const C: Pair = Pair(7, Some(Shape::Many(&[1, 2, 3])));
+    const D: &[u8] = b"hello";
+    const E: [(u8, bool); 2] = [(1, true), (2, false)];
+    const F: &Pair = &Pair(1, None);
+    const G: (f32, char) = (1.5, 'x');
+    fn shape(s: Shape) -> u8 {
+        match s { A => 1, B => 2, Shape::Dot => 3, _ => 4 }
+    }
+    fn pair(p: &Pair) -> u8 {
+        match *p { C => 1, _ => match p { F => 2, _ => 3 } }
+    }
+    fn bytes(b: &[u8]) -> u8 {
+        match b { D => 1, b"" => 2, _ => 3 }
+    }
+    fn arr(e: [(u8, bool); 2]) -> u8 { match e { E => 1, _ => 0 } }
+    fn fl(e: (f32, char)) -> u8 { match e { G => 1, _ => 0 } }
+    pub fn run() -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(format!("{:?}", [shape(Shape::Line(1, 2)), shape(Shape::Line(1, 3)), shape(Shape::Named("bee")),
+            shape(Shape::Named("be")), shape(Shape::Dot), shape(Shape::Many(&[]))])); 
+        out.push(format!("{:?}", [pair(&Pair(7, Some(Shape::Many(&[1, 2, 3])))), pair(&Pair(7, Some(Shape::Many(&[1, 2])))),
+            pair(&Pair(7, None)), pair(&Pair(1, None)), pair(&Pair(7, Some(Shape::Many(&[1, 2, 4]))))])); 
+        out.push(format!("{:?}", [bytes(b"hello"), bytes(b""), bytes(b"hellp"), bytes(b"hell")])); 
+        out.push(format!("{:?}", [arr(E), arr([(1, true), (2, true)])])); 
+        out.push(format!("{:?}", [fl((1.5, 'x')), fl((1.5, 'y')), fl((f32::NAN, 'x'))])); 
+        out
+    }
+}
+
+pub mod array_map {
+    pub fn run() -> Vec<String> {
+        let doubled = [1u8, 2, 3].map(|x| x as u32 * 2);
+        let owned = [String::from("a"), String::from("b")].map(|s| s + "!");
+        vec![format!("{doubled:?}"), format!("{owned:?}")]
+    }
+}
+
+pub mod box_patterns {
+    pub struct Noisy(pub &'static str, pub std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(format!("drop {}", self.0));
+        }
+    }
+    pub enum List {
+        Nil,
+        Cons(u32, Box<List>),
+    }
+    fn sum(list: &List) -> u32 {
+        match list {
+            List::Nil => 0,
+            List::Cons(value, box rest) => *value + sum(rest),
+        }
+    }
+    fn take(pair: Box<(Noisy, Noisy)>) -> Noisy {
+        let box (first, _second) = pair;
+        first.1.borrow_mut().push("taken".to_owned());
+        first
+    }
+    fn by_ref(option: &Box<Option<String>>) -> usize {
+        match option {
+            box Some(text) => text.len(),
+            box None => 0,
+        }
+    }
+    fn mutate(pair: &mut Box<(u8, String)>) {
+        let box (_, ref mut text) = *pair;
+        text.push('!');
+    }
+    fn nested(inner: Box<Box<Noisy>>) -> &'static str {
+        let box box noisy = inner;
+        noisy.0
+    }
+
+    pub fn run() -> Vec<String> {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
+        let mut out = vec![sum(&list).to_string()];
+        let kept = take(Box::new((Noisy("a", log.clone()), Noisy("b", log.clone()))));
+        out.push(kept.0.to_owned());
+        out.push(by_ref(&Box::new(Some("hey".to_owned()))).to_string());
+        out.push(by_ref(&Box::new(None)).to_string());
+        let mut pair = Box::new((1, "x".to_owned()));
+        mutate(&mut pair);
+        out.push(pair.1.clone());
+        out.push(nested(Box::new(Box::new(Noisy("n", log.clone())))).to_owned());
+        drop(kept);
+        out.extend(log.borrow().iter().cloned());
+        out
+    }
+}
+
+pub mod promoted_call {
+    #[repr(packed)]
+    pub struct Packed(pub u8, pub u32);
+
+    // `size_of` is promotable: `&size_of::<T>()` is a constant, not a call that writes one.
+    pub fn run() -> Vec<String> {
+        let size: &'static usize = &std::mem::size_of::<Packed>();
+        assert_eq!(std::mem::size_of::<Packed>(), 5);
+        vec![size.to_string()]
+    }
+}
+
+pub mod type_ids {
+    use std::any::{Any, TypeId};
+
+    #[derive(Debug)]
+    pub struct Local(pub u8);
+    pub struct Generic<T>(pub T);
+
+    // A `TypeId` has to be the one rustc computed, or a value boxed by one compiler does not
+    // downcast in code from the other.
+    pub fn run() -> Vec<String> {
+        let boxed: Box<dyn Any> = Box::new(Local(3));
+        vec![
+            format!("{:?}", boxed.downcast_ref::<Local>()),
+            boxed.downcast_ref::<String>().is_some().to_string(),
+            boxed.is::<Local>().to_string(),
+            (TypeId::of::<Generic<Vec<u8>>>() == TypeId::of::<Generic<Vec<u8>>>()).to_string(),
+            (TypeId::of::<(u8, &'static str)>() == TypeId::of::<[u8; 4]>()).to_string(),
+            (TypeId::of::<dyn Any>() == TypeId::of::<fn(u8) -> u8>()).to_string(),
+            (boxed.type_id() == TypeId::of::<Box<dyn Any>>()).to_string(),
+        ]
+    }
+}
+
+/// A destructor that panics does not stop the values next to it from being dropped, each once.
+pub mod unwind_drops {
+    use std::cell::RefCell;
+    use std::panic::{self, AssertUnwindSafe};
+
+    type Log = RefCell<Vec<u8>>;
+
+    /// Logs its number when dropped, and panics after that if the number is the log's first
+    /// entry, which is the one to fail.
+    struct Noisy<'a>(u8, &'a Log);
+
+    impl Drop for Noisy<'_> {
+        fn drop(&mut self) {
+            let failing = self.1.borrow()[0];
+            self.1.borrow_mut().push(self.0);
+            if self.0 == failing {
+                panic::panic_any(self.0);
+            }
+        }
+    }
+
+    struct Two<'a>(Noisy<'a>, Noisy<'a>);
+
+    fn array(log: &Log) {
+        let _all = [Noisy(1, log), Noisy(2, log), Noisy(3, log)];
+    }
+
+    fn tuple(log: &Log) {
+        let _all = (Noisy(1, log), Two(Noisy(2, log), Noisy(3, log)), Noisy(4, log));
+    }
+
+    fn boxed(log: &Log) {
+        let _all = Box::new((Noisy(1, log), Noisy(2, log)));
+        let _slice: Box<[Noisy<'_>]> = vec![Noisy(3, log), Noisy(4, log)].into_boxed_slice();
+    }
+
+    fn assigned(log: &Log) {
+        let mut pair = (Noisy(1, log), Noisy(2, log));
+        pair.1 = Noisy(3, log);
+        let moved = pair.0;
+        pair.0 = Noisy(4, log);
+        drop(moved);
+    }
+
+    fn subslice(log: &Log) {
+        let all = [Noisy(1, log), Noisy(2, log), Noisy(3, log)];
+        let [_, _rest @ ..] = all;
+    }
+
+    fn partly_moved(log: &Log) {
+        let all = (Noisy(1, log), Noisy(2, log), Noisy(3, log));
+        drop(all.1);
+    }
+
+    /// The operands of an expression that unwinds go before the temporaries it borrowed.
+    fn operands(log: &Log) {
+        (Noisy(1, log), &Noisy(2, log), Noisy(3, log), &Noisy(4, log), panic::panic_any(0u8));
+    }
+
+    pub fn run() -> Vec<Vec<u8>> {
+        let cases: [fn(&Log); 6] = [array, tuple, boxed, assigned, subslice, partly_moved];
+        let mut logs = Vec::new();
+        let mut run = |case: fn(&Log), failing| {
+            let log = RefCell::new(vec![failing]);
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| case(&log)));
+            logs.push(log.into_inner());
+        };
+        for case in cases {
+            (0..5).for_each(|failing| run(case, failing));
+        }
+        // This one unwinds by itself, and a second panic on the way out would abort.
+        run(operands, 0);
+        logs
+    }
+}
+
+pub mod async_drops {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    type Log = Rc<RefCell<Vec<u32>>>;
+
+    struct Noisy(u32, Log, u32);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+            if self.0 == self.2 {
+                panic!("drop of {}", self.0);
+            }
+        }
+    }
+
+    struct Pair(Noisy, Noisy);
+
+    struct Yield(bool);
+
+    impl Future for Yield {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if std::mem::replace(&mut self.0, true) { Poll::Ready(()) } else { Poll::Pending }
+        }
+    }
+
+    // The safe `drop` is coerced to an unsafe function pointer in a promoted constant.
+    fn raw_waker(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &RawWakerVTable::new(raw_waker, drop, drop, drop))
+    }
+
+    async fn moves(log: Log, first: bool, second: bool, fails: u32) {
+        for i in 0..2u32 {
+            let x;
+            let y;
+            if (first && i == 0) || (second && i == 1) {
+                let at = i * 10;
+                x = (
+                    Noisy(at + 1, log.clone(), fails),
+                    Noisy(at + 2, log.clone(), fails),
+                    Noisy(at + 3, log.clone(), fails),
+                );
+                Yield(false).await;
+                y = Pair(Noisy(at + 4, log.clone(), fails), Noisy(at + 5, log.clone(), fails));
+                drop(x.1);
+                Yield(false).await;
+                drop(y.0);
+                Yield(false).await;
+            }
+        }
+    }
+
+    pub fn run() -> Vec<String> {
+        let waker = unsafe { Waker::from_raw(raw_waker(std::ptr::null())) };
+        let cloned = waker.clone();
+        let cx = &mut Context::from_waker(&cloned);
+        let mut out = Vec::new();
+        for (first, second) in [(true, false), (false, true), (true, true)] {
+            for fails in [0, 3, 5, 12, 14] {
+                for polls in 0..8 {
+                    let log = Log::default();
+                    let panicked = catch_unwind(AssertUnwindSafe(|| {
+                        let mut future = Box::pin(moves(log.clone(), first, second, fails));
+                        for _ in 0..polls {
+                            if future.as_mut().poll(cx).is_ready() {
+                                break;
+                            }
+                        }
+                    }))
+                    .is_err();
+                    let log = log.borrow();
+                    out.push(format!("{first} {second} {fails} {polls} {panicked} {log:?}"));
+                }
+            }
+        }
+        out
+    }
+}
+
+pub mod promoted_assoc_const {
+    use std::marker::PhantomData;
+
+    struct Vtable {
+        align: fn() -> usize,
+        size: fn() -> usize,
+    }
+    struct Owned<T>(PhantomData<T>);
+    fn size_of_it<T>() -> usize {
+        std::mem::size_of::<T>()
+    }
+    fn align_of_it<T>() -> usize {
+        std::mem::align_of::<T>()
+    }
+    impl<T> Owned<T> {
+        const VTABLE: Vtable = Vtable { align: align_of_it::<T>, size: size_of_it::<T> };
+    }
+    struct Handle {
+        vtable: &'static Vtable,
+    }
+    // The borrow outlives the call, so the constant has to be a static.
+    fn make<T>(_: T) -> Handle {
+        Handle { vtable: &Owned::<T>::VTABLE }
+    }
+
+    pub fn run() -> Vec<usize> {
+        let (a, b) = (make(1u8), make([0u32; 5]));
+        vec![(a.vtable.size)(), (b.vtable.size)(), (a.vtable.align)(), (b.vtable.align)()]
+    }
+}
+
+pub mod offsets {
+    use std::mem::offset_of;
+
+    #[repr(C)]
+    struct Outer {
+        a: u8,
+        b: u32,
+        c: (u16, u64),
+        d: Inner,
+    }
+    #[repr(C)]
+    struct Inner {
+        x: u8,
+        y: [u16; 3],
+    }
+    struct Generic<T> {
+        _a: u8,
+        t: T,
+        z: u16,
+    }
+    fn generic<T>() -> (usize, usize) {
+        (offset_of!(Generic<T>, t), offset_of!(Generic<T>, z))
+    }
+    const NESTED: usize = offset_of!(Outer, d.y);
+
+    pub fn run() -> Vec<usize> {
+        let (wide, narrow) = (generic::<u64>(), generic::<[u8; 3]>());
+        vec![
+            offset_of!(Outer, a),
+            offset_of!(Outer, b),
+            offset_of!(Outer, c.1),
+            offset_of!(Outer, d.x),
+            NESTED,
+            wide.0,
+            wide.1,
+            narrow.0,
+            narrow.1,
+            offset_of!((u8, u64, u16), 2),
+        ]
+    }
+}
+
+pub mod backtraces {
+    use std::backtrace::{Backtrace, BacktraceStatus};
+
+    struct Report {
+        code: u32,
+        // Its layout hangs on a type alias for an `impl Trait` inside std.
+        backtrace: Option<Backtrace>,
+    }
+
+    fn report(code: u32) -> Report {
+        Report { code, backtrace: (code > 1).then(Backtrace::disabled) }
+    }
+
+    pub fn run() -> Vec<usize> {
+        let (a, b) = (report(1), report(2));
+        let disabled =
+            b.backtrace.as_ref().is_some_and(|it| it.status() == BacktraceStatus::Disabled);
+        vec![
+            std::mem::size_of::<Report>(),
+            a.code as usize,
+            a.backtrace.is_none() as usize,
+            b.code as usize,
+            disabled as usize,
+        ]
+    }
+}
+
+// An inline `const { .. }` block declares bindings of its own.
+pub mod inline_const_bindings {
+    trait Swizzle<const N: usize> {
+        const INDEX: [usize; N];
+
+        fn indices() -> [u32; N] {
+            const {
+                let mut output = [0; N];
+                let mut i = 0;
+                while i < N {
+                    let index = Self::INDEX[i];
+                    assert!(index < 100);
+                    output[i] = index as u32;
+                    i += 1;
+                }
+                struct Indices<const LEN: usize>([u32; LEN]);
+                Indices(output)
+            }
+            .0
+        }
+    }
+
+    struct Reverse;
+    impl Swizzle<3> for Reverse {
+        const INDEX: [usize; 3] = [2, 1, 0];
+    }
+
+    pub fn run() -> Vec<u32> {
+        let nested = std::mem::offset_of!(((u8, (u8, u16)), (u8, u32, u16)), 0.1.1);
+        let mut out = Reverse::indices().to_vec();
+        out.push(nested as u32);
+        out
+    }
+}
+
+// A closure is `Clone` when what it captured is, and clones capture by capture.
+pub mod closure_clone {
+    fn twice<F: Fn(i32) -> String + Clone>(f: F) -> (String, String) {
+        let g = f.clone();
+        (f(1), g(2))
+    }
+
+    pub fn run() -> Vec<(String, String)> {
+        let s = String::from("hi");
+        let v = vec![1, 2, 3];
+        let r = &v;
+        let captures = move |x: i32| format!("{s} {x} {}", r.len());
+        let plain = |x: i32| x.to_string();
+        vec![twice(captures.clone()), twice(captures), twice(plain)]
+    }
+}
+
+/// `TypeId`s are rustc's hash of the type, which its own code compares ours against.
+pub mod type_id_hashes {
+    use std::any::{Any, TypeId};
+    use std::collections::HashMap;
+    use std::fmt::Debug;
+
+    pub struct Unit;
+    pub struct Tuple(pub u8, u16);
+    struct Record {
+        _a: u32,
+        pub _b: String,
+        pub(crate) _c: bool,
+    }
+    #[repr(C)]
+    pub struct ReprC {
+        pub a: u8,
+    }
+    #[repr(transparent)]
+    pub struct Transparent(u64);
+    #[repr(C, packed(2))]
+    pub struct Packed(u64);
+    #[repr(align(32))]
+    pub struct Aligned(u8);
+    pub enum Plain {
+        A,
+        B,
+    }
+    #[repr(u8)]
+    pub enum Assigned {
+        A = 3,
+        B,
+        C = 9,
+        D,
+    }
+    #[non_exhaustive]
+    pub enum Payload {
+        Unit,
+        Tuple(u8, Box<Payload>),
+        Record { _a: u8 },
+    }
+    pub union Either {
+        pub a: u8,
+        _b: u32,
+    }
+    pub struct Generic<T, const N: usize>(pub [T; N]);
+    pub struct Borrowed<'a>(pub &'a str);
+    pub mod inner {
+        pub struct Nested(pub(super) u8, pub(in crate::type_id_hashes) u8, pub(self) u8);
+    }
+    pub trait Shape {}
+    pub trait Convert<T> {}
+
+    fn id<T: ?Sized + 'static>() -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    pub fn primitives() -> Vec<TypeId> {
+        vec![
+            id::<bool>(),
+            id::<char>(),
+            id::<u8>(),
+            id::<i8>(),
+            id::<u16>(),
+            id::<i32>(),
+            id::<u64>(),
+            id::<i128>(),
+            id::<usize>(),
+            id::<isize>(),
+            id::<f32>(),
+            id::<f64>(),
+            id::<str>(),
+            id::<()>(),
+        ]
+    }
+
+    pub fn compound() -> Vec<TypeId> {
+        vec![
+            id::<&'static str>(),
+            id::<&'static mut u8>(),
+            id::<*const u8>(),
+            id::<*mut [u16]>(),
+            id::<[u8]>(),
+            id::<[u8; 4]>(),
+            id::<[[u32; 2]; 300]>(),
+            id::<(u8,)>(),
+            id::<(u8, &'static str, [i64; 0])>(),
+        ]
+    }
+
+    pub fn local_structs() -> Vec<TypeId> {
+        vec![id::<Unit>(), id::<Tuple>(), id::<Record>(), id::<inner::Nested>()]
+    }
+
+    pub fn local_reprs() -> Vec<TypeId> {
+        vec![id::<ReprC>(), id::<Transparent>(), id::<Packed>(), id::<Aligned>()]
+    }
+
+    pub fn local_enums() -> Vec<TypeId> {
+        vec![id::<Plain>(), id::<Assigned>(), id::<Payload>(), id::<Either>()]
+    }
+
+    pub fn local_generics() -> Vec<TypeId> {
+        vec![
+            id::<Generic<u8, 3>>(),
+            id::<Generic<Unit, 0>>(),
+            id::<Borrowed<'static>>(),
+            id::<Generic<Borrowed<'static>, 1>>(),
+        ]
+    }
+
+    pub fn std_types() -> Vec<TypeId> {
+        vec![
+            id::<String>(),
+            id::<Option<u8>>(),
+            id::<Result<(), String>>(),
+            id::<Vec<u8>>(),
+            id::<Box<str>>(),
+            id::<std::cell::Cell<u8>>(),
+            id::<std::marker::PhantomData<u8>>(),
+            id::<std::mem::ManuallyDrop<u8>>(),
+            id::<std::pin::Pin<Box<u8>>>(),
+            id::<std::rc::Rc<Unit>>(),
+            id::<std::sync::Arc<Plain>>(),
+            id::<HashMap<String, Vec<u32>>>(),
+            id::<std::io::Error>(),
+            id::<std::fmt::Error>(),
+            id::<std::num::NonZeroU8>(),
+            id::<std::time::Duration>(),
+            id::<std::cmp::Ordering>(),
+        ]
+    }
+
+    pub fn trait_objects() -> Vec<TypeId> {
+        vec![
+            id::<dyn Any>(),
+            id::<dyn Any + Send>(),
+            id::<dyn Any + Send + Sync>(),
+            id::<dyn Debug>(),
+            id::<dyn Shape>(),
+            id::<dyn Convert<u8> + Sync>(),
+            id::<Box<dyn std::error::Error + Send + Sync>>(),
+            id::<&'static dyn Shape>(),
+        ]
+    }
+
+    type Pick = for<'a, 'b> fn(&'a u8, &'b u8) -> &'b u8;
+    type PickSwapped = for<'a, 'b> fn(&'b u8, &'a u8) -> &'a u8;
+    type Nested = for<'a> fn(&'a u8, for<'b> fn(&'b u8, &'a u8) -> &'b u8) -> Borrowed<'a>;
+    type Callback = dyn for<'a> Fn(&'a str) -> &'a str + Send;
+    type Visitor = Box<dyn for<'a, 'b> FnMut(&'a mut Vec<&'b u8>, &'b u8)>;
+
+    pub fn functions() -> Vec<TypeId> {
+        vec![
+            id::<fn()>(),
+            id::<fn(u8) -> u8>(),
+            id::<unsafe fn(u8, String) -> Vec<u8>>(),
+            id::<extern "C" fn(i32) -> i32>(),
+            id::<unsafe extern "C" fn(*const u8, ...) -> i32>(),
+            id::<fn(fn(u8) -> String) -> !>(),
+            id::<Pick>(),
+            id::<PickSwapped>(),
+            id::<Nested>(),
+            id::<Callback>(),
+            id::<Visitor>(),
+        ]
+    }
+
+    /// The lifetimes these leave out are bound by the signature, which only rustc knows.
+    pub fn elided() -> Vec<TypeId> {
+        vec![
+            id::<fn(&u8) -> &u8>(),
+            id::<fn(&mut Borrowed<'_>) -> Borrowed<'static>>(),
+            id::<dyn FnMut(&str) -> &str>(),
+            id::<Box<dyn Fn(&dyn Fn(&u8) -> &u8) -> Box<dyn Iterator<Item = &'static str>>>>(),
+            id::<std::iter::Map<std::slice::Iter<'static, u8>, fn(&u8) -> u8>>(),
+        ]
+    }
+
+    fn of_value<T: 'static>(_: &T) -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    fn generic_item<T, const N: usize>(_: T) {}
+
+    /// Function items, which are named by their path and what they were instantiated with.
+    pub fn function_items() -> Vec<TypeId> {
+        vec![
+            of_value(&id::<u8>),
+            of_value(&id::<dyn Shape>),
+            of_value(&primitives),
+            of_value(&generic_item::<Unit, 3>),
+            of_value(&std::io::stdout),
+            of_value(&std::mem::drop::<String>),
+            of_value(&<u8 as Clone>::clone),
+            of_value(&<Vec<u8> as Default>::default),
+            id::<Option<Generic<u8, 1>>>(),
+        ]
+    }
+
+    struct Holder<F>(F, u8);
+
+    fn two_closures<T: 'static>(seed: T) -> (impl Fn() -> u8 + 'static, impl Fn(&str) -> usize) {
+        let _ = seed;
+        (|| 1, |text: &str| text.len())
+    }
+
+    fn is<T: 'static>(_: &T, any: &dyn Any) -> bool {
+        any.is::<T>()
+    }
+
+    /// A closure's `TypeId` is only ever compared with what was made from the same closure.
+    pub fn closures() -> Vec<bool> {
+        let captured = String::from("captured");
+        let borrowing = move |field: &str| field.len() + captured.len();
+        let plain = |a: u8| a + 1;
+        let (first, second) = two_closures(0u8);
+        let (other, _) = two_closures(0u16);
+        let held: Box<dyn Any> = Box::new(Holder(plain, 3));
+        vec![
+            of_value(&borrowing) == of_value(&borrowing),
+            of_value(&borrowing) == of_value(&plain),
+            of_value(&first) == of_value(&second),
+            of_value(&first) == of_value(&other),
+            of_value(&first) == of_value(&two_closures(1u8).0),
+            is(&Holder(plain, 0), &*held),
+            is(&plain, &*held),
+            held.downcast_ref::<Holder<fn(u8) -> u8>>().is_some(),
+            borrowing("ab") == 10 && first() == 1 && second("abc") == 3 && other() == 1,
+        ]
+    }
+
+    /// And so is that of the future of an `async` block or function.
+    pub fn futures() -> Vec<bool> {
+        async fn waits<T>(value: T) -> T {
+            value
+        }
+        let block = async { 1u8 };
+        let other = async { 1u8 };
+        let held: Box<dyn Any> = Box::new(Some(waits(2u8)));
+        vec![
+            of_value(&block) == of_value(&block),
+            of_value(&block) == of_value(&other),
+            of_value(&waits(1u8)) == of_value(&waits(2u8)),
+            of_value(&waits(1u8)) == of_value(&waits(1u16)),
+            is(&Some(waits(3u8)), &*held),
+            is(&Some(waits(3u16)), &*held),
+        ]
+    }
+
+    fn name_of<T>(_: &T) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    pub fn type_names() -> Vec<&'static str> {
+        let outer = |a: u8| {
+            let inner = move |b: u8| a + b;
+            (name_of(&inner), inner(1))
+        };
+        vec![
+            name_of(&outer),
+            outer(1).0,
+            name_of(&primitives),
+            name_of(&Holder(|| 3u8, 0)),
+            std::any::type_name::<Generic<Unit, 2>>(),
+            std::any::type_name::<(&'static str, Vec<Option<Box<dyn Shape>>>)>(),
+        ]
+    }
+
+    pub fn projections() -> Vec<TypeId> {
+        vec![
+            id::<dyn Iterator<Item = u8>>(),
+            id::<dyn DoubleEndedIterator<Item = (u8, String)> + Send>(),
+            id::<dyn Fn(u8) -> u8>(),
+            id::<dyn std::ops::Deref<Target = [u8]>>(),
+            id::<dyn std::future::Future<Output = Result<(), std::io::Error>> + Send>(),
+            id::<dyn Convert<&'static str>>(),
+        ]
+    }
+
+    pub fn more_std_types() -> Vec<TypeId> {
+        vec![
+            id::<std::borrow::Cow<'static, str>>(),
+            id::<std::collections::BTreeMap<u8, &'static [u8]>>(),
+            id::<std::collections::HashSet<char>>(),
+            id::<std::collections::VecDeque<f64>>(),
+            id::<std::sync::Mutex<Option<Box<dyn Any + Send>>>>(),
+            id::<std::sync::atomic::AtomicUsize>(),
+            id::<std::path::PathBuf>(),
+            id::<std::path::Path>(),
+            id::<std::ffi::OsString>(),
+            id::<std::ffi::CStr>(),
+            id::<std::net::IpAddr>(),
+            id::<std::ops::Range<usize>>(),
+            id::<std::ops::RangeInclusive<i128>>(),
+            id::<std::fmt::Arguments<'static>>(),
+            id::<std::thread::Thread>(),
+            id::<std::fs::File>(),
+            id::<std::cell::RefCell<std::rc::Weak<Record>>>(),
+            id::<std::mem::MaybeUninit<[u16; 7]>>(),
+            id::<std::num::Wrapping<i8>>(),
+            id::<std::task::Poll<Option<u8>>>(),
+            id::<std::alloc::Layout>(),
+            id::<std::char::ParseCharError>(),
+            id::<std::string::FromUtf8Error>(),
+            id::<std::num::ParseIntError>(),
+            id::<std::convert::Infallible>(),
+            id::<std::vec::IntoIter<u8>>(),
+            id::<std::panic::Location<'static>>(),
+            id::<std::time::Instant>(),
+            id::<std::process::ExitCode>(),
+        ]
+    }
+
+    pub struct BodyHolder;
+    pub trait BodyMaker {
+        fn make() -> TypeId;
+    }
+    impl BodyHolder {
+        fn inherent() -> TypeId {
+            struct Local(#[allow(dead_code)] u8);
+            TypeId::of::<Local>()
+        }
+    }
+    impl BodyMaker for BodyHolder {
+        fn make() -> TypeId {
+            struct Local;
+            TypeId::of::<Local>()
+        }
+    }
+    impl BodyMaker for u8 {
+        fn make() -> TypeId {
+            enum Local {
+                #[allow(dead_code)]
+                A,
+            }
+            TypeId::of::<Local>()
+        }
+    }
+
+    /// Types declared in bodies, and one of the standard library's that only a body names.
+    pub fn in_bodies() -> (Vec<TypeId>, bool, String) {
+        struct InFn(#[allow(dead_code)] u8);
+        let ids = vec![
+            TypeId::of::<InFn>(),
+            BodyHolder::inherent(),
+            <BodyHolder as BodyMaker>::make(),
+            <u8 as BodyMaker>::make(),
+        ];
+        let error: Box<dyn std::error::Error + Send + Sync> = String::from("boxed").into();
+        (ids, error.is::<std::fmt::Error>(), error.to_string())
+    }
+
+    pub fn downcasts() -> (Option<u8>, Option<String>, bool, bool) {
+        let boxed: Box<dyn Any> = Box::new(7u8);
+        let error: Box<dyn std::error::Error + Send + Sync> = Box::new(std::fmt::Error);
+        let record: &dyn Any = &Tuple(1, 2);
+        (
+            boxed.downcast_ref::<u8>().copied(),
+            boxed.downcast_ref::<String>().cloned(),
+            error.downcast_ref::<std::fmt::Error>().is_some(),
+            record.is::<Tuple>(),
+        )
+    }
+}
+
+pub mod type_names {
+    pub struct Plain;
+    pub struct Generic<A, B = u8>(pub A, pub B);
+    pub mod inner {
+        pub enum Choice {
+            A,
+        }
+    }
+
+    fn of<T: ?Sized>(_: &T) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    pub fn run() -> Vec<&'static str> {
+        vec![
+            of(&Generic(1i8, [Plain, Plain])),
+            std::any::type_name::<Generic<&'static str>>(),
+            std::any::type_name::<inner::Choice>(),
+            std::any::type_name::<Option<Vec<(u8, String)>>>(),
+            std::any::type_name::<*const [u16]>(),
+            std::any::type_name::<&mut (i32,)>(),
+            std::any::type_name::<dyn std::fmt::Debug + Send>(),
+        ]
+    }
+
+    pub struct Holder<T>(pub T);
+
+    pub trait Named {
+        fn named<F: Fn()>(&self, f: F) -> &'static str;
+    }
+
+    fn generic<T, const N: usize>(_: T) {}
+
+    impl<T> Holder<T> {
+        fn inherent<F: Fn() -> u8>(&self, f: F) -> [&'static str; 3] {
+            let inner = || f();
+            [of(&inner), of(&Self::inherent::<F>), of(&generic::<F, 3>)]
+        }
+
+        async fn waits(&self, f: impl Fn() -> u8) -> &'static str {
+            let inner = || f();
+            of(&inner)
+        }
+    }
+
+    impl<T> Named for Holder<T> {
+        fn named<F: Fn()>(&self, f: F) -> &'static str {
+            let inner = || f();
+            of(&inner)
+        }
+    }
+
+    impl Named for u8 {
+        fn named<F: Fn()>(&self, f: F) -> &'static str {
+            let inner = || f();
+            of(&inner)
+        }
+    }
+
+    mod elsewhere {
+        impl super::Named for super::inner::Choice {
+            fn named<F: Fn()>(&self, f: F) -> &'static str {
+                let inner = || f();
+                super::of(&inner)
+            }
+        }
+    }
+
+    /// Names that go through an `impl`, a generic function or a closure of one.
+    pub fn nested() -> Vec<&'static str> {
+        use std::future::Future;
+        let holder = Holder(Some(1u16));
+        let mut names = holder.inherent(|| 1).to_vec();
+        let future = std::pin::pin!(holder.waits(|| 2));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(name) = future.poll(&mut cx) {
+            names.push(name);
+        }
+        names.push(holder.named(|| ()));
+        names.push(7u8.named(|| ()));
+        names.push(inner::Choice::A.named(|| ()));
+        names.push(std::any::type_name::<std::slice::Iter<'static, u8>>());
+        names
+    }
+}
+
+pub mod promoted_slices {
+    /// `&[..][..]` borrows the array and then indexes it: the temporary that is promoted is
+    /// the array, not the slice the index returns.
+    pub fn run() -> (usize, Vec<i32>, usize, Vec<u64>, [u64; 2]) {
+        let a = &[0i32, 0, 0, 0][..];
+        let b = &[5, 6, 7, 8][..];
+        let c = &[0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..];
+        let d = &[5u64, 6, 7, 8][1..3];
+        let e = &[[5u64, 6], [7, 8]][1];
+        (a.len(), b.to_vec(), c.len(), d.to_vec(), *e)
+    }
+}
+
+pub mod reified {
+    #[derive(Debug)]
+    pub struct W(u8, String);
+    #[derive(Debug)]
+    pub enum E {
+        A(u64, u64, u64),
+        B,
+    }
+    pub trait Tr {
+        fn m(&self, x: u32) -> u32;
+    }
+    impl Tr for u32 {
+        fn m(&self, x: u32) -> u32 {
+            *self + x
+        }
+    }
+    fn plain(a: u8, b: &str) -> String {
+        format!("{a}{b}")
+    }
+    extern "C" fn cfn(a: u32) -> u32 {
+        a * 2
+    }
+
+    pub fn run() -> Vec<String> {
+        let mut out = Vec::new();
+        let f: fn(u8, String) -> W = W;
+        out.push(format!("{:?}", f(1, "a".into())));
+        let g: fn(u64, u64, u64) -> E = E::A;
+        out.push(format!("{:?} {:?}", g(1, 2, 3), E::B));
+        let s: fn(u8) -> Option<u8> = Some;
+        out.push(format!("{:?}", s(4)));
+        let d: fn(&(dyn Tr + 'static), u32) -> u32 = <dyn Tr>::m;
+        out.push(format!("{}", d(&5u32, 6)));
+        let b: Box<dyn Fn(u8, String) -> W> = Box::new(W);
+        out.push(format!("{:?}", b(2, "b".into())));
+        let b: Box<dyn Fn(u8, &str) -> String> = Box::new(plain);
+        out.push(b(3, "c"));
+        let p: fn(u8, &str) -> String = plain;
+        let mut b: Box<dyn FnMut(u8, &str) -> String> = Box::new(p);
+        out.push(b(4, "d"));
+        let b: Box<dyn FnOnce(u64, u64, u64) -> E> = Box::new(E::A);
+        out.push(format!("{:?}", b(7, 8, 9)));
+        let b: Box<dyn FnOnce(u8, &str) -> String> = Box::new(p);
+        out.push(b(5, "e"));
+        let r: extern "C" fn(u32) -> u32 = cfn;
+        out.push(format!("{:?}", r(5)));
+        let v: Vec<Box<dyn Fn(u8) -> Option<u8>>> =
+            vec![Box::new(Some), Box::new(|x| x.checked_add(250))];
+        out.push(format!("{:?}", v.iter().map(|f| f(9)).collect::<Vec<_>>()));
+        out
+    }
+}
+
+pub mod boxed_fn_once {
+    use std::sync::Mutex;
+
+    static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct D(&'static str);
+    impl Drop for D {
+        fn drop(&mut self) {
+            LOG.lock().unwrap().push(format!("drop {}", self.0));
+        }
+    }
+    fn call(f: Box<dyn FnOnce(u8) -> u8 + Send>) -> u8 {
+        f(1)
+    }
+
+    pub fn run() -> Vec<String> {
+        let log = |it: String| LOG.lock().unwrap().push(it);
+        let d = D("a");
+        let b: Box<dyn FnOnce(u8) -> u8 + Send> = Box::new(move |x| x + d.0.len() as u8);
+        log(format!("{}", call(b)));
+        let d = D("b");
+        let b: Box<dyn FnOnce()> = Box::new(move || {
+            let _d = &d;
+        });
+        drop(b);
+        let d = D("c");
+        let b: Box<dyn FnOnce()> = Box::new(move || {
+            let _d = d;
+            panic!("boom")
+        });
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(b));
+        log(format!("{}", r.is_err()));
+        let d = D("d");
+        let b: Box<dyn Fn(u8) -> u8> = Box::new(move |x| x + d.0.len() as u8);
+        let once: Box<dyn FnOnce(u8) -> u8> = b;
+        log(format!("{}", once(3)));
+        let v: Vec<Box<dyn FnOnce() -> String>> = vec![Box::new(|| "x".into()), Box::new(String::new)];
+        for f in v {
+            log(f());
+        }
+        let h = std::thread::spawn(move || 5);
+        log(format!("{}", h.join().unwrap()));
+        std::mem::take(&mut *LOG.lock().unwrap())
+    }
+}
+
+pub mod overloaded_unary {
+    use std::ops::{Neg, Not};
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Bits(u8);
+    impl Not for Bits {
+        type Output = Self;
+        fn not(self) -> Self {
+            Bits(!self.0 & 7)
+        }
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Sat(i8);
+    impl Neg for Sat {
+        type Output = Self;
+        fn neg(self) -> Self {
+            Sat(self.0.saturating_neg())
+        }
+    }
+    impl Neg for &Sat {
+        type Output = i32;
+        fn neg(self) -> i32 {
+            -(self.0 as i32) * 100
+        }
+    }
+    #[derive(Debug)]
+    pub struct Wide(f64, String);
+    impl Neg for Wide {
+        type Output = Wide;
+        fn neg(self) -> Wide {
+            Wide(-self.0, self.1 + "!")
+        }
+    }
+    fn generic<T: Not<Output = T>>(value: T) -> T {
+        !value
+    }
+
+    pub fn run() -> String {
+        let (bits, sat) = (Bits(1), Sat(i8::MIN));
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            !bits,
+            generic(bits),
+            generic(5u8),
+            generic(true),
+            -sat,
+            -&sat,
+            -Wide(1.5, "w".into()),
+            -(-1.5f32),
+        )
+    }
+}
+
+/// A closure whose last capture is the widest one: its fields are free to be reordered, where
+/// the tuple of the same captures keeps the last one in place. Made and called in different
+/// functions, so that a mixed build has rustc's code and ours agree on where the captures are.
+pub mod closure_layout {
+    #[derive(Clone, Copy)]
+    #[repr(packed)]
+    pub struct Edge {
+        byte: u8,
+        next: u32,
+        link: u32,
+    }
+
+    pub struct Graph {
+        heads: Vec<u32>,
+        edges: Vec<Edge>,
+    }
+
+    impl Graph {
+        pub fn edges(&self, node: usize) -> impl Iterator<Item = Edge> + '_ {
+            let mut link = self.heads[node];
+            core::iter::from_fn(move || {
+                if link == 0 {
+                    return None;
+                }
+                let edge = self.edges[link as usize];
+                link = edge.link;
+                Some(edge)
+            })
+        }
+
+        pub fn follow(&self, node: usize, byte: u8) -> u32 {
+            for edge in self.edges(node) {
+                if byte <= edge.byte {
+                    if byte == edge.byte {
+                        return edge.next;
+                    }
+                    break;
+                }
+            }
+            99
+        }
+    }
+
+    pub fn small_first(a: u8, b: &str, c: u16) -> impl Fn(u64) -> String + '_ {
+        move |d| format!("{a} {b} {c} {d}")
+    }
+
+    pub fn call(f: &dyn Fn(u64) -> String) -> String {
+        f(7)
+    }
+
+    /// Collected by `Vec`'s general `from_iter`: the in-place one is for adapters of a
+    /// `vec::IntoIter`, which this iterator is not.
+    pub fn collected(graph: &Graph) -> Vec<u8> {
+        graph.edges(0).map(|edge| edge.byte).collect()
+    }
+
+    pub fn run() -> String {
+        let edge = |byte, next, link| Edge { byte, next, link };
+        let graph = Graph { heads: vec![1], edges: vec![edge(0, 0, 0), edge(3, 7, 2), edge(9, 8, 0)] };
+        format!(
+            "{} {} {} {} {} {:?}",
+            graph.follow(0, 9),
+            graph.follow(0, 3),
+            graph.follow(0, 4),
+            graph.edges(0).count(),
+            call(&small_first(1, "two", 3)),
+            collected(&graph),
+        )
+    }
+}
+
+/// `Vec`'s in-place `collect`, which is chosen by constants of the adapters (`MERGE_BY`) whose
+/// impls are spread over `core` and `alloc`.
+pub mod in_place_collect {
+    pub fn mapped(v: Vec<u32>) -> Vec<(u16, u16)> {
+        v.into_iter().map(|m| (m as u16, m as u16 + 1)).collect()
+    }
+
+    pub fn filtered(v: Vec<u64>) -> Vec<u32> {
+        v.into_iter().map(|m| m as u32).filter(|x| *x != 3).collect()
+    }
+
+    pub fn run() -> String {
+        format!("{:?} {:?}", mapped(vec![1, 2, 3]), filtered(vec![1, 2, 3, 4]))
+    }
+}
+
+/// A static that holds a `&dyn Trait` to another static: both the data pointer and the vtable
+/// are relocations.
+pub mod dyn_statics {
+    pub trait Callsite: Sync {
+        fn name(&self) -> &'static str;
+    }
+
+    pub struct First(u8);
+    pub struct Second(u16);
+
+    impl Callsite for First {
+        fn name(&self) -> &'static str {
+            "first"
+        }
+    }
+
+    impl Callsite for Second {
+        fn name(&self) -> &'static str {
+            "second"
+        }
+    }
+
+    static FIRST: First = First(1);
+    static SECOND: Second = Second(2);
+
+    pub struct Meta {
+        callsite: &'static dyn Callsite,
+        n: u32,
+    }
+
+    static ONE: Meta = Meta { callsite: &FIRST, n: 1 };
+    static TWO: Meta = Meta { callsite: &SECOND, n: 2 };
+    static INLINE: Meta = Meta { callsite: &Second(7), n: 3 };
+    const BOTH: [&dyn Callsite; 2] = [&FIRST, &SECOND];
+
+    fn same(a: &Meta, b: &Meta) -> bool {
+        core::ptr::addr_eq(a.callsite, b.callsite)
+    }
+
+    pub fn run() -> String {
+        format!(
+            "{} {} {} {} {} {} {}",
+            same(&ONE, &TWO),
+            same(&ONE, &ONE),
+            ONE.n + TWO.n + INLINE.n,
+            ONE.callsite.name(),
+            TWO.callsite.name(),
+            INLINE.callsite.name(),
+            BOTH.iter().map(|it| it.name()).collect::<String>(),
+        )
+    }
+}
+
+/// `as` between floats and 128-bit integers, which saturates and turns NaN into zero.
+pub mod wide_float_casts {
+    pub fn to_int(f: f32, d: f64) -> (i128, u128, i128, u128) {
+        (f as i128, f as u128, d as i128, d as u128)
+    }
+
+    pub fn to_float(a: i128, b: u128) -> (f32, f64, f32, f64) {
+        (a as f32, a as f64, b as f32, b as f64)
+    }
+
+    pub fn run() -> String {
+        let floats = [0.0f32, -1.0, 1.5, 3.0e38, f32::MAX, f32::MIN, f32::NAN, f32::INFINITY, 1e20];
+        let ints = [0i128, -1, i128::MAX, i128::MIN, 1 << 100, -(1 << 70), 12345678901234567890123];
+        let mut out = String::new();
+        for f in floats {
+            out += &format!("{:?} {:?}\n", to_int(f, f as f64 * 4.0), to_int(-f, -f as f64));
+        }
+        for a in ints {
+            out += &format!("{:?}\n", to_float(a, a as u128));
+        }
+        out
+    }
+}
+
+/// Floats computed at compile time: a NaN is rustc's positive quiet one whatever the host's
+/// arithmetic gives, and casts to and from 128-bit integers saturate.
+pub mod const_floats {
+    use core::cmp::Ordering;
+
+    pub const CASTS: (f32, f64, u128, u128, i128, u128) = (
+        u128::MAX as f32,
+        i128::MIN as f64,
+        1e30f64 as u128,
+        3e38f32 as u128,
+        -1e30f32 as i128,
+        -5.0f64 as u128,
+    );
+    pub const NANS: (f32, f64, f64) = (0.0 / 0.0, f64::INFINITY - f64::INFINITY, f64::NAN);
+    pub const SMALL: (u8, i8, u32, u64, i64) =
+        (-0.5f32 as u8, f32::NAN as i8, f64::INFINITY as u32, -1.0f64 as u64, f64::MAX as i64);
+
+    pub fn total(a: f64, b: f64) -> Ordering {
+        a.total_cmp(&b)
+    }
+
+    pub fn total_single(a: &f32, b: &f32) -> Ordering {
+        f32::total_cmp(a, b)
+    }
+
+    pub fn sorted<T: Copy>(mut v: Vec<T>, cmp: impl Fn(&T, &T) -> Ordering) -> Vec<T> {
+        v.sort_by(cmp);
+        v
+    }
+
+    pub fn run() -> String {
+        let doubles = [f64::NAN, -f64::NAN, f64::INFINITY, -0.0, 0.0, -1.5, f64::NEG_INFINITY, 2.0];
+        let singles = [f32::NAN, -f32::NAN, f32::INFINITY, -0.0, 0.0, -1.5, f32::MIN, 2.0];
+        format!(
+            "{:?} {:?} {:x} {:x} {:x} {:?} {:?} {:?} {:?} {:?} {:?}",
+            CASTS,
+            SMALL,
+            NANS.0.to_bits(),
+            NANS.1.to_bits(),
+            NANS.2.to_bits(),
+            total(f64::NAN, f64::INFINITY),
+            total(-f64::NAN, f64::NEG_INFINITY),
+            total(-0.0, 0.0),
+            total_single(&f32::NAN, &f32::MAX),
+            sorted(doubles.to_vec(), f64::total_cmp),
+            sorted(singles.to_vec(), |a, b| total_single(a, b)),
+        )
+    }
+}
+
+/// Statics with equal contents are still different objects.
+pub mod static_identity {
+    pub trait Callsite: Sync {
+        fn id(&self) -> u32;
+    }
+    pub struct First {
+        _unused: u8,
+    }
+    pub struct Second {
+        _unused: u8,
+    }
+    impl Callsite for First {
+        fn id(&self) -> u32 {
+            1
+        }
+    }
+    impl Callsite for Second {
+        fn id(&self) -> u32 {
+            2
+        }
+    }
+    pub struct Meta {
+        pub name: &'static str,
+        pub site: &'static dyn Callsite,
+        pub plain: &'static First,
+    }
+    static FIRST: First = First { _unused: 0 };
+    static TWIN: First = First { _unused: 0 };
+    static SECOND: Second = Second { _unused: 0 };
+    static META: Meta = Meta { name: "a", site: &FIRST, plain: &FIRST };
+    static OTHER: Meta = Meta { name: "b", site: &SECOND, plain: &TWIN };
+
+    pub fn thin(meta: &Meta) -> *const () {
+        meta.site as *const _ as *const ()
+    }
+
+    pub fn run() -> String {
+        format!(
+            "{} {} {} {} {} {}",
+            thin(&META) == thin(&OTHER),
+            core::ptr::eq(META.plain, OTHER.plain),
+            core::ptr::eq(META.plain, &FIRST),
+            thin(&OTHER) == &SECOND as *const Second as *const (),
+            META.site.id(),
+            OTHER.site.id(),
+        )
+    }
+}
+
+/// `core::arch` vector functions, whose immediates are const generics written as arguments
+/// (`#[rustc_legacy_const_generics]`).
+#[cfg(target_arch = "x86_64")]
+#[rustfmt::skip]
+pub mod simd_x86 {
+    use core::arch::x86_64::*;
+    pub fn ext(v: __m128i) -> (i32, i32) { unsafe { (_mm_extract_epi16(v, 3), _mm_extract_epi16::<5>(v)) } }
+    pub fn shift(v: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_srli_si128(v, 3)) } }
+    pub fn shl(v: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_slli_si128(v, 5)) } }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn alignr(v: __m128i, w: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_alignr_epi8(v, w, 13)) } }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn pshufb(v: __m128i, w: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_shuffle_epi8(v, w)) } }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn unload(v: __m128i) -> [i32; 3] { [_mm_extract_epi8(v, 0), _mm_extract_epi8(v, 7), _mm_extract_epi8(v, 15)] }
+    pub fn lanes(v: __m128i) -> (i64, i64, i32) { unsafe { (_mm_cvtsi128_si64(v), _mm_cvtsi128_si64(_mm_srli_si128(v, 8)), _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(7)))) } }
+    pub fn shr16(v: __m128i) -> [u8; 16] { unsafe { core::mem::transmute(_mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0xF))) } }
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn wide(v: __m256i, w: __m256i) -> ([u8; 32], [u8; 32], [u8; 32], i32, i64, [u8; 32]) { unsafe {
+        let p = _mm256_permute2x128_si256(w, v, 0x21);
+        (core::mem::transmute(p), core::mem::transmute(_mm256_alignr_epi8(v, p, 15)), core::mem::transmute(_mm256_shuffle_epi8(v, w)),
+         _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, w)), _mm256_extract_epi64(v, 2), core::mem::transmute(_mm256_and_si256(_mm256_srli_epi16(v, 4), _mm256_set1_epi8(0xF))))
+    } }
+    pub fn run() -> String {
+        let mut out = String::new();
+        let v = unsafe { _mm_set_epi8(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16) };
+        let w = unsafe { _mm_set_epi8(-1,0,3,14,5,6,7,-8,9,1,11,2,3,4,15,6) };
+        out += &format!("{:?} {:?} {:?} {:?} {:?}", ext(v), shift(v), shl(v), lanes(v), shr16(w));
+        if is_x86_feature_detected!("ssse3") { out += &format!(" {:?} {:?} {:?}", unsafe { alignr(v, w) }, unsafe { pshufb(v, w) }, unsafe { unload(w) }); }
+        if is_x86_feature_detected!("avx2") { unsafe {
+            let a = _mm256_set_m128i(v, w); let b = _mm256_set_m128i(w, _mm_set1_epi8(9));
+            out += &format!(" {:?}", wide(a, b)); } }
+        out
+    }
+}
+
+/// An associated constant of an impl that is generic over a lifetime, named from a method of
+/// that impl.
+pub mod lifetime_impl_consts {
+    pub struct State<'a> {
+        pub trans: &'a [u32],
+    }
+
+    impl<'a> State<'a> {
+        const DENSE: u32 = 0xFF;
+        const ONE: u32 = Self::DENSE - 1;
+
+        pub fn kind(len: usize, force: bool) -> u32 {
+            if force || len > State::ONE as usize {
+                State::DENSE
+            } else if len == 1 {
+                State::ONE
+            } else {
+                len as u32
+            }
+        }
+
+        pub fn read(&self) -> u32 {
+            self.trans.iter().sum::<u32>() + Self::kind(self.trans.len(), false)
+        }
+    }
+
+    pub fn run() -> String {
+        let state = State { trans: &[1, 2, 3] };
+        format!("{} {} {} {}", State::kind(1, false), State::kind(4, true), State::kind(999, false), state.read())
+    }
+}
+
+/// `module_path!()` names the module it is written in, also through a macro and in a static.
+pub mod module_paths {
+    macro_rules! here {
+        () => {
+            module_path!()
+        };
+    }
+    static IN_STATIC: &str = module_path!();
+    const IN_CONST: (&str, usize) = (module_path!(), module_path!().len());
+
+    pub mod nested {
+        pub fn path() -> &'static str {
+            fn inner() -> &'static str {
+                module_path!()
+            }
+            inner()
+        }
+        pub fn through_macro() -> &'static str {
+            here!()
+        }
+    }
+
+    pub fn run() -> String {
+        format!(
+            "{} {} {} {} {:?}",
+            module_path!(),
+            nested::path(),
+            nested::through_macro(),
+            IN_STATIC,
+            IN_CONST
+        )
+    }
+}
+
+/// A lazy thread local with a destructor inside a function, as `block_on` caches its parker.
+pub mod fn_thread_local {
+    use std::cell::RefCell;
+
+    fn push<T: Into<u32>>(value: T) -> usize {
+        thread_local! {
+            static CACHE: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+        }
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.push(value.into());
+            cache.len()
+        })
+    }
+
+    pub fn run() -> (usize, usize, usize) {
+        let other = std::thread::spawn(|| push(7u8)).join().unwrap();
+        (push(1u8), push(2u16), other)
+    }
+}
+
+/// Items of one name at the module's level, in a function and in a closure are different items.
+pub mod shadowed_items {
+    struct D(u32);
+    impl Drop for D {
+        fn drop(&mut self) {
+            println!("outer D {}", self.0);
+        }
+    }
+    fn helper() -> u32 {
+        1
+    }
+    trait Name {
+        fn name(&self) -> &'static str;
+    }
+    impl Name for D {
+        fn name(&self) -> &'static str {
+            "outer"
+        }
+    }
+
+    fn in_function() -> u32 {
+        struct D(u32, bool);
+        impl Drop for D {
+            fn drop(&mut self) {
+                println!("fn D {} {}", self.0, self.1);
+            }
+        }
+        impl Name for D {
+            fn name(&self) -> &'static str {
+                "in function"
+            }
+        }
+        fn helper() -> u32 {
+            2
+        }
+        let d = D(5, true);
+        println!("{}", d.name());
+        helper() + d.0
+    }
+
+    fn in_closure() -> u32 {
+        let f = || {
+            struct D(u8);
+            impl Drop for D {
+                fn drop(&mut self) {
+                    println!("closure D {}", self.0);
+                }
+            }
+            fn helper() -> u32 {
+                3
+            }
+            let d = D(9);
+            helper() + d.0 as u32
+        };
+        f()
+    }
+
+    impl D {
+        fn in_method(&self) -> u32 {
+            struct D(u64);
+            impl Drop for D {
+                fn drop(&mut self) {
+                    println!("method D {}", self.0);
+                }
+            }
+            fn helper() -> u32 {
+                4
+            }
+            helper() + D(11).0 as u32 + self.0
+        }
+    }
+
+    pub fn run() -> u32 {
+        let d = D(100);
+        println!("{}", d.name());
+        helper() + in_function() + in_closure() + d.in_method()
+    }
+}
+
+/// A `for<'a>` written in a body binds its lifetime, so `Any` can't turn `'a` into `'static`.
+pub mod hrtb_type_ids {
+    use std::any::Any;
+
+    trait AsStr<'a, 'b> {
+        fn get(&'a self) -> &'b str;
+    }
+    impl<'a> AsStr<'a, 'a> for String {
+        fn get(&'a self) -> &'a str {
+            self
+        }
+    }
+
+    fn escape(s: String) -> Option<&'static str> {
+        let a: Box<dyn Any> = Box::new(Box::new(s) as Box<dyn for<'a> AsStr<'a, 'a>>);
+        a.downcast_ref::<Box<dyn for<'a> AsStr<'a, 'static>>>().map(|x| x.get())
+    }
+
+    fn same(s: String) -> Option<usize> {
+        let a: Box<dyn Any> = Box::new(Box::new(s) as Box<dyn for<'a> AsStr<'a, 'a>>);
+        a.downcast_ref::<Box<dyn for<'b> AsStr<'b, 'b>>>().map(|x| x.get().len())
+    }
+
+    pub fn run() -> (Option<&'static str>, Option<usize>) {
+        (escape(String::from("bar")), same(String::from("bar")))
+    }
+}
+
+/// A parameter typed `Self::Residual` in an impl is matched as the type the impl gives it.
+pub mod projected_patterns {
+    use std::convert::Infallible;
+    use std::task::Poll;
+
+    pub trait Try {
+        type Output;
+        type Residual;
+        fn from_residual(residual: Self::Residual) -> Self;
+        fn branch(self) -> Result<Self::Output, Self::Residual>;
+    }
+
+    impl<T> Try for Option<T> {
+        type Output = T;
+        type Residual = Option<Infallible>;
+        fn from_residual(residual: Self::Residual) -> Self {
+            match residual {
+                None => None,
+                Some(never) => match never {},
+            }
+        }
+        fn branch(self) -> Result<T, Self::Residual> {
+            match self {
+                Some(value) => Ok(value),
+                None => Err(None),
+            }
+        }
+    }
+
+    impl<T, E> Try for Poll<Result<T, E>> {
+        type Output = Poll<T>;
+        type Residual = Result<Infallible, E>;
+        fn from_residual(residual: Self::Residual) -> Self {
+            match residual {
+                Err(e) => Poll::Ready(Err(e)),
+                Ok(never) => match never {},
+            }
+        }
+        fn branch(self) -> Result<Poll<T>, Self::Residual> {
+            match self {
+                Poll::Pending => Ok(Poll::Pending),
+                Poll::Ready(Ok(value)) => Ok(Poll::Ready(value)),
+                Poll::Ready(Err(e)) => Err(Err(e)),
+            }
+        }
+    }
+
+    fn round_trip<R: Try>(value: R) -> Option<R> {
+        value.branch().err().map(R::from_residual)
+    }
+
+    pub fn run() -> (Option<Option<u8>>, Option<Poll<Result<u8, String>>>, bool) {
+        (
+            round_trip(None::<u8>),
+            round_trip(Poll::Ready(Err::<u8, _>(String::from("bad")))),
+            round_trip(Poll::Ready(Ok::<u8, String>(3))).is_none(),
+        )
+    }
+}
+
+/// A field typed `<Flags as Public>::Internal` is compared, ordered and hashed as `Inner`.
+pub mod projected_fields {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    pub trait Public {
+        type Internal;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Inner(u8);
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Flags(<Flags as Public>::Internal);
+
+    impl Public for Flags {
+        type Internal = Inner;
+    }
+
+    pub fn run() -> (bool, std::cmp::Ordering, Option<std::cmp::Ordering>, u64, String) {
+        let (a, b) = (Flags(Inner(1)), Flags(Inner(2)));
+        let mut hasher = DefaultHasher::new();
+        a.clone().hash(&mut hasher);
+        (a == b, a.cmp(&b), b.partial_cmp(&a), hasher.finish(), format!("{a:?}"))
+    }
+}
+
+/// Two `const _` blocks of one module each have an `Inner`, and rustc's symbols for the two
+/// read the same.
+pub mod anonymous_consts {
+    pub trait Named {
+        fn name(&self) -> String;
+    }
+
+    pub struct First;
+    pub struct Second;
+
+    const _: () = {
+        #[derive(Debug, PartialEq)]
+        struct Inner(u8);
+        impl Inner {
+            fn describe(&self) -> String {
+                format!("first {:?} {}", self, *self == Inner(1))
+            }
+        }
+        impl Named for First {
+            fn name(&self) -> String {
+                Inner(1).describe()
+            }
+        }
+    };
+
+    const _: () = {
+        #[derive(Debug, PartialEq)]
+        struct Inner(&'static str);
+        impl Inner {
+            fn describe(&self) -> String {
+                format!("second {:?} {}", self, *self == Inner("b"))
+            }
+        }
+        impl Named for Second {
+            fn name(&self) -> String {
+                Inner("a").describe()
+            }
+        }
+    };
+
+    pub fn run() -> (String, String) {
+        (First.name(), Second.name())
+    }
+}
+
+/// `Zip` of two slices takes `fold` and its `Item` from the impls its own impl specializes.
+pub mod specialized_items {
+    pub fn copy(src: &[u8], dst: &mut [u8]) -> u32 {
+        let mut copied = 0;
+        src.iter().zip(dst.iter_mut()).for_each(|(from, to)| {
+            *to = from.to_ascii_uppercase();
+            copied += 1;
+        });
+        copied
+    }
+
+    pub fn run() -> (u32, [u8; 4], usize, Vec<(char, u8)>) {
+        let mut dst = [b'-'; 4];
+        let copied = copy(b"abc", &mut dst);
+        let sum = [1usize, 2, 3].iter().zip([10usize, 20].iter()).fold(0, |n, (a, b)| n + a * b);
+        let mixed = "xyz".chars().zip([1u8, 2].iter().copied()).rev_pairs();
+        (copied, dst, sum, mixed)
+    }
+
+    trait RevPairs: Iterator + Sized {
+        fn rev_pairs(self) -> Vec<Self::Item> {
+            let mut all = self.fold(Vec::new(), |mut all, it| {
+                all.push(it);
+                all
+            });
+            all.reverse();
+            all
+        }
+    }
+    impl<I: Iterator> RevPairs for I {}
+}
+
+/// A derive on a struct outside a `const _` calls the derives of a type declared inside it.
+pub mod hidden_derives {
+    pub trait Public {
+        type Internal;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Small(<Small as Public>::Internal);
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Wide(<Wide as Public>::Internal);
+
+    const _: () = {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        pub struct Internal(u8);
+        impl Public for Small {
+            type Internal = Internal;
+        }
+        impl Small {
+            pub fn new(bits: u8) -> Small {
+                Small(Internal(bits))
+            }
+        }
+    };
+
+    const _: () = {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        pub struct Internal(u64, u64);
+        impl Public for Wide {
+            type Internal = Internal;
+        }
+        impl Wide {
+            pub fn new(bits: u64) -> Wide {
+                Wide(Internal(bits, !bits))
+            }
+        }
+    };
+
+    pub fn run() -> (bool, bool, std::cmp::Ordering, std::cmp::Ordering, String, String) {
+        let (a, b) = (Small::new(1), Small::new(2));
+        let (c, d) = (Wide::new(7), Wide::new(7));
+        (a == b, c == d, a.cmp(&b), c.cmp(&d), format!("{a:?}"), format!("{c:?}"))
+    }
+}
+
+/// A parameter moved out in the operand of a `break` is not dropped again when the function
+/// returns.
+pub mod moved_in_break {
+    use std::mem;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Counted(u8);
+
+    impl Counted {
+        fn new(value: u8) -> Counted {
+            LIVE.fetch_add(1, SeqCst);
+            Counted(value)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, SeqCst);
+        }
+    }
+
+    const fn same_size<A, B>() -> bool {
+        mem::size_of::<A>() == mem::size_of::<B>()
+    }
+
+    unsafe fn swap<T>(dst: *mut T, val: T) -> T {
+        loop {
+            if same_size::<T, ()>() {
+                break {
+                    let res = unsafe { mem::transmute_copy(&()) };
+                    mem::forget(val);
+                    res
+                };
+            }
+            if same_size::<T, AtomicU8>() {
+                let a: &AtomicU8;
+                break {
+                    a = unsafe { &*(dst as *const AtomicU8) };
+                    let res = unsafe {
+                        mem::transmute_copy(&a.swap(mem::transmute_copy(&val), SeqCst))
+                    };
+                    mem::forget(val);
+                    res
+                };
+            }
+            break unsafe { std::ptr::replace(dst, val) };
+        }
+    }
+
+    fn local() -> (usize, usize) {
+        static CNT: AtomicUsize = AtomicUsize::new(0);
+        CNT.store(0, SeqCst);
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Foo();
+
+        impl Foo {
+            fn new() -> Foo {
+                CNT.fetch_add(1, SeqCst);
+                Foo()
+            }
+        }
+
+        impl Drop for Foo {
+            fn drop(&mut self) {
+                CNT.fetch_sub(1, SeqCst);
+            }
+        }
+
+        let mut a = Foo::new();
+        assert_eq!(unsafe { swap(&mut a, Foo::new()) }, Foo::new());
+        let one = CNT.load(SeqCst);
+        drop(a);
+        (one, CNT.load(SeqCst))
+    }
+
+    pub fn run() -> (u8, usize, usize, usize, (usize, usize)) {
+        let mut cell = Counted::new(5);
+        let old = unsafe { swap(&mut cell, Counted::new(6)) };
+        let two = LIVE.load(SeqCst);
+        let value = old.0;
+        drop(old);
+        let one = LIVE.load(SeqCst);
+        let mut wide = (Counted::new(1), 7u32);
+        drop(unsafe { swap(&mut wide, (Counted::new(2), 8)) });
+        (value, two, one, LIVE.load(SeqCst), local())
+    }
+}
+
+/// `stringify!` keeps the spacing of the source, also for tokens a macro took apart as `tt`s
+/// and put back together.
+pub mod stringified {
+    macro_rules! all {
+        ($($t:tt)*) => {
+            stringify!($($t)*)
+        };
+    }
+
+    // Moves one token at a time into the buffer and writes the `>>` itself, as `anyhow::ensure!`
+    // does.
+    macro_rules! munch {
+        (($($buf:tt)*) $dup:tt >> $($rest:tt)*) => {
+            stringify!($($buf)* > > $($rest)*)
+        };
+        (($($buf:tt)*) ($first:tt $($dup:tt)*) $skip:tt $($rest:tt)*) => {
+            munch!(($($buf)* $first) ($($rest)*) $($rest)*)
+        };
+    }
+
+    macro_rules! body {
+        ($a:tt $b:tt) => {
+            stringify!($a+$b; $a+ $b; $a +$b, f($a)+1, ($a)$b, [$a]+{$b}+{ $b}, $a::$b, $a+=..=$b<-1)
+        };
+    }
+
+    macro_rules! tts {
+        ($a:tt,$b:tt) => {
+            stringify!($a $b|$a+1|$a 1|$a)
+        };
+    }
+
+    macro_rules! fragments {
+        ($a:expr, $b:ty) => {
+            stringify!($a+$b;$a,$b)
+        };
+    }
+
+    pub fn run() -> [&'static str; 14] {
+        [
+            body!(x y),
+            tts!(x,y),
+            tts!(+,-),
+            fragments!(x+1, Vec<u8>),
+            stringify!(0 as int! {...} != 0),
+            stringify!(1 + 'a: loop { break 'a 1 } == 1),
+            stringify!(E::U::<>>E::U::<u8>),
+            stringify!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1),
+            all!(0 as int! {...} != 0),
+            all!(1 + 'a: loop { break 'a 1 } == 1),
+            all!(E::U::<>>E::U::<u8>),
+            all!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1),
+            munch!(() (E::U::<>>E::U::<u8>) E::U::<>>E::U::<u8>),
+            munch!(() (a; &b + 'c: loop {}>>d) a; &b + 'c: loop {}>>d),
+        ]
+    }
+}
+
+/// What std does with a function pointer goes through `FnPtr::addr`, which only the compiler
+/// implements.
+pub mod fn_pointers {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn one() -> u8 {
+        1
+    }
+
+    fn two() -> u8 {
+        2
+    }
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+    pub struct Callback(fn() -> u8, unsafe extern "C" fn(u8) -> u8);
+
+    unsafe extern "C" fn id(x: u8) -> u8 {
+        x
+    }
+
+    fn hash(value: impl Hash) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn run() -> (bool, bool, bool, bool, bool, bool, usize, u8) {
+        let (a, b): (fn() -> u8, fn() -> u8) = (one, two);
+        let (x, y) = (Callback(a, id), Callback(b, id));
+        let shown = format!("{a:?} {a:p} {x:?}");
+        (
+            a == a,
+            a == b,
+            (a < b) == ((a as usize) < (b as usize)),
+            x == x.clone() && x != y,
+            hash(a) == hash(a) && hash(x) == hash(x),
+            x.cmp(&y) == a.cmp(&b),
+            shown.matches("0x").count(),
+            (x.0)() + unsafe { (y.1)(3) },
+        )
+    }
+}
+
+/// A closure whose parameter types are only known from the bound on the field it is put in.
+pub mod closure_in_bounded_field {
+    struct Guard<T, Data, F>
+    where
+        F: FnMut(&Data, &mut T),
+    {
+        value: T,
+        data: Data,
+        f: F,
+    }
+
+    impl<T, Data, F> Drop for Guard<T, Data, F>
+    where
+        F: FnMut(&Data, &mut T),
+    {
+        fn drop(&mut self) {
+            (self.f)(&self.data, &mut self.value)
+        }
+    }
+
+    fn fill<I: IntoIterator<Item = u8>, const CHECK: bool>(len: &mut u32, items: I) -> u8 {
+        let start = *len as usize;
+        let mut guard = Guard {
+            value: len,
+            data: start,
+            f: move |&count, len| {
+                **len = count as u32;
+            },
+        };
+        let mut sum = 0;
+        for item in items {
+            if guard.data == 4 && CHECK {
+                break;
+            }
+            sum += item;
+            guard.data += 1;
+        }
+        sum
+    }
+
+    pub fn run() -> (u32, u8, u32, u8) {
+        let (mut a, mut b) = (1, 0);
+        let x = fill::<_, true>(&mut a, [1, 2, 3, 4, 5].iter().cloned());
+        let y = fill::<_, false>(&mut b, 1..=5);
+        (a, x, b, y)
+    }
+}
+
+/// A trait method named like an unstable inherent method of std, which rustc passes over.
+pub mod unstable_name_collision {
+    use std::alloc::Layout;
+
+    pub trait LayoutExt {
+        fn padding_needed_for(&self, align: usize) -> usize;
+        fn repeated(&self, n: usize) -> Option<(Layout, usize)>;
+    }
+
+    impl LayoutExt for Layout {
+        fn padding_needed_for(&self, align: usize) -> usize {
+            let len = self.size();
+            (len.wrapping_add(align).wrapping_sub(1) & !align.wrapping_sub(1)).wrapping_sub(len)
+        }
+
+        fn repeated(&self, n: usize) -> Option<(Layout, usize)> {
+            let padded = self.size().checked_add(self.padding_needed_for(self.align()))?;
+            let layout = Layout::from_size_align(padded.checked_mul(n)?, self.align()).ok()?;
+            Some((layout, padded))
+        }
+    }
+
+    pub fn run() -> (usize, Option<(Layout, usize)>) {
+        let layout = Layout::new::<(u32, u8)>();
+        (Layout::new::<[u8; 5]>().padding_needed_for(4), layout.repeated(3))
+    }
+}
+
+/// A closure that moves out of a local of the block it is the tail of, inside another closure.
+pub mod closure_in_block_tail {
+    fn call<R>(f: impl FnOnce(u8) -> R) -> R {
+        f(1)
+    }
+
+    pub fn run() -> (usize, String) {
+        let shared = String::from("shared");
+        let sync = vec![1u8, 2];
+        call(|outer| {
+            let first = call({
+                let sync = sync.clone();
+                |inner| {
+                    let mut sync = sync;
+                    sync.push(inner + outer);
+                    sync.len() + shared.len()
+                }
+            });
+            let second = call(|_| {
+                let mut sync = sync;
+                sync.push(0);
+                format!("{sync:?} {shared}")
+            });
+            (first, second)
+        })
+    }
+}
+
+/// What cargo's dev profile sets and what it does not.
+pub mod build_cfgs {
+    pub struct Sized {
+        #[cfg(debug_assertions)]
+        pub id: usize,
+        pub fd: u32,
+    }
+
+    pub fn flags() -> (bool, bool, usize) {
+        (cfg!(debug_assertions), cfg!(rust_analyzer), size_of::<Sized>())
+    }
+
+    pub fn debug_assert_runs() -> u32 {
+        let mut ran = 0;
+        debug_assert!({
+            ran += 1;
+            true
+        });
+        ran
+    }
+}
+
+/// A bound on a concrete type holds through the type's impl, not through the bound.
+pub mod trivial_bounds {
+    type Storage = Vec<u8>;
+
+    pub fn default_len() -> usize
+    where
+        Storage: 'static + Send + Default,
+    {
+        let mut storage = Storage::default();
+        storage.push(7);
+        storage.len()
+    }
+}
+
+/// One variadic function called with different numbers of arguments.
+pub mod variadic {
+    unsafe extern "C" {
+        fn snprintf(buf: *mut u8, len: usize, format: *const u8, ...) -> i32;
+    }
+
+    pub fn none() -> String {
+        let mut buf = [0u8; 32];
+        let len = unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"plain".as_ptr().cast()) };
+        String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    }
+
+    pub fn two(a: i32, b: u64) -> String {
+        let mut buf = [0u8; 32];
+        let len =
+            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"%d-%lu".as_ptr().cast(), a, b) };
+        String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    }
+
+    pub fn string(text: &std::ffi::CStr) -> String {
+        let mut buf = [0u8; 32];
+        let len =
+            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"<%s>".as_ptr().cast(), text.as_ptr()) };
+        String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+    }
+}
+
+/// A constant holding a pointer into another, over-aligned constant.
+pub mod const_pointer_into_const {
+    use std::marker::PhantomData;
+
+    #[repr(align(16))]
+    #[derive(Clone, Copy)]
+    struct Wide([u8; 16]);
+
+    const fn tags() -> &'static [u8; 16] {
+        #[repr(C)]
+        struct Aligned {
+            _align: [Wide; 0],
+            tags: [u8; 16],
+        }
+        const ALIGNED: Aligned = Aligned { _align: [], tags: [0x80; 16] };
+        &ALIGNED.tags
+    }
+
+    struct Inner {
+        ctrl: std::ptr::NonNull<u8>,
+        mask: usize,
+    }
+
+    impl Inner {
+        const NEW: Self = Inner::new();
+
+        const fn new() -> Self {
+            Self { ctrl: unsafe { std::ptr::NonNull::new_unchecked(tags().as_ptr().cast_mut()) }, mask: 0 }
+        }
+    }
+
+    pub struct Table<T, S> {
+        inner: Inner,
+        hasher: S,
+        marker: PhantomData<T>,
+    }
+
+    impl<T, S> Table<T, S> {
+        pub const fn with_hasher(hasher: S) -> Self {
+            Self { inner: Inner::NEW, hasher, marker: PhantomData }
+        }
+
+        pub fn first(&self) -> (u8, usize, usize) {
+            let ptr = self.inner.ctrl.as_ptr();
+            (unsafe { *ptr.add(self.inner.mask) }, ptr as usize % 16, size_of_val(&self.hasher))
+        }
+    }
+
+    pub fn run() -> ((u8, usize, usize), (u8, usize, usize)) {
+        #[derive(Clone)]
+        struct Hasher;
+        const EMPTY: Table<u32, Hasher> = Table::with_hasher(Hasher);
+        let local = EMPTY;
+        (local.first(), Table::<u8, u64>::with_hasher(3).first())
+    }
+}
+
+pub mod included_files {
+    static BLOB: &[u8] = include_bytes!("blob.bin");
+    const NOTE: &str = include_str!("note.txt");
+
+    pub fn run() -> (usize, u8, &'static [u8], &'static str, usize) {
+        let local: &[u8; 11] = include_bytes!("blob.bin");
+        (BLOB.len(), BLOB[2], &local[4..9], NOTE, include_str!("note.txt").lines().count())
+    }
+}
+
+pub mod nested_macro_self {
+    #[derive(Default, PartialEq, Clone)]
+    pub struct Side {
+        pub width: Option<u32>,
+        pub style: Option<u8>,
+    }
+
+    #[derive(Default)]
+    pub struct Handler {
+        top: Side,
+        bottom: Side,
+        start: Side,
+        end: Side,
+        out: Vec<u32>,
+    }
+
+    impl Handler {
+        pub fn flush(&mut self) {
+            macro_rules! flush_category {
+                ($a: expr, $b: expr, $is_logical: expr) => {
+                    macro_rules! shorthand {
+                        ($key: ident) => {{
+                            let has_prop = $a.$key.is_some() && $b.$key.is_some();
+                            if has_prop {
+                                self.out.push(std::mem::take(&mut $a.$key).unwrap() as u32);
+                            }
+                        }};
+                    }
+                    macro_rules! logical_shorthand {
+                        ($key: ident, $start: expr, $end: expr) => {{
+                            let has_prop = $start.$key.is_some() && $end.$key.is_some();
+                            if has_prop {
+                                self.out.push(std::mem::take(&mut $end.$key).unwrap() as u32 + 100);
+                            }
+                        }};
+                    }
+                    if $is_logical && $a == $b {
+                        logical_shorthand!(style, $a, $b);
+                        logical_shorthand!(width, $a, $b);
+                    } else {
+                        shorthand!(style);
+                        shorthand!(width);
+                    }
+                };
+            }
+            flush_category!(self.top, self.bottom, false);
+            flush_category!(self.start, self.end, true);
+        }
+    }
+
+    pub fn run() -> Vec<u32> {
+        let side = Side { width: Some(3), style: Some(4) };
+        let mut handler = Handler {
+            top: side.clone(),
+            bottom: side.clone(),
+            start: side.clone(),
+            end: side,
+            out: Vec::new(),
+        };
+        handler.flush();
+        handler.out
+    }
+}
+
+pub mod shadowed_item_macro {
+    macro_rules! for_each_op {
+        ($mac:ident) => {
+            $mac! { nop unreachable }
+        };
+    }
+
+    macro_rules! define_ops {
+        ($($op:ident)*) => {
+            $( fn $op(&mut self) -> Self::Output; )*
+        };
+    }
+
+    pub trait Visit {
+        type Output;
+        for_each_op!(define_ops);
+    }
+
+    pub struct Names;
+
+    macro_rules! define_ops {
+        ($($op:ident)*) => {
+            $( fn $op(&mut self) -> &'static str { stringify!($op) } )*
+        };
+    }
+
+    impl Visit for Names {
+        type Output = &'static str;
+        for_each_op!(define_ops);
+    }
+
+    fn visit<V: Visit>(visitor: &mut V, code: u8) -> Option<V::Output> {
+        Some(match code {
+            0 => visitor.nop(),
+            1 => {
+                let visitor = visitor;
+                visitor.unreachable()
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn run() -> [Option<&'static str>; 3] {
+        [visit(&mut Names, 0), visit(&mut Names, 1), visit(&mut Names, 2)]
+    }
+}
+
+pub mod repeated_statics {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    macro_rules! bump {
+        ($by:expr) => {{
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            static mut LAST: u32 = 0;
+            unsafe { LAST = $by };
+            COUNT.fetch_add($by, Ordering::Relaxed) + unsafe { LAST }
+        }};
+    }
+
+    static LAZY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "lazy".repeat(2));
+
+    pub fn lazy() -> usize {
+        fn named() -> u32 {
+            7
+        }
+        static NAMED: std::sync::LazyLock<u32> = std::sync::LazyLock::new(named);
+        LAZY.len() + *NAMED as usize
+    }
+
+    pub fn twice() -> (u32, u32, u32) {
+        (bump!(1), bump!(10), bump!(100) + bump!(1000))
+    }
+
+    pub fn in_closure() -> (u32, u32) {
+        let first = || bump!(2) + bump!(20);
+        let second = || bump!(200);
+        (first() + first(), second() + bump!(2000))
+    }
+
+    async fn waits() -> (u32, u32) {
+        let first = bump!(3);
+        let second = async { bump!(30) + bump!(300) }.await;
+        (first, second + bump!(3000))
+    }
+
+    pub fn in_async() -> (u32, u32) {
+        let mut future = std::pin::pin!(waits());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+}
+
+/// `writeln!` adds its newline to a raw string as to any other.
+pub mod raw_newline {
+    use std::fmt::Write;
+
+    pub fn run() -> String {
+        let mut out = String::new();
+        let name = "raw";
+        writeln!(
+            out,
+            r#"first {name}
+second "quoted"
+"#
+        )
+        .unwrap();
+        writeln!(out, r"plain
+ {}", 1).unwrap();
+        writeln!(out, "escaped\n {name}\n").unwrap();
+        out
+    }
+}
+
+/// A map filled in here and read by the caller: both sides must agree on where a tree node
+/// keeps its keys and values.
+pub mod shared_map {
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Number(f64),
+        String(String),
+        Array(Vec<Value>),
+        Object(BTreeMap<String, Value>),
+    }
+
+    pub fn build() -> Value {
+        let mut inner = BTreeMap::new();
+        inner.insert("message".to_string(), Value::String("unexpected token".to_string()));
+        inner.insert("line".to_string(), Value::Number(3.0));
+        let mut outer = BTreeMap::new();
+        outer.insert("error".to_string(), Value::Object(inner));
+        outer.insert("ok".to_string(), Value::Bool(false));
+        outer.insert("rest".to_string(), Value::Array(vec![Value::Null, Value::Bool(true)]));
+        Value::Object(outer)
+    }
+}
+
+/// A temporary in the tail of a block that an older-edition macro wrote lives to the end of
+/// the statement around the block, not to the end of the block.
+pub mod tail_temporaries {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub struct Noisy(String);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            LOG.with(|log| log.borrow_mut().push(format!("drop {}", self.0)));
+        }
+    }
+
+    pub struct Shown<'a>(&'a Noisy);
+
+    pub fn show(value: &Noisy) -> Shown<'_> {
+        Shown(value)
+    }
+
+    fn read(values: &[(&str, Option<&Shown<'_>>)]) -> String {
+        let read: Vec<String> =
+            values.iter().map(|it| format!("{}={}", it.0, it.1.unwrap().0.0)).collect();
+        LOG.with(|log| log.borrow_mut().push(format!("read {read:?}")));
+        read.join(",")
+    }
+
+    pub fn run(pick: bool) -> Vec<String> {
+        let first = read(old_macros::values!(
+            show;
+            "a" = Noisy("one".to_string()),
+            "b" = Noisy("two".to_string())
+        ));
+        let second = if pick {
+            read(old_macros::values!(show; "c" = Noisy(format!("three {first}"))))
+        } else {
+            read(&[])
+        };
+        LOG.with(|log| log.borrow_mut().push(second));
+        LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+    }
+}
+
+/// A derived ordering over an enum whose variants carry fields of several types.
+pub mod enum_ordering {
+    use std::path::PathBuf;
+
+    #[non_exhaustive]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Stage {
+        Initializing,
+        Starting { crate_count: usize, patch: bool },
+        Compiling { current: usize, total: usize, krate: String, fresh: bool },
+        Copying { current: usize, total: usize, path: PathBuf },
+        Native { detail: String },
+        Success,
+    }
+
+    pub fn run(seed: usize) -> Vec<(Option<std::cmp::Ordering>, std::cmp::Ordering, bool)> {
+        let stages = [
+            Stage::Initializing,
+            Stage::Starting { crate_count: seed, patch: seed % 2 == 0 },
+            Stage::Starting { crate_count: seed, patch: true },
+            Stage::Compiling { current: 1, total: seed, krate: "a".into(), fresh: false },
+            Stage::Compiling { current: 1, total: seed, krate: "b".into(), fresh: false },
+            Stage::Copying { current: 0, total: 1, path: PathBuf::from("x/y") },
+            Stage::Copying { current: 0, total: 1, path: PathBuf::from("x/z") },
+            Stage::Native { detail: format!("{seed}") },
+            Stage::Success,
+        ];
+        let mut out = Vec::new();
+        for a in &stages {
+            for b in &stages {
+                out.push((a.partial_cmp(b), a.cmp(b), a < b));
+            }
+        }
+        out
+    }
+}
+
+/// `String + &String`, where the right side only fits the one `Add` impl after a deref, in
+/// a closure whose return type is inferred from it.
+pub mod added_strings {
+    pub enum Segment {
+        Literal(String),
+        Other(u8),
+    }
+
+    pub fn joined(raw: Vec<u32>) -> String {
+        raw.into_iter().map(|ident| ident.to_string()).collect::<Vec<_>>().join("-")
+    }
+
+    pub struct Word(String);
+    impl core::borrow::Borrow<str> for Word {
+        fn borrow(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// An instance of `join` rustc has no copy of.
+    pub fn joined_words(raw: Vec<u32>) -> String {
+        raw.into_iter().map(|ident| Word(ident.to_string())).collect::<Vec<_>>().join("-")
+    }
+
+    pub fn run(segments: &[Segment]) -> Option<String> {
+        segments.iter().try_fold(String::new(), |acc, segment| {
+            if let Segment::Literal(seg) = segment { Some(acc + seg) } else { None }
+        })
+    }
+}
+
+/// A macro call as a generic argument of a path expression.
+pub mod macro_type_arguments {
+    pub struct Minus;
+    pub struct Plus;
+    macro_rules! Tok {
+        [-] => { Minus };
+        [+] => { Plus };
+    }
+    pub trait Named {
+        const NAME: &'static str;
+    }
+    impl Named for Minus {
+        const NAME: &'static str = "minus";
+    }
+    impl Named for Plus {
+        const NAME: &'static str = "plus";
+    }
+    pub struct Pair<A, B>(core::marker::PhantomData<(A, B)>);
+    impl<A: Named, B: Named> Pair<A, B> {
+        pub fn names(extra: &str) -> Result<String, String> {
+            Ok(format!("{}{}{extra}", A::NAME, B::NAME))
+        }
+    }
+
+    pub fn run(extra: &str) -> Result<usize, String> {
+        let raw = Pair::<Tok![+], Tok![-]>::names(extra)?;
+        if raw.len() == 1 { Ok(0) } else { Ok(raw.len()) }
+    }
+}
+
+pub mod cfg_macro_arguments {
+    pub fn run(extra: &str) -> Vec<String> {
+        vec![
+            #[cfg(unix)]
+            "unix".parse().unwrap(),
+            #[cfg(windows)]
+            "windows".parse().unwrap(),
+            extra.parse().unwrap(),
+        ]
+    }
+}

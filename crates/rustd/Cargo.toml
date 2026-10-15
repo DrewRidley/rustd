@@ -1,0 +1,31 @@
+[package]
+name = "rustd"
+version = "0.0.0"
+description = "Spike: persistent compiler on top of rust-analyzer's database"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mimalloc = { version = "0.1.46", default-features = false }
+object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf"] }
+rustc-demangle = "0.1.28"
+rustc-hash.workspace = true
+
+hir.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+ide-db.workspace = true
+load-cargo.workspace = true
+project-model.workspace = true
+vfs.workspace = true
+triomphe.workspace = true
+paths.workspace = true
+syntax.workspace = true
+
+[lints]
+workspace = true
