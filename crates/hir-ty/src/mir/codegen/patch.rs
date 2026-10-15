@@ -370,7 +370,7 @@ pub(super) struct Patch {
 pub(super) fn empty_object() -> Result<Vec<u8>> {
     if super::is_wasm32() {
         return super::wasm::WasmObjectBuilder::default()
-            .finish(&cranelift_module::ModuleDeclarations::default());
+            .finish(&cranelift_module::ModuleDeclarations::default(), false, true);
     }
     let builder =
         ObjectBuilder::new(target()?.clone(), "rustd", cranelift_module::default_libcall_names())?;

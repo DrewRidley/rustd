@@ -1523,10 +1523,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn finish(self) -> Result<Vec<u8>> {
-        if let Some(wasm) = self.wasm {
-            return wasm.finish(self.module.declarations());
-        }
         let is_base = self.base.is_none();
+        if let Some(wasm) = self.wasm {
+            return wasm.finish(self.module.declarations(), is_base, self.patching);
+        }
         let mut product = self.module.finish();
         if is_base && product.object.format() == cranelift_object::object::BinaryFormat::MachO {
             for sym_id in product
@@ -1972,7 +1972,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
         if compiled.writable && !self.own_statics.owns(db, id) {
             let name = hir_def::signatures::StaticSignature::of(db, id).name.as_str();
-            unsupported!("writable static `{name}` without a rustc symbol");
+            if name != "__CALLSITE" {
+                unsupported!("writable static `{name}` without a rustc symbol");
+            }
         }
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.

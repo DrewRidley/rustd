@@ -2273,8 +2273,16 @@ impl WasmObjectBuilder {
         self.datas.insert(id, blob);
     }
 
-    pub(super) fn finish(self, decls: &ModuleDeclarations) -> Result<Vec<u8>> {
+    pub(super) fn finish(
+        self,
+        decls: &ModuleDeclarations,
+        is_base: bool,
+        patching: bool,
+    ) -> Result<Vec<u8>> {
         let map_err = |e: String| CodegenError::Backend(e);
+        let emit_trampolines =
+            is_base && patching && std::env::var_os("RUSTD_WASM_TRAMPOLINES").is_some();
+        let emit_patch_exports = !is_base;
 
         let mut types: Vec<WasmSig> = Vec::new();
         let mut type_map: FxHashMap<WasmSig, u32> = FxHashMap::default();
@@ -2305,7 +2313,7 @@ impl WasmObjectBuilder {
 
         let mut imported_datas: Vec<(DataId, String)> = Vec::new();
         let mut defined_datas: Vec<(DataId, String, Linkage, u32, ConstBlob)> = Vec::new();
-        let mut mem_cursor = 0u32;
+        let mut mem_cursor = if emit_patch_exports { 60 * 1024 * 1024 } else { 0u32 };
         for (data_id, decl) in decls.get_data_objects() {
             let name = decl.linkage_name(data_id).into_owned();
             if let Some(blob) = self.datas.get(&data_id) {
@@ -2323,10 +2331,12 @@ impl WasmObjectBuilder {
         //   0: __stack_pointer (Global, undefined, element_index = 0)
         //   1..=imported_funcs.len(): imported functions (element_index = 0..imported_funcs.len())
         //   next..: defined functions (element_index = imported_funcs.len()..)
+        //   (if emit_trampolines: next..: __rustd_impl_<name> functions)
         //   next..: imported datas
         //   next..: defined datas
         let mut func_sym_index: FxHashMap<FuncId, (u32, u32)> = FxHashMap::default(); // FuncId -> (sym_idx, wasm_func_idx)
         let mut data_sym_index: FxHashMap<DataId, (u32, u32)> = FxHashMap::default(); // DataId -> (sym_idx, mem_offset)
+        let mut impl_sym_indices: Vec<u32> = Vec::new();
 
         let mut next_sym = 1u32; // 0 is __stack_pointer
         for (i, &(fid, _, _)) in imported_funcs.iter().enumerate() {
@@ -2337,6 +2347,12 @@ impl WasmObjectBuilder {
         for (i, &(fid, _, _, _)) in defined_funcs.iter().enumerate() {
             func_sym_index.insert(fid, (next_sym, num_func_imports + i as u32));
             next_sym += 1;
+        }
+        if emit_trampolines {
+            for _ in 0..defined_funcs.len() {
+                impl_sym_indices.push(next_sym);
+                next_sym += 1;
+            }
         }
         for &(did, _) in &imported_datas {
             data_sym_index.insert(did, (next_sym, 0));
@@ -2385,26 +2401,79 @@ impl WasmObjectBuilder {
 
         // 3. Function section (id = 3)
         let mut func_sec = Vec::new();
-        write_uleb(&mut func_sec, defined_funcs.len() as u64);
+        let total_defined_funcs = if emit_trampolines {
+            defined_funcs.len() * 2
+        } else {
+            defined_funcs.len()
+        };
+        write_uleb(&mut func_sec, total_defined_funcs as u64);
         for &(_, _, _, tidx) in &defined_funcs {
             write_uleb(&mut func_sec, u64::from(tidx));
         }
+        if emit_trampolines {
+            for &(_, _, _, tidx) in &defined_funcs {
+                write_uleb(&mut func_sec, u64::from(tidx));
+            }
+        }
 
-        // Track which section index CODE and DATA get in the output file.
-        // Sections emitted:
-        //   0: Type (id=1)
-        //   1: Import (id=2)
-        //   2: Function (id=3)
-        //   3: Code (id=10)
-        //   4: Data (id=11) (if defined_datas non-empty)
-        let code_section_index = 3u32;
-        let data_section_index = 4u32;
+        // 7. Export section (id = 7) for patch objects so `new WebAssembly.Instance` exposes patched fns.
+        let mut export_sec = Vec::new();
+        if emit_patch_exports {
+            write_uleb(&mut export_sec, defined_funcs.len() as u64);
+            for (i, (_, name, _, _)) in defined_funcs.iter().enumerate() {
+                write_str(&mut export_sec, name);
+                export_sec.push(0x00); // Func
+                write_uleb(&mut export_sec, u64::from(num_func_imports + i as u32));
+            }
+        }
+
+        let code_section_index = if emit_patch_exports { 4u32 } else { 3u32 };
+        let data_section_index = code_section_index + 1;
 
         // 10. Code section (id = 10) + reloc.CODE entries
         // Each reloc entry: (reloc_type: u8, offset_in_code_sec: u32, index: u32, addend: Option<i64>)
         let mut code_sec = Vec::new();
         let mut code_relocs: Vec<(u8, u32, u32, Option<i64>)> = Vec::new();
-        write_uleb(&mut code_sec, defined_funcs.len() as u64);
+        write_uleb(&mut code_sec, total_defined_funcs as u64);
+        if emit_trampolines {
+            for (i, &(_, _, _, tidx)) in defined_funcs.iter().enumerate() {
+                let num_params = types[tidx as usize].params.len();
+                let mut tramp = Vec::new();
+                tramp.push(0x00); // 0 locals
+                for p in 0..num_params {
+                    tramp.push(0x20); // local.get
+                    write_uleb(&mut tramp, p as u64);
+                }
+                tramp.push(0x41); // i32.const <table_slot>
+                let slot_reloc_off = tramp.len() as u32;
+                tramp.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
+                tramp.push(0x11); // call_indirect
+                let type_reloc_off = tramp.len() as u32;
+                let mut tidx_buf = [0u8; 5];
+                write_uleb_5(&mut tidx_buf, tidx);
+                tramp.extend_from_slice(&tidx_buf);
+                tramp.push(0x00); // table 0
+                tramp.push(0x0b); // end
+
+                let mut len_buf = Vec::new();
+                write_uleb(&mut len_buf, tramp.len() as u64);
+                let body_start = (code_sec.len() + len_buf.len()) as u32;
+                code_relocs.push((
+                    R_WASM_TABLE_INDEX_SLEB,
+                    body_start + slot_reloc_off,
+                    impl_sym_indices[i],
+                    None,
+                ));
+                code_relocs.push((
+                    R_WASM_TYPE_INDEX_LEB,
+                    body_start + type_reloc_off,
+                    tidx,
+                    None,
+                ));
+                code_sec.extend_from_slice(&len_buf);
+                code_sec.extend_from_slice(&tramp);
+            }
+        }
         for &(fid, _, _, _) in &defined_funcs {
             let (raw_body, f_relocs) = &self.functions[&fid];
             let mut patched_body = raw_body.clone();
@@ -2556,6 +2625,15 @@ impl WasmObjectBuilder {
             write_uleb(&mut symtab, (num_func_imports as usize + i) as u64);
             write_str(&mut symtab, name);
         }
+        if emit_trampolines {
+            let m = defined_funcs.len();
+            for (i, (_, name, _, _)) in defined_funcs.iter().enumerate() {
+                symtab.push(0); // SYMTAB_FUNCTION
+                write_uleb(&mut symtab, 0x00u64); // global default
+                write_uleb(&mut symtab, (num_func_imports as usize + m + i) as u64);
+                write_str(&mut symtab, &format!("__rustd_impl_{name}"));
+            }
+        }
         // Imported datas
         for (_, name) in &imported_datas {
             symtab.push(1); // SYMTAB_DATA
@@ -2607,6 +2685,9 @@ impl WasmObjectBuilder {
         push_sec(&mut out, 1, &type_sec);
         push_sec(&mut out, 2, &import_sec);
         push_sec(&mut out, 3, &func_sec);
+        if emit_patch_exports {
+            push_sec(&mut out, 7, &export_sec);
+        }
         push_sec(&mut out, 10, &code_sec);
         if !defined_datas.is_empty() {
             push_sec(&mut out, 11, &data_sec);
