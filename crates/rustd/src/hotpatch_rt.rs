@@ -1,9 +1,12 @@
-//! Pure-Rust in-process hot-patch runtime injected into `base.o` when `rustd --patch` is used.
+//! Pure-Rust in-process hot-patch runtime (`base.rt.o`) when `rustd` builds a binary.
 //!
-//! Compiled by `rustc --crate-type=rlib --emit=obj -O` and merged into `base.o` so any binary
-//! linked with `base.o` (such as `surreal`) automatically watches `patch.o` in a background
-//! Rust thread, relocates new Mach-O / ELF patch objects in memory, and atomically updates
-//! `<sym>$rustd_ptr` jump-table slots without restarting the process.
+//! Supports both:
+//! 1. Jump-table slot patching (`<sym>$rustd_ptr` in `__DATA,__data`) when `--crate` pre-compiles
+//!    a crate into `base.o`.
+//! 2. Zero-config workspace-wide 4-byte inline branch detouring (`b <veneer>`) on any `rustc`
+//!    function in `__TEXT,__text` via `VENEER_CAVE_START` / `__rustd_veneer_cave_end` and
+//!    Copy-on-Write `mach_vm_protect` / `mprotect`, so `rustd run` works across all workspace
+//!    crates without needing `--crate`.
 
 #![allow(unsafe_op_in_unsafe_fn, clippy::manual_slice_size_calculation)]
 
@@ -25,6 +28,18 @@ use std::{
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
 static RUSTD_HOTPATCH_INIT: extern "C" fn() = rustd_hotpatch_init;
 
+#[repr(C, align(16384))]
+struct VeneerCave([u32; 16384]);
+
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__TEXT,__text"))]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".text"))]
+static VENEER_CAVE_START: VeneerCave = VeneerCave([0xd503_201f; 16384]);
+
+unsafe extern "C" {
+    static __rustd_veneer_cave_end: u32;
+}
+
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const PROT_EXEC: c_int = 0x4;
@@ -33,6 +48,15 @@ const MAP_PRIVATE: c_int = 0x0002;
 const MAP_ANON: c_int = 0x1000;
 #[cfg(target_os = "linux")]
 const MAP_ANON: c_int = 0x0020;
+
+#[cfg(target_os = "macos")]
+const VM_PROT_READ: c_int = 0x01;
+#[cfg(target_os = "macos")]
+const VM_PROT_WRITE: c_int = 0x02;
+#[cfg(target_os = "macos")]
+const VM_PROT_EXECUTE: c_int = 0x04;
+#[cfg(target_os = "macos")]
+const VM_PROT_COPY: c_int = 0x10;
 
 #[cfg(target_os = "macos")]
 const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
@@ -53,47 +77,208 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *const c_void, len: usize);
+    #[cfg(target_os = "macos")]
+    fn mach_task_self() -> u32;
+    #[cfg(target_os = "macos")]
+    fn mach_vm_protect(
+        target_task: u32,
+        address: u64,
+        size: u64,
+        set_maximum: c_int,
+        new_protection: c_int,
+    ) -> c_int;
 }
 
-struct SavedSlot {
-    slot: *const AtomicPtr<c_void>,
-    orig: *mut c_void,
+enum SavedPatch {
+    PtrSlot { slot: *const AtomicPtr<c_void>, orig: *mut c_void },
+    InlineBranch { addr: *mut u32, orig_insn: u32 },
 }
 
-unsafe impl Send for SavedSlot {}
-unsafe impl Sync for SavedSlot {}
+unsafe impl Send for SavedPatch {}
+unsafe impl Sync for SavedPatch {}
 
-static SAVED_SLOTS: Mutex<Vec<SavedSlot>> = Mutex::new(Vec::new());
+static SAVED_PATCHES: Mutex<Vec<SavedPatch>> = Mutex::new(Vec::new());
 
-fn record_and_patch(slot: *const AtomicPtr<c_void>, new_fn: *mut c_void) {
-    let mut saved = SAVED_SLOTS.lock().unwrap();
-    if !saved.iter().any(|s| ptr::eq(s.slot, slot)) {
+unsafe fn make_text_writable(addr: usize, len: usize) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let page = (addr & !0x3fff) as u64;
+        let end = ((addr + len + 0x3fff) & !0x3fff) as u64;
+        let kr =
+            mach_vm_protect(mach_task_self(), page, end - page, 0, VM_PROT_READ | VM_PROT_WRITE);
+        if kr == 0 {
+            return true;
+        }
+        mach_vm_protect(
+            mach_task_self(),
+            page,
+            end - page,
+            0,
+            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+        ) == 0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let page = addr & !0xfff;
+        let end = (addr + len + 0xfff) & !0xfff;
+        mprotect(page as *mut c_void, end - page, PROT_READ | PROT_WRITE | PROT_EXEC) == 0
+    }
+}
+
+unsafe fn make_text_executable(addr: usize, len: usize) {
+    #[cfg(target_os = "macos")]
+    {
+        sys_icache_invalidate(addr as *const c_void, len);
+        let page = (addr & !0x3fff) as u64;
+        let end = ((addr + len + 0x3fff) & !0x3fff) as u64;
+        let _ = mach_vm_protect(
+            mach_task_self(),
+            page,
+            end - page,
+            0,
+            VM_PROT_READ | VM_PROT_EXECUTE,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let page = addr & !0xfff;
+        let end = (addr + len + 0xfff) & !0xfff;
+        let _ = mprotect(page as *mut c_void, end - page, PROT_READ | PROT_EXEC);
+    }
+}
+
+fn record_and_patch_slot(slot: *const AtomicPtr<c_void>, new_fn: *mut c_void) {
+    let mut saved = SAVED_PATCHES.lock().unwrap();
+    if !saved.iter().any(|s| matches!(s, SavedPatch::PtrSlot { slot: existing, .. } if ptr::eq(*existing, slot))) {
         let orig = unsafe { (*slot).load(Ordering::Relaxed) };
-        saved.push(SavedSlot { slot, orig });
+        saved.push(SavedPatch::PtrSlot { slot, orig });
     }
     unsafe {
         (*slot).store(new_fn, Ordering::Release);
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn detour_function_inline(
+    orig_fn: *mut u32,
+    new_fn: usize,
+    veneer_idx: &mut usize,
+) -> bool {
+    let orig_addr = orig_fn as usize;
+    let start_cave = VENEER_CAVE_START.0.as_ptr() as usize;
+    let end_cave = (((&raw const __rustd_veneer_cave_end) as usize) + 16383) & !16383;
+
+    let slot_offset = *veneer_idx * 16;
+    if slot_offset + 16 > 65536 {
+        return false;
+    }
+    let cave_base = if orig_addr.abs_diff(start_cave + slot_offset) < 120 * 1024 * 1024 {
+        start_cave
+    } else if orig_addr.abs_diff(end_cave + slot_offset) < 120 * 1024 * 1024 {
+        end_cave
+    } else {
+        return false;
+    };
+    let veneer_addr = cave_base + slot_offset;
+    let diff = ((veneer_addr as i64) - (orig_addr as i64)) >> 2;
+    if !(-0x0200_0000..0x0200_0000).contains(&diff) {
+        return false;
+    }
+    *veneer_idx += 1;
+
+    unsafe {
+        if !make_text_writable(veneer_addr, 16) {
+            return false;
+        }
+        let vp = veneer_addr as *mut u32;
+        vp.write(0x5800_0050); // ldr x16, #8
+        vp.add(1).write(0xd61f_0200); // br x16
+        (vp.add(2) as *mut u64).write_unaligned(new_fn as u64);
+        make_text_executable(veneer_addr, 16);
+
+        let mut saved = SAVED_PATCHES.lock().unwrap();
+        let already = saved.iter().any(
+            |s| matches!(s, SavedPatch::InlineBranch { addr, .. } if ptr::eq(*addr, orig_fn)),
+        );
+        let orig_insn = orig_fn.read();
+        if !already {
+            saved.push(SavedPatch::InlineBranch { addr: orig_fn, orig_insn });
+        }
+        if !make_text_writable(orig_addr, 4) {
+            return false;
+        }
+        let b_insn = 0x1400_0000u32 | ((diff as u32) & 0x03ff_ffff);
+        orig_fn.write(b_insn);
+        make_text_executable(orig_addr, 4);
+    }
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn detour_function_inline(
+    _orig_fn: *mut u32,
+    _new_fn: usize,
+    _veneer_idx: &mut usize,
+) -> bool {
+    false
+}
+
 fn restore_all() -> usize {
-    let mut saved = SAVED_SLOTS.lock().unwrap();
+    let mut saved = SAVED_PATCHES.lock().unwrap();
     let count = saved.len();
     for s in saved.drain(..) {
-        unsafe {
-            (*s.slot).store(s.orig, Ordering::Release);
+        match s {
+            SavedPatch::PtrSlot { slot, orig } => unsafe {
+                (*slot).store(orig, Ordering::Release);
+            },
+            SavedPatch::InlineBranch { addr, orig_insn } => unsafe {
+                if make_text_writable(addr as usize, 4) {
+                    addr.write(orig_insn);
+                    make_text_executable(addr as usize, 4);
+                }
+            },
         }
     }
     count
 }
 
-fn lookup_symbol(name: &str) -> *mut c_void {
-    let Ok(cstr) = CString::new(name) else { return ptr::null_mut() };
-    unsafe { dlsym(RTLD_DEFAULT, cstr.as_ptr()) }
+extern "C" fn fallback_fixdfti(x: f64) -> i128 {
+    x as i128
 }
 
-fn read_u16(buf: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
+extern "C" fn fallback_fixunsdfti(x: f64) -> u128 {
+    x as u128
+}
+
+extern "C" fn fallback_fixsfti(x: f32) -> i128 {
+    x as i128
+}
+
+extern "C" fn fallback_fixunssfti(x: f32) -> u128 {
+    x as u128
+}
+
+#[repr(C, align(16))]
+struct StaticInnerSlice([usize; 4]);
+static FALLBACK_STATIC_INNER_SLICE: StaticInnerSlice =
+    StaticInnerSlice([usize::MAX >> 1, usize::MAX >> 1, 0, 0]);
+
+fn lookup_symbol(name: &str) -> *mut c_void {
+    let Ok(cstr) = CString::new(name) else { return ptr::null_mut() };
+    let p = unsafe { dlsym(RTLD_DEFAULT, cstr.as_ptr()) };
+    if !p.is_null() {
+        return p;
+    }
+    if name.ends_with("STATIC_INNER_SLICE") {
+        return (&raw const FALLBACK_STATIC_INNER_SLICE) as *mut c_void;
+    }
+    match name {
+        "__fixdfti" => fallback_fixdfti as *mut c_void,
+        "__fixunsdfti" => fallback_fixunsdfti as *mut c_void,
+        "__fixsfti" => fallback_fixsfti as *mut c_void,
+        "__fixunssfti" => fallback_fixunssfti as *mut c_void,
+        _ => ptr::null_mut(),
+    }
 }
 
 fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
@@ -141,7 +326,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
         return Some(restore_all());
     }
 
-    // Check if there are any defined external symbols; if not, restore base functions.
     let mut has_defined_ext = false;
     for i in 0..nsyms {
         let entry = symoff + i * 16;
@@ -154,6 +338,9 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
     if !has_defined_ext {
         return Some(restore_all());
     }
+
+    // Restore any previous inline/slot patches before applying the current patch object.
+    let _ = restore_all();
 
     let seg_vmsize = (vmsize + 15) & !15;
     let got_size = nsyms * 8;
@@ -229,7 +416,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
             let r_type = (r_info >> 28) & 0xf;
 
             if r_type == 10 {
-                // ARM64_RELOC_ADDEND
                 let mut add = r_symbolnum as i64;
                 if (add & (1 << 23)) != 0 {
                     add |= !((1i64 << 24) - 1);
@@ -247,7 +433,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
 
             match r_type {
                 0 => {
-                    // ARM64_RELOC_UNSIGNED
                     if r_length == 3 {
                         unsafe {
                             let p = loc as *mut u64;
@@ -262,7 +447,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                     }
                 }
                 3 | 5 => {
-                    // PAGE21 | GOT_LOAD_PAGE21
                     let t = if r_type == 5 {
                         unsafe { got_base.add(r_symbolnum) as u64 }
                     } else {
@@ -280,7 +464,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                     }
                 }
                 4 | 6 => {
-                    // PAGEOFF12 | GOT_LOAD_PAGEOFF12
                     let t = if r_type == 6 {
                         unsafe { got_base.add(r_symbolnum) as u64 }
                     } else {
@@ -296,7 +479,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                     }
                 }
                 2 => {
-                    // ARM64_RELOC_BRANCH26
                     let t = target.wrapping_add(pending_addend as u64);
                     let diff = ((t as i64) - (loc as u64 as i64)) >> 2;
                     unsafe {
@@ -321,6 +503,7 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
     }
 
     let mut patched = 0usize;
+    let mut veneer_idx = 0usize;
     for i in 0..nsyms {
         let entry = symoff + i * 16;
         let strx = read_u32(buf, entry)? as usize;
@@ -329,12 +512,19 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
             let cstr = CStr::from_bytes_until_nul(buf.get(stroff + strx..)?).ok()?;
             let raw_name = cstr.to_str().ok()?;
             let sym_name = raw_name.strip_prefix('_').unwrap_or(raw_name);
+            let new_fn = unsafe { *got_base.add(i) as *mut c_void };
             let ptr_name = format!("{sym_name}$rustd_ptr");
             let slot = lookup_symbol(&ptr_name) as *const AtomicPtr<c_void>;
             if !slot.is_null() {
-                let new_fn = unsafe { *got_base.add(i) as *mut c_void };
-                record_and_patch(slot, new_fn);
+                record_and_patch_slot(slot, new_fn);
                 patched += 1;
+            } else {
+                let orig_fn = lookup_symbol(sym_name) as *mut u32;
+                if !orig_fn.is_null()
+                    && detour_function_inline(orig_fn, new_fn as usize, &mut veneer_idx)
+                {
+                    patched += 1;
+                }
             }
         }
     }
@@ -342,173 +532,8 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 64 || &buf[0..4] != b"\x7fELF" {
-        return None;
-    }
-    let e_shoff = read_u64(buf, 40)? as usize;
-    let e_shentsize = read_u16(buf, 58)? as usize;
-    let e_shnum = read_u16(buf, 60)? as usize;
-    if e_shnum == 0 {
-        return Some(restore_all());
-    }
-
-    let mut sec_offsets = vec![0usize; e_shnum];
-    let mut total_size = 0usize;
-    let mut symtab_idx = None;
-    for i in 0..e_shnum {
-        let sh = e_shoff + i * e_shentsize;
-        let sh_type = read_u32(buf, sh + 4)?;
-        let sh_size = read_u64(buf, sh + 32)? as usize;
-        let sh_addralign = (read_u64(buf, sh + 48)? as usize).max(1);
-        if sh_type == 2 {
-            symtab_idx = Some(i);
-        }
-        total_size = (total_size + sh_addralign - 1) & !(sh_addralign - 1);
-        sec_offsets[i] = total_size;
-        total_size += sh_size;
-    }
-
-    let Some(sym_sec) = symtab_idx else { return Some(restore_all()) };
-    let sym_sh = e_shoff + sym_sec * e_shentsize;
-    let sym_off = read_u64(buf, sym_sh + 24)? as usize;
-    let sym_size = read_u64(buf, sym_sh + 32)? as usize;
-    let str_sec = read_u32(buf, sym_sh + 40)? as usize;
-    let str_sh = e_shoff + str_sec * e_shentsize;
-    let str_off = read_u64(buf, str_sh + 24)? as usize;
-    let nsyms = sym_size / 24;
-
-    let mut has_defined_ext = false;
-    for i in 1..nsyms {
-        let sp = sym_off + i * 24;
-        let st_info = *buf.get(sp + 4)?;
-        let st_shndx = read_u16(buf, sp + 6)?;
-        if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < 0xff00 {
-            has_defined_ext = true;
-            break;
-        }
-    }
-    if !has_defined_ext {
-        return Some(restore_all());
-    }
-
-    let got_offset = (total_size + 15) & !15;
-    let alloc_size = ((got_offset + nsyms * 8 + 4095) & !4095).max(4096);
-    let jit = unsafe {
-        mmap(ptr::null_mut(), alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
-    } as *mut u8;
-    if jit.is_null() || jit as isize == -1 {
-        return None;
-    }
-
-    for i in 0..e_shnum {
-        let sh = e_shoff + i * e_shentsize;
-        let sh_type = read_u32(buf, sh + 4)?;
-        let sh_offset = read_u64(buf, sh + 24)? as usize;
-        let sh_size = read_u64(buf, sh + 32)? as usize;
-        if sh_type != 8 && sh_size > 0 {
-            let src = buf.get(sh_offset..sh_offset + sh_size)?;
-            unsafe {
-                ptr::copy_nonoverlapping(src.as_ptr(), jit.add(sec_offsets[i]), sh_size);
-            }
-        }
-    }
-
-    let got_base = unsafe { jit.add(got_offset) as *mut u64 };
-    for i in 1..nsyms {
-        let sp = sym_off + i * 24;
-        let st_name = read_u32(buf, sp)? as usize;
-        let st_shndx = read_u16(buf, sp + 6)? as usize;
-        let st_value = read_u64(buf, sp + 8)? as usize;
-        if st_shndx != 0 && st_shndx < e_shnum {
-            unsafe { *got_base.add(i) = jit.add(sec_offsets[st_shndx] + st_value) as u64 };
-        } else if st_shndx == 0 {
-            let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
-            let sym_name = cstr.to_str().ok()?;
-            let resolved = lookup_symbol(sym_name);
-            if resolved.is_null() {
-                unsafe { munmap(jit as *mut c_void, alloc_size) };
-                return None;
-            }
-            unsafe { *got_base.add(i) = resolved as u64 };
-        }
-    }
-
-    for i in 0..e_shnum {
-        let sh = e_shoff + i * e_shentsize;
-        let sh_type = read_u32(buf, sh + 4)?;
-        if sh_type != 4 {
-            continue;
-        }
-        let rela_off = read_u64(buf, sh + 24)? as usize;
-        let rela_size = read_u64(buf, sh + 32)? as usize;
-        let target_sec = read_u32(buf, sh + 44)? as usize;
-        let sec_base = unsafe { jit.add(sec_offsets[target_sec]) };
-        let nrela = rela_size / 24;
-        for r in 0..nrela {
-            let rp = rela_off + r * 24;
-            let r_offset = read_u64(buf, rp)? as usize;
-            let r_info = read_u64(buf, rp + 8)?;
-            let r_addend = read_u64(buf, rp + 16)? as i64;
-            let r_sym = (r_info >> 32) as usize;
-            let r_type = (r_info & 0xffff_ffff) as u32;
-            let loc = unsafe { sec_base.add(r_offset) };
-            let sym_val = unsafe { *got_base.add(r_sym) };
-            match r_type {
-                1 => {
-                    // R_X86_64_64
-                    unsafe {
-                        *(loc as *mut u64) = sym_val.wrapping_add(r_addend as u64);
-                    }
-                }
-                2 | 4 => {
-                    // R_X86_64_PC32 | R_X86_64_PLT32
-                    let val = (sym_val as i64)
-                        .wrapping_add(r_addend)
-                        .wrapping_sub(loc as u64 as i64);
-                    unsafe {
-                        *(loc as *mut i32) = val as i32;
-                    }
-                }
-                9 | 41 | 42 => {
-                    // R_X86_64_GOTPCREL | GOTPCRELX | REX_GOTPCRELX
-                    let got_slot = unsafe { got_base.add(r_sym) as u64 as i64 };
-                    let val = got_slot.wrapping_add(r_addend).wrapping_sub(loc as u64 as i64);
-                    unsafe {
-                        *(loc as *mut i32) = val as i32;
-                    }
-                }
-                _ => {
-                    unsafe { munmap(jit as *mut c_void, alloc_size) };
-                    return None;
-                }
-            }
-        }
-    }
-
-    unsafe {
-        mprotect(jit as *mut c_void, alloc_size, PROT_READ | PROT_EXEC);
-    }
-
-    let mut patched = 0usize;
-    for i in 1..nsyms {
-        let sp = sym_off + i * 24;
-        let st_name = read_u32(buf, sp)? as usize;
-        let st_info = *buf.get(sp + 4)?;
-        let st_shndx = read_u16(buf, sp + 6)? as usize;
-        if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < e_shnum {
-            let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
-            let sym_name = cstr.to_str().ok()?;
-            let ptr_name = format!("{sym_name}$rustd_ptr");
-            let slot = lookup_symbol(&ptr_name) as *const AtomicPtr<c_void>;
-            if !slot.is_null() {
-                let new_fn = unsafe { *got_base.add(i) as *mut c_void };
-                record_and_patch(slot, new_fn);
-                patched += 1;
-            }
-        }
-    }
-    Some(patched)
+fn apply_elf_patch(_buf: &[u8]) -> Option<usize> {
+    None
 }
 
 fn apply_patch_bytes(bytes: &[u8]) -> Option<usize> {

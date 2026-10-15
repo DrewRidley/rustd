@@ -142,16 +142,29 @@ fn infer_default_bin(workspace_root: &Path) -> Option<String> {
     }
     let manifest = workspace_root.join("Cargo.toml");
     if let Ok(txt) = fs::read_to_string(manifest) {
+        let mut in_bin = false;
+        let mut pkg_name = None;
         for line in txt.lines() {
             let t = line.trim();
+            if t.starts_with('[') {
+                in_bin = t == "[[bin]]";
+                continue;
+            }
             if let Some(rest) = t.strip_prefix("name")
                 && let Some((_, val)) = rest.split_once('=')
             {
                 let name = val.trim().trim_matches('"').trim_matches('\'');
                 if !name.is_empty() {
-                    return Some(name.to_owned());
+                    if in_bin {
+                        return Some(name.to_owned());
+                    } else if pkg_name.is_none() {
+                        pkg_name = Some(name.to_owned());
+                    }
                 }
             }
+        }
+        if pkg_name.is_some() {
+            return pkg_name;
         }
     }
     None
@@ -201,9 +214,6 @@ fn parse_opts(args: &[String]) -> anyhow::Result<CliOpts> {
         Some(b) => b,
         None => bail!("could not infer binary target; pass `--bin <NAME>`"),
     };
-    if crates.is_empty() {
-        crates.push(bin_name.replace('-', "_"));
-    }
     Ok(CliOpts { manifest_path, workspace_root, bin_name, crates, target, watch, run_args })
 }
 
@@ -293,6 +303,20 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
         return Ok(fs::read_to_string(&paths.link_args_txt)?);
     }
     eprintln!("Capturing linker arguments via `cargo build --bin {}`...", opts.bin_name);
+    let debug_dir = opts.workspace_root.join("target").join("debug");
+    let _ = fs::remove_file(debug_dir.join(&opts.bin_name));
+    if let Ok(entries) = fs::read_dir(debug_dir.join("deps")) {
+        let prefix = format!("{}-", opts.bin_name.replace('-', "_"));
+        for e in entries.flatten() {
+            let p = e.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && name.starts_with(&prefix)
+                && p.extension().is_none()
+            {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&opts.workspace_root)
         .args(["build", "--bin", &opts.bin_name])
@@ -308,7 +332,7 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
     );
     ensure!(
         combined.lines().any(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang") || l.contains("rust-lld"))),
-        "cargo build did not emit a linker command (if the binary is already built, remove `target/debug/{}` and retry)",
+        "cargo build did not emit a linker command for `{}`",
         opts.bin_name
     );
     fs::write(&paths.link_args_txt, &combined)?;
@@ -388,6 +412,7 @@ fn prepare_link_script_and_symbols(
         )?;
         fs::set_permissions(&ld_wrapper, fs::Permissions::from_mode(0o755))?;
 
+        let sys_rlibs = sysroot_rlibs(&opts.workspace_root, opts.target.as_deref())?;
         let mut wild_cc = vec![
             link_args[0].clone(),
             format!("-B{}", paths.dir.display()),
@@ -398,6 +423,16 @@ fn prepare_link_script_and_symbols(
         wild_cc.push(paths.patch_o.display().to_string());
         wild_cc.push(paths.base_o.display().to_string());
         wild_cc.extend_from_slice(&link_args[first_obj..]);
+        if cfg!(target_os = "macos") {
+            for sr in &sys_rlibs {
+                if let Some(fname) = sr.file_name().and_then(|n| n.to_str())
+                    && (fname.starts_with("libcore-") || fname.starts_with("liballoc-"))
+                {
+                    wild_cc.push(format!("-Wl,-force_load,{}", sr.display()));
+                }
+            }
+        }
+        wild_cc.push(format!("-Wl,{}", paths.base_o.with_extension("cave.o").display()));
         if let Some(o_pos) = wild_cc.iter().position(|x| x == "-o") {
             wild_cc[o_pos + 1] = paths.out_bin.display().to_string();
         }
@@ -451,20 +486,25 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
         .arg(&paths.rustd_sock)
         .arg("--link-cmd")
         .arg(&paths.link_sh)
+        .env("RUSTD_BIN_CRATE", &opts.bin_name)
         .env("RUSTD_STATS", "1");
     if opts.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
         cmd.env("RUSTD_WASM_TRAMPOLINES", "1");
-    } else {
+    } else if !opts.crates.is_empty() {
         cmd.env("RUSTD_NATIVE_TRAMPOLINES", "1");
     }
     for r in &rlibs {
         cmd.arg("--symbols").arg(r);
     }
 
+    let scope_desc = if opts.crates.is_empty() {
+        "all workspace crates".to_owned()
+    } else {
+        format!("crates: {}", opts.crates.join(", "))
+    };
     eprintln!(
-        "[rustd] starting hot-patch daemon for `{}` (crates: {})...",
+        "[rustd] starting hot-patch daemon for `{}` ({scope_desc})...",
         opts.bin_name,
-        opts.crates.join(", ")
     );
     let t0 = Instant::now();
     let log = fs::File::create(&paths.rustd_log)?;

@@ -47,7 +47,7 @@ use crate::symbols::SymbolTable;
 
 struct Args {
     project: PathBuf,
-    krate: String,
+    krate: Option<String>,
     /// More crates to compile from the same loaded workspace, into the same object. When `out`
     /// is a directory, each crate is a program of its own instead: `out` and `report` get a
     /// file per crate, and a crate that fails gets a `.error` file instead of ending the run.
@@ -125,7 +125,7 @@ impl Args {
         }
         Ok(Args {
             project: project.context("missing project path")?,
-            krate: krate.context("missing --crate")?,
+            krate,
             batch,
             out: out.context("missing --out")?,
             symbol_files,
@@ -711,15 +711,25 @@ fn built_features(
 fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
-    for name in std::iter::once(&args.krate).chain(&args.batch) {
-        for krate in crates_named(db, name)? {
-            let krate: ide_db::base_db::Crate = krate.into();
-            crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
+    let roots: Vec<Crate> = if let Some(first) = &args.krate {
+        let mut r = Vec::new();
+        for name in std::iter::once(first).chain(&args.batch) {
+            r.extend(crates_named(db, name)?);
         }
+        r
+    } else if let Ok(bin_crate) = std::env::var("RUSTD_BIN_CRATE")
+        && let Ok(r) = crates_named(db, &bin_crate.replace('-', "_"))
+    {
+        r
+    } else {
+        Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
+    };
+    for krate in roots {
+        let krate: ide_db::base_db::Crate = krate.into();
+        crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
     }
-    // A crate comes before its dependencies in the list, and a thread that starts on one
-    // waits for the threads working on what it depends on.
-    crates.reverse();
+    // A crate with fewer transitive dependencies must be resolved before one that depends on it.
+    crates.sort_by_cached_key(|&c| c.transitive_deps(db).len());
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
@@ -911,29 +921,66 @@ fn build(
     args: &Args,
     known: &mut Rejections,
     listed: &mut Listed,
+    dirty_files: &FxHashSet<vfs::FileId>,
+    initial_serials: &FxHashMap<FunctionId, u64>,
+    is_cold: bool,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
     let root = args.root()?;
     let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
     let hir_db: &dyn HirDatabase = db;
-    let mut functions = Vec::new();
-    let mut has_main = false;
     let mut local = Vec::new();
-    for krate in std::iter::once(&args.krate).chain(&args.batch) {
-        for krate in crates_named(db, krate)? {
-            local.push(krate);
-            let listed = listed.of(db, krate);
-            has_main |= listed.has_main;
-            functions.extend(listed.functions.iter().copied().zip(listed.starts.iter().copied()));
+    let (entries, on_demand): (Vec<FunctionId>, Vec<FunctionId>) = if let Some(first) = &args.krate {
+        let mut functions = Vec::new();
+        let mut has_main = false;
+        for krate in std::iter::once(first).chain(&args.batch) {
+            for krate in crates_named(db, krate)? {
+                local.push(krate);
+                let listed = listed.of(db, krate);
+                has_main |= listed.has_main;
+                functions
+                    .extend(listed.functions.iter().copied().zip(listed.starts.iter().copied()));
+            }
         }
-    }
+        let (e, o): (Vec<_>, Vec<_>) =
+            functions.into_iter().partition(|&(_, starts)| starts || !has_main);
+        let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
+        (unzip(e), unzip(o))
+    } else {
+        let mut e = Vec::new();
+        let mut o = Vec::new();
+        let mut seen_crates = FxHashSet::default();
+        for &file in dirty_files {
+            for &krate in ide_db::base_db::relevant_crates(db, file) {
+                if seen_crates.insert(krate) {
+                    let c = Crate::from(krate);
+                    local.push(c);
+                    let l = listed.of(db, c);
+                    hir::attach_db(db, || {
+                        for &func in &l.functions {
+                            let f = func
+                                .lookup(db)
+                                .id
+                                .file_id
+                                .original_file_respecting_includes(db)
+                                .file_id(db);
+                            if dirty_files.contains(&f)
+                                && initial_serials.get(&func).is_none_or(|&orig_s| {
+                                    hir_ty::mir::codegen::root_serial(db, func) != orig_s
+                                })
+                            {
+                                e.push(func);
+                            } else if resolver.path(func).is_none() {
+                                o.push(func);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        (e, o)
+    };
     let list = start.elapsed();
-    // With a program to start from, only what it reaches is compiled, and what a runtime
-    // looks up by name. Without one any function may be the one called.
-    let (entries, on_demand): (Vec<_>, Vec<_>) =
-        functions.into_iter().partition(|&(_, starts)| starts || !has_main);
-    let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
-    let (entries, on_demand) = (unzip(entries), unzip(on_demand));
     let roots = Roots { entries: &entries, on_demand: &on_demand };
     let setup = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
@@ -978,9 +1025,19 @@ fn build(
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
-    let unit =
-        hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
-            .map_err(anyhow::Error::msg)?;
+    let mut on_demand_rejections = Rejections::default();
+    on_demand_rejections.patching = true;
+    let active_known = if args.krate.is_some() { &mut *known } else { &mut on_demand_rejections };
+    let unit = hir::attach_db(db, || {
+        CodegenUnit::compile(hir_db, &resolver, roots, &denied, active_known)
+    })
+    .map_err(anyhow::Error::msg)?;
+    if args.krate.is_none() {
+        known.stats = on_demand_rejections.stats;
+        if !is_cold {
+            known.stats.patched = Some(unit.compiled.len());
+        }
+    }
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
@@ -991,18 +1048,26 @@ fn build(
         );
     }
     let start = Instant::now();
-    if let Some(object) = &unit.object {
-        std::fs::write(&args.out, object)?;
-        if let Some(patch_path) = &args.patch
-            && !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32"))
-        {
-            inject_hotpatch_rt(&args.out, patch_path, &args.root()?)?;
+    if args.krate.is_none() && !is_cold {
+        if let (Some(path), Some(object)) = (&args.patch, &unit.object) {
+            let tmp = path.with_extension("o.tmp");
+            std::fs::write(&tmp, object)?;
+            std::fs::rename(&tmp, path)?;
         }
-    }
-    if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
-        let tmp = path.with_extension("o.tmp");
-        std::fs::write(&tmp, patch)?;
-        std::fs::rename(&tmp, path)?;
+    } else {
+        if let Some(object) = &unit.object {
+            std::fs::write(&args.out, object)?;
+            if let Some(patch_path) = &args.patch
+                && !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32"))
+            {
+                inject_hotpatch_rt(&args.out, patch_path, &args.root()?)?;
+            }
+        }
+        if let (Some(path), Some(patch)) = (&args.patch, unit.patch.as_ref().or(unit.object.as_ref())) {
+            let tmp = path.with_extension("o.tmp");
+            std::fs::write(&tmp, patch)?;
+            std::fs::rename(&tmp, path)?;
+        }
     }
     let build = Build {
         compiled: unit.compiled.len(),
@@ -1260,8 +1325,9 @@ impl WatchedFile {
 /// none of them: a symbol from another crate's rlib would not be there at link time.
 fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
     let (out, report) = (args.out.clone(), args.report.clone().context("a batch needs --report")?);
+    let first_krate = args.krate.clone().context("a batch needs --crate")?;
     let crates: Vec<_> =
-        std::iter::once(args.krate.clone()).chain(args.batch.iter().cloned()).collect();
+        std::iter::once(first_krate).chain(args.batch.iter().cloned()).collect();
     let rlib_of = |file: &Path| {
         let name = file.file_name()?.to_str()?.strip_prefix("lib")?;
         let name = name.rsplit_once('-').map_or(name, |(name, _)| name);
@@ -1277,7 +1343,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
         let table = &SymbolTable::load(&symbol_files, &args.root()?)?;
         let args = Args {
             project: args.project.clone(),
-            krate: krate.clone(),
+            krate: Some(krate.clone()),
             batch: Vec::new(),
             out: out.join(format!("{krate}.o")),
             symbol_files: Vec::new(),
@@ -1293,7 +1359,16 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             target: args.target.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
+            build(
+                db,
+                table,
+                &args,
+                &mut Rejections::default(),
+                &mut Listed::default(),
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                true,
+            )
         }));
         let error = match built {
             Ok(Ok(_)) => continue,
@@ -1380,6 +1455,36 @@ fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path, root: &Path) -> anyhow::Res
         .context("compiling hotpatch_rt.rs")?;
     anyhow::ensure!(status.success(), "rustc failed on hotpatch_rt.rs ({status})");
     let _ = std::fs::remove_file(&rt_rs);
+
+    let cave_rs = base_o.with_extension("cave.rs");
+    let cave_o = base_o.with_extension("cave.o");
+    std::fs::write(
+        &cave_rs,
+        "#[repr(C, align(1))] pub struct Cave([u8; 81920]);\n\
+         #[used]\n\
+         #[unsafe(no_mangle)]\n\
+         #[cfg_attr(target_os = \"macos\", unsafe(link_section = \"__TEXT,__text\"))]\n\
+         #[cfg_attr(target_os = \"linux\", unsafe(link_section = \".text\"))]\n\
+         pub static __rustd_veneer_cave_end: Cave = Cave([0; 81920]);\n",
+    )?;
+    let cave_status = Command::new("rustc")
+        .current_dir(root)
+        .args([
+            "--edition=2024",
+            "--crate-name=rustd_veneer_cave",
+            "--crate-type=rlib",
+            "--emit=obj",
+            "-C",
+            "panic=abort",
+            "-O",
+        ])
+        .arg(&cave_rs)
+        .arg("-o")
+        .arg(&cave_o)
+        .status()
+        .context("compiling cave.rs")?;
+    anyhow::ensure!(cave_status.success(), "rustc failed on cave.rs ({cave_status})");
+    let _ = std::fs::remove_file(&cave_rs);
     Ok(())
 }
 
@@ -1474,26 +1579,28 @@ fn main() -> anyhow::Result<()> {
     known.patching = args.patch.is_some();
     let mut listed = Listed::default();
     let mut outlines = outline::Outlines::default();
+    let mut initial_texts: FxHashMap<vfs::FileId, triomphe::Arc<str>> = FxHashMap::default();
+    let mut initial_serials: FxHashMap<FunctionId, u64> = FxHashMap::default();
+    let mut dirty_files: FxHashSet<vfs::FileId> = FxHashSet::default();
     let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
-    let cold = build(&db, &table, &args, &mut known, &mut listed)?;
+    let cold = build(
+        &db,
+        &table,
+        &args,
+        &mut known,
+        &mut listed,
+        &dirty_files,
+        &initial_serials,
+        true,
+    )?;
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
     link(&args)?;
     hir::attach_db(&db, || known.out_of_date(&db));
-    let listener = match &args.socket {
-        Some(path) => {
-            // A socket file left by a daemon that is gone can't be bound again.
-            let _ = std::fs::remove_file(path);
-            let l = UnixListener::bind(path)?;
-            if args.watch {
-                l.set_nonblocking(true)?;
-            }
-            Some(l)
-        }
-        None if args.watch => None,
-        None => return Ok(()),
-    };
+    if args.socket.is_none() && !args.watch {
+        return Ok(());
+    }
 
     // The first change after a build of everything waits for what that build left behind.
     // Paid here, the first edit does not.
@@ -1512,6 +1619,18 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let mut tree = tree::Tree::new(&db, vfs, &sources);
+    let listener = match &args.socket {
+        Some(path) => {
+            // A socket file left by a daemon that is gone can't be bound again.
+            let _ = std::fs::remove_file(path);
+            let l = UnixListener::bind(path)?;
+            if args.watch {
+                l.set_nonblocking(true)?;
+            }
+            Some(l)
+        }
+        None => None,
+    };
     loop {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
@@ -1582,6 +1701,7 @@ fn main() -> anyhow::Result<()> {
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
                 outlines.before_edit(&db, &listed, id);
+                dirty_files.remove(&id);
                 change.change_file(id, None);
                 sources.push(id);
                 removed.push(id);
@@ -1591,8 +1711,38 @@ fn main() -> anyhow::Result<()> {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
+                    if !initial_texts.contains_key(id) {
+                        initial_texts.insert(*id, db.file_text(*id).text(&db).clone());
+                        if args.krate.is_none() {
+                            for &krate in ide_db::base_db::relevant_crates(&db, *id) {
+                                let l = listed.of(&db, Crate::from(krate));
+                                hir::attach_db(&db, || {
+                                    for &func in &l.functions {
+                                        let f = func
+                                            .lookup(&db)
+                                            .id
+                                            .file_id
+                                            .original_file_respecting_includes(&db)
+                                            .file_id(&db);
+                                        if f == *id {
+                                            initial_serials.entry(func).or_insert_with(|| {
+                                                hir_ty::mir::codegen::root_serial(&db, func)
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    let orig = initial_texts.get(id).unwrap();
+                    let new_text = std::fs::read_to_string(path)?;
+                    if new_text == **orig {
+                        dirty_files.remove(id);
+                    } else {
+                        dirty_files.insert(*id);
+                    }
                     outlines.before_edit(&db, &listed, *id);
-                    change.change_file(*id, Some(std::fs::read_to_string(path)?));
+                    change.change_file(*id, Some(new_text));
                     sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path.clone()),
@@ -1641,7 +1791,16 @@ fn main() -> anyhow::Result<()> {
                 let (db, edited) = (db.clone(), &edited);
                 scope.spawn(move || broken_in(&db, edited))
             };
-            let warm = build(&db, &table, &args, &mut known, &mut listed);
+            let warm = build(
+                &db,
+                &table,
+                &args,
+                &mut known,
+                &mut listed,
+                &dirty_files,
+                &initial_serials,
+                false,
+            );
             (warm, check.join().ok().flatten())
         });
         let warm = warm?;

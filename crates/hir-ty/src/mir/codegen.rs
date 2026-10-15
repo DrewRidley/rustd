@@ -887,7 +887,7 @@ fn next_serial() -> u64 {
 /// A number that is another once the code of the function is. The database runs this again
 /// only when compiling gave something else, not each time it compiled.
 #[salsa::tracked(returns(copy))]
-fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
+pub fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
     compiled_root(db, func);
     next_serial()
 }
@@ -1674,7 +1674,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return wasm.finish(self.module.declarations(), is_base, self.patching);
         }
         let mut product = self.module.finish();
-        if is_base && (self.patching || std::env::var_os("RUSTD_NATIVE_TRAMPOLINES").is_some()) {
+        if is_base && std::env::var_os("RUSTD_NATIVE_TRAMPOLINES").is_some() {
             emit_native_trampolines(&mut product).map_err(CodegenError::Backend)?;
         }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
