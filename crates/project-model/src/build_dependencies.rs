@@ -451,7 +451,12 @@ impl WorkspaceBuildScripts {
                 let mut requires_unstable_options = false;
                 let mut cmd = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
 
-                cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
+                let as_built =
+                    crate::workspace::SYSROOT_AS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
+                cmd.args(["check", "--quiet", "--message-format=json"]);
+                if !as_built {
+                    cmd.arg("--workspace");
+                }
                 cmd.args(&config.extra_args);
                 if let Some(config_path) = &config.config_path {
                     cmd.arg("--config").arg(config_path);
@@ -539,7 +544,9 @@ impl WorkspaceBuildScripts {
                     cmd.arg("--compile-time-deps");
                     // we can pass this unconditionally, because we won't actually build the
                     // binaries, and as such, this will succeed even on targets without libtest
-                    cmd.arg("--all-targets");
+                    if !as_built || config.set_test {
+                        cmd.arg("--all-targets");
+                    }
                 } else {
                     // --all-targets includes tests, benches and examples in addition to the
                     // default lib and bins. This is an independent concept from the --target

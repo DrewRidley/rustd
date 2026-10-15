@@ -848,11 +848,20 @@ const LARGE: usize = 50_000;
 fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, String> {
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
-    flags.set("tls_model", "elf_gd").map_err(|e| e.to_string())?;
+    let (triple, tls_model) = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        ("aarch64-apple-darwin", "macho")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        ("x86_64-apple-darwin", "macho")
+    } else if cfg!(target_arch = "aarch64") {
+        ("aarch64-unknown-linux-gnu", "elf_gd")
+    } else {
+        ("x86_64-unknown-linux-gnu", "elf_gd")
+    };
+    flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
     flags.set("opt_level", "none").map_err(|e| e.to_string())?;
     flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
     flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
-    isa::lookup_by_name("x86_64-unknown-linux-gnu")
+    isa::lookup_by_name(triple)
         .map_err(|e| e.to_string())?
         .finish(settings::Flags::new(flags))
         .map_err(|e| e.to_string())
@@ -1502,7 +1511,21 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn finish(self) -> Result<Vec<u8>> {
+        let is_base = self.base.is_none();
         let mut product = self.module.finish();
+        if is_base && product.object.format() == cranelift_object::object::BinaryFormat::MachO {
+            for sym_id in product
+                .functions
+                .values()
+                .filter_map(|x| x.map(|(id, _)| id))
+                .chain(product.data_objects.values().filter_map(|x| x.map(|(id, _)| id)))
+            {
+                let sym = product.object.symbol_mut(sym_id);
+                if !sym.is_local() && !sym.is_undefined() {
+                    sym.weak = true;
+                }
+            }
+        }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
@@ -2956,7 +2979,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 // Out of registers: an aggregate goes to memory whole. Cranelift moves
                 // anything else to the stack by itself.
-                _ if aggregate => PassMode::OnStack(self.layout(ty)?.size.bytes() as u32),
+                _ if aggregate => {
+                    if cfg!(target_arch = "aarch64") {
+                        PassMode::Indirect
+                    } else {
+                        PassMode::OnStack(self.layout(ty)?.size.bytes() as u32)
+                    }
+                }
                 _ => mode,
             });
         }
@@ -2976,7 +3005,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(PassMode::Ignore);
         }
         let size = layout.size.bytes();
-        let on_stack = PassMode::OnStack(size.next_multiple_of(8) as u32);
+        let on_stack = if cfg!(target_arch = "aarch64") {
+            PassMode::Indirect
+        } else {
+            PassMode::OnStack(size.next_multiple_of(8) as u32)
+        };
         match layout.backend_repr {
             BackendRepr::Scalar(scalar) => return Ok(PassMode::Direct(self.scalar(scalar)?)),
             BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
@@ -3091,7 +3124,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn signature(&self, args: &[PassMode], ret: PassMode) -> Signature {
-        let mut sig = Signature::new(CallConv::SystemV);
+        let mut sig = self.cg.make_signature();
         match ret {
             PassMode::Indirect => {
                 sig.params.push(AbiParam::special(PTR, ArgumentPurpose::StructReturn))

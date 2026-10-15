@@ -12,7 +12,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 mimalloc = { version = "0.1.46", default-features = false }
-object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf"] }
+object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf", "macho"] }
 rustc-demangle = "0.1.28"
 rustc-hash.workspace = true
 

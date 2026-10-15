@@ -47,23 +47,86 @@ struct Symbol {
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
-        let mut table = SymbolTable::default();
-        let mut symbols = Vec::new();
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut per_file: Vec<(Option<(String, PathBuf)>, Vec<String>)> =
+            (0..files.len()).map(|_| (None, Vec::new())).collect();
+        std::thread::scope(|scope| {
+            let chunk_size = files.len().div_ceil(threads).max(1);
+            for (idx, chunk) in per_file.chunks_mut(chunk_size).enumerate() {
+                let start = idx * chunk_size;
+                scope.spawn(move || {
+                    let mut local_seen = rustc_hash::FxHashSet::default();
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        let file = &files[start + offset];
+                        let Ok(data) = std::fs::read(file) else { continue };
+                        let mut names = Vec::new();
+                        match ArchiveFile::parse(&*data) {
+                            Ok(archive) => {
+                                for member in archive.members().flatten() {
+                                    if let Ok(member_data) = member.data(&*data) {
+                                        Self::collect_names(
+                                            member_data,
+                                            &mut names,
+                                            &mut local_seen,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(_) => Self::collect_names(&data, &mut names, &mut local_seen),
+                        }
+                        *slot = (crate_root(file, root), names);
+                    }
+                });
+            }
+        });
+        let _ = next;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut unique_names = Vec::new();
         let mut owners = Vec::new();
-        for file in files {
-            let data =
-                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-            let first = symbols.len();
-            match ArchiveFile::parse(&*data) {
-                Ok(archive) => {
-                    for member in archive.members() {
-                        table.add_object(member?.data(&*data)?, &mut symbols);
+        for (owner, names) in per_file {
+            let first = unique_names.len();
+            for name in names {
+                if seen.insert(without_instantiating_crate(&name).to_owned()) {
+                    unique_names.push(name);
+                }
+            }
+            if let Some((name, source)) = owner {
+                owners.push((name, source, first..unique_names.len()));
+            }
+        }
+        let mut symbols: Vec<Option<Symbol>> = (0..unique_names.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let chunk_size = unique_names.len().div_ceil(threads).max(1);
+            for (idx, chunk) in symbols.chunks_mut(chunk_size).enumerate() {
+                let start = idx * chunk_size;
+                let unique_names = &unique_names;
+                scope.spawn(move || {
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        let name = &unique_names[start + offset];
+                        let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
+                        let with_ids = demangled.to_string();
+                        let path = format!("{demangled:#}");
+                        *slot = Some(Symbol {
+                            name: name.clone(),
+                            place: V0::place(name),
+                            with_ids,
+                            path,
+                        });
+                    }
+                });
+            }
+        });
+        let mut table = SymbolTable::default();
+        for sym in symbols.iter().flatten() {
+            for (krate, id) in crate_ids(&sym.with_ids) {
+                match table.crates.get_mut(krate) {
+                    Some(known) if *known != Some(id) => *known = None,
+                    Some(_) => {}
+                    None => {
+                        table.crates.insert(krate.to_owned(), Some(id));
                     }
                 }
-                Err(_) => table.add_object(&data, &mut symbols),
-            }
-            if let Some((name, source)) = crate_root(file, root) {
-                owners.push((name, source, first..symbols.len()));
             }
         }
         for (name, source, range) in owners {
@@ -71,14 +134,14 @@ impl SymbolTable {
                 continue;
             }
             // Nothing a crate defines mentions the other crate of its name.
-            let id = symbols[range].iter().find_map(|symbol| {
+            let id = symbols[range].iter().flatten().find_map(|symbol| {
                 crate_ids(&symbol.with_ids).find(|it| it.0 == name).map(|it| it.1)
             });
             if let Some(id) = id {
                 table.by_root.insert(source, id);
             }
         }
-        for Symbol { name, place, with_ids, path } in symbols {
+        for Symbol { name, place, with_ids, path } in symbols.into_iter().flatten() {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
@@ -98,20 +161,19 @@ impl SymbolTable {
                     symbols.push(NestedSymbol { name: name.clone(), closures, place });
                 }
             }
-            let known = table.by_path.entry(path).or_default();
-            let same = |it: &Placed| {
-                without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
-            };
-            if !known.iter().any(same) {
-                known.push(Placed { name, place });
-            }
+            table.by_path.entry(path).or_default().push(Placed { name, place });
         }
         Ok(table)
     }
 
-    fn add_object(&mut self, data: &[u8], symbols: &mut Vec<Symbol>) {
+    fn collect_names(
+        data: &[u8],
+        names: &mut Vec<String>,
+        seen: &mut rustc_hash::FxHashSet<String>,
+    ) {
         // rlibs also hold `lib.rmeta`, which isn't an object file.
         let Ok(object) = object::File::parse(data) else { return };
+        let is_macho = object.format() == object::BinaryFormat::MachO;
         for symbol in object.symbols() {
             // A reference is as good as a definition: something in the link defines it.
             // Not `is_definition`, which leaves out thread locals.
@@ -121,28 +183,20 @@ impl SymbolTable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
+            let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
             // The memory a static points to is a symbol that demangles to the static's path.
-            if name.starts_with("_RNn") {
+            let is_v0 = name.starts_with("_R") && !name.starts_with("_RNn");
+            let is_legacy = name.starts_with("_ZN")
+                && name.ends_with('E')
+                && name.len() > 20
+                && &name.as_bytes()[name.len() - 20..name.len() - 17] == b"17h";
+            if !is_v0 && !is_legacy {
                 continue;
             }
-            let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
-            let with_ids = demangled.to_string();
-            for (krate, id) in crate_ids(&with_ids) {
-                match self.crates.get_mut(krate) {
-                    Some(known) if *known != Some(id) => *known = None,
-                    Some(_) => {}
-                    None => {
-                        self.crates.insert(krate.to_owned(), Some(id));
-                    }
-                }
+            let base = without_instantiating_crate(name);
+            if seen.insert(base.to_owned()) {
+                names.push(name.to_owned());
             }
-            // `{:#}` drops the crate disambiguator hashes.
-            symbols.push(Symbol {
-                name: name.to_owned(),
-                place: V0::place(name),
-                with_ids,
-                path: format!("{demangled:#}"),
-            });
         }
     }
 

@@ -108,6 +108,9 @@ pub(super) struct UnwindContext {
 impl UnwindContext {
     pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
+        if cfg!(target_os = "macos") {
+            return Ok(UnwindContext { frame_table, cie: None });
+        }
         let Some(mut cie) = module.isa().create_systemv_cie() else {
             return Ok(UnwindContext { frame_table, cie: None });
         };
@@ -167,6 +170,9 @@ impl UnwindContext {
         let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
         let mut data = DataDescription::new();
         data.define(unwind.landing_pads.clone().into_boxed_slice());
+        #[cfg(target_os = "macos")]
+        data.set_custom_section("__TEXT,__gcc_except_tab");
+        #[cfg(not(target_os = "macos"))]
         data.set_custom_section(".gcc_except_table");
         module.define_data(lsda, &data).map_err(|e| e.to_string())?;
         fde.lsda = Some(address_for_data(lsda));

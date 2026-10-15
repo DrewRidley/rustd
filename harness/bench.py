@@ -43,7 +43,7 @@ def rustd_loop(fx, crate, edit, n):
     obj = os.path.join(fx.work, "rustd.o")
     args = list(fx.link_args)
     first = next(i for i, a in enumerate(args) if a.endswith(".rlib"))
-    args[first:first] = [obj, "-Wl,--allow-multiple-definition"]
+    args[first:first] = [obj] if sys.platform == "darwin" else [obj, "-Wl,--allow-multiple-definition"]
     args[args.index("-o") + 1] = os.path.join(fx.work, "bin-rustd")
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     log = open(os.path.join(fx.work, "daemon.log"), "w+")
@@ -77,7 +77,10 @@ def rustd_loop(fx, crate, edit, n):
             wait_for(r"edit-to-binary: \S+", i)
         log.seek(0)
         text = log.read()
-        rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
+        if sys.platform == "darwin":
+            rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(daemon.pid)], text=True).strip()) // 1024
+        else:
+            rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
     finally:
         daemon.kill()
         edit.restore()

@@ -24,6 +24,40 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(ROOT, "target/release/rustd")
 
 
+def weaken_macho(buf, off=0):
+    import struct
+    if buf[off:off+4] != b"\xcf\xfa\xed\xfe":
+        return False
+    ncmds = struct.unpack_from("<I", buf, off + 16)[0]
+    pos = off + 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", buf, pos)
+        if cmd == 2:  # LC_SYMTAB
+            symoff, nsyms = struct.unpack_from("<II", buf, pos + 8)
+            for i in range(nsyms):
+                s = off + symoff + i * 16
+                n_type = buf[s + 4]
+                if (n_type & 0x0f) == 0x0f:  # N_SECT | N_EXT
+                    n_desc = struct.unpack_from("<H", buf, s + 6)[0]
+                    struct.pack_into("<H", buf, s + 6, n_desc | 0x0080)  # N_WEAK_DEF
+        pos += cmdsize
+    return True
+
+
+def weaken_file(path):
+    buf = bytearray(open(path, "rb").read())
+    if not weaken_macho(buf, 0) and buf[:8] == b"!<arch>\n":
+        pos = 8
+        while pos + 60 <= len(buf):
+            size = int(bytes(buf[pos+48:pos+58]).strip())
+            body = pos + 60
+            if bytes(buf[pos:pos+3]) == b"#1/":
+                name_len = int(bytes(buf[pos+3:pos+16]).strip())
+                weaken_macho(buf, body + name_len)
+            else:
+                weaken_macho(buf, body)
+            pos = body + size + (size & 1)
+    open(path, "wb").write(buf)
 def sysroot_rlibs():
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
     host = subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
@@ -61,6 +95,9 @@ class Fixture:
         self.reference = self.link_args[self.link_args.index("-o") + 1]
         # The target's own objects too: a crate rustd rebuilds may be the one being linked.
         self.rlibs = [a for a in self.link_args if a.endswith((".rlib", ".rcgu.o"))]
+        if sys.platform == "darwin":
+            for rlib in self.rlibs:
+                weaken_file(rlib)
 
     def rustd_build(self, deny=()):
         """Compiles each crate with rustd and links the objects ahead of rustc's rlibs."""
@@ -91,7 +128,7 @@ class Fixture:
     def link(self, objects):
         args = list(self.link_args)
         first = next(i for i, a in enumerate(args) if a.endswith((".rlib", ".rcgu.o")))
-        args[first:first] = objects + ["-Wl,--allow-multiple-definition"]
+        args[first:first] = objects + ([] if sys.platform == "darwin" else ["-Wl,--allow-multiple-definition"])
         self.binary = os.path.join(self.work, "bin-rustd")
         args[args.index("-o") + 1] = self.binary
         run = subprocess.run(args, capture_output=True, text=True)
