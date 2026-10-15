@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Random edits of the kind people and agents make, thrown at one warm daemon on a real workspace.
 
-usage: agents.py WORKSPACE PACKAGE CRATE[,CRATE...] [--steps N] [--seed S] [--lib PATH:NAME]
+usage: agents.py WORKSPACE PACKAGE CRATE[,CRATE...] [--steps N] [--seed S] [--tag T] [--project DIR] [--lib PATH:NAME]
                  [--noise FILE,FILE...] [-- RUN_ARG...]
 
 The workspace is copied. Each step changes the copy, asks the daemon for a build with
 `rustd sync`, builds the same source with cargo in a directory of its own and runs both programs:
 they have to print the same. A step is one of
   - a unit added: a new module of the program (functions, a struct with derives, a trait with
-    impls, generics, a macro, statics, closures, an `async fn`, collections, an enum), with a line
-    in `main` that prints what it computes;
+    impls, generics, a macro, statics, closures, an `async fn`, collections, an enum, operators
+    with `Drop` and associated types), with a line in `main` that prints what it computes;
+  - a `user` unit, which uses a module the others of its kind share, and a change of that
+    module: its struct's fields, its trait's methods, a signature, an enum's variants, a macro;
   - a unit changed: its next version, which differs in bodies, signatures, fields, variants,
     impls or instantiations;
   - a unit removed, file and all;
@@ -58,18 +60,19 @@ def trait(k, v):
     over = "\n    fn twice(&self) -> u32 {\n        self.area() * 3\n    }\n" if v % 3 == 1 else ""
     third = f"\npub struct Tri(pub u32);\n\nimpl Shape for Tri {{\n    const SIDES: u32 = 3;\n\n    fn area(&self) -> u32 {{\n        self.0 * {v}\n    }}\n}}\n" if v >= 2 else ""
     items = "Box::new(Sq(2)), Box::new(Rect(2, 5))" + (", Box::new(Tri(4))" if v >= 2 else "")
-    name = ' + &s.name()' if v % 2 else ""
+    name = ' + s.name().as_str()' if v % 2 else ""
     return (f"pub trait Shape {{\n    const SIDES: u32;\n\n    fn area(&self) -> u32;\n\n    fn twice(&self) -> u32 {{\n        self.area() * 2 + {v}\n    }}\n{extra}}}\n\npub struct Sq(pub u32);\npub struct Rect(pub u32, pub u32);\n\nimpl Shape for Sq {{\n    const SIDES: u32 = 4;\n\n    fn area(&self) -> u32 {{\n        self.0 * self.0\n    }}\n{over}}}\n\nimpl Shape for Rect {{\n    const SIDES: u32 = {4 + v};\n\n    fn area(&self) -> u32 {{\n        self.0 * self.1\n    }}\n}}\n{third}\nfn sides<T: Shape>(_: &T) -> u32 {{\n    T::SIDES\n}}\n\npub fn all() -> String {{\n    let shapes: Vec<Box<dyn ShapeDyn>> = vec![{items}];\n    let mut out = format!(\"{{}}\", sides(&Rect(1, 1)));\n    for s in &shapes {{\n        out += &format!(\" {{}}\", s.twice_dyn());\n    }}\n    out{''}\n}}\n\npub trait ShapeDyn {{\n    fn twice_dyn(&self) -> String;\n}}\n\nimpl<T: Shape> ShapeDyn for T {{\n    fn twice_dyn(&self) -> String {{\n        let s = self;\n        s.twice().to_string(){name}\n    }}\n}}\n",
             "all()")
 
 
 def generic(k, v):
-    uses = " + &".join(f"pick(&[{TYPES[(k + i) % len(TYPES)]}], {i})" for i in range(1 + v % 5))
+    # Not `+ &string`: a crate of the workspace may add to `String` too, and then `&String` fits no impl.
+    uses = " + ".join(f"pick(&[{TYPES[(k + i) % len(TYPES)]}], {i})" + ".as_str()" for i in range(1 + v % 5))
     bound = "Clone + std::fmt::Debug" if v % 2 == 0 else "Clone + std::fmt::Debug + PartialEq"
     n = f"<const N: usize>(items: &[T; N]" if v % 3 == 2 else "(items: &[T]"
     gen = "<T: " + bound + (", const N: usize>" if v % 3 == 2 else ">")
     sig = f"fn pick{gen}(items: &[T{'; N' if v % 3 == 2 else ''}], n: usize) -> String"
-    return (f"{sig} {{\n    let copy: Vec<T> = items.iter().cloned().cycle().take(n + 1).collect();\n    format!(\"{{:?}}/{{}}\", copy, std::mem::size_of::<T>())\n}}\n\npub fn picks() -> String {{\n    String::new() + &{uses}\n}}\n",
+    return (f"{sig} {{\n    let copy: Vec<T> = items.iter().cloned().cycle().take(n + 1).collect();\n    format!(\"{{:?}}/{{}}\", copy, std::mem::size_of::<T>())\n}}\n\npub fn picks() -> String {{\n    String::new() + {uses}\n}}\n",
             "picks()")
 
 
@@ -119,8 +122,43 @@ def enum(k, v):
             "ops()")
 
 
+def ops(k, v):
+    add_int = "\nimpl Add<i32> for V2 {\n    type Output = V2;\n\n    fn add(self, o: i32) -> V2 {\n        V2(self.0 + o, self.1 - o)\n    }\n}\n" if v % 2 else ""
+    use_int = "    let sum = sum + 1;\n" if v % 2 else ""
+    third = '        let _c = Guard("c");\n' if v % 3 == 1 else ""
+    return ("use std::cell::RefCell;\nuse std::ops::{Add, Index, Neg};\n\nthread_local! {\n    static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };\n}\n\n#[derive(Clone, Copy, Debug, PartialEq)]\npub struct V2(pub i32, pub i32);\n\n"
+            f"impl Add for V2 {{\n    type Output = V2;\n\n    fn add(self, o: V2) -> V2 {{\n        V2(self.0 + o.0 + {v}, self.1 + o.1)\n    }}\n}}\n{add_int}\nimpl Neg for V2 {{\n    type Output = V2;\n\n    fn neg(self) -> V2 {{\n        V2(-self.0, -self.1)\n    }}\n}}\n\npub struct Grid {{\n    cells: Vec<V2>,\n}}\n\nimpl Index<usize> for Grid {{\n    type Output = V2;\n\n    fn index(&self, i: usize) -> &V2 {{\n        &self.cells[i % self.cells.len()]\n    }}\n}}\n\nstruct Guard(&'static str);\n\nimpl Drop for Guard {{\n    fn drop(&mut self) {{\n        LOG.with(|l| l.borrow_mut().push(format!(\"drop {{}}\", self.0)));\n    }}\n}}\n\nstruct Count {{\n    at: u32,\n    to: u32,\n}}\n\nimpl Iterator for Count {{\n    type Item = u32;\n\n    fn next(&mut self) -> Option<u32> {{\n        if self.at < self.to {{\n            self.at += {1 + v % 3};\n            Some(self.at)\n        }} else {{\n            None\n        }}\n    }}\n}}\n\ntrait Named {{\n    fn name(&self) -> String;\n}}\n\ntrait Loud: Named {{\n    fn shout(&self) -> String {{\n        self.name().to_uppercase() + \"{'!' * (v % 3 + 1)}\"\n    }}\n}}\n\nimpl Named for V2 {{\n    fn name(&self) -> String {{\n        format!(\"v{{}}_{{}}\", self.0, self.1)\n    }}\n}}\n\nimpl Loud for V2 {{}}\n\ntrait Container {{\n    type Item;\n\n    fn first(&self) -> Option<Self::Item>;\n}}\n\nimpl Container for Grid {{\n    type Item = V2;\n\n    fn first(&self) -> Option<V2> {{\n        self.cells.{'first' if v % 2 == 0 else 'last'}().copied()\n    }}\n}}\n\nfn first_of<C: Container>(c: &C) -> Option<C::Item> {{\n    c.first()\n}}\n\npub fn ops() -> String {{\n    let g = Grid {{ cells: vec![V2(1, 2), V2(3, {k})] }};\n    let sum = g[0] + g[1] + -g[{v}];\n{use_int}    {{\n        let _a = Guard(\"a\");\n        let _b = Guard(\"b\");\n{third}    }}\n    let log = LOG.with(|l| l.borrow().join(\",\"));\n    let total: u32 = Count {{ at: 0, to: {5 + v} }}.filter(|x| x % 2 == 1).sum();\n    let loud: &dyn Loud = &sum;\n    format!(\"{{:?}} {{}} {{}} {{}} {{:?}}\", sum, log, total, loud.shout(), first_of(&g))\n}}\n",
+            "ops()")
+
+
+SHARED = 0
+
+
+def shared_text(s):
+    """A module the `user` units all use: what it declares changes shape with its version."""
+    fields = "    pub scale: u32,\n" + ("    pub offset: u32,\n" if s % 3 >= 1 else "") + ("    pub label: &'static str,\n" if s % 3 == 2 else "")
+    init = f"scale: {2 + s}" + (f", offset: {s}" if s % 3 >= 1 else "") + (f', label: "L{s}"' if s % 3 == 2 else "")
+    describe = f"\n    fn describe(&self) -> String {{\n        String::from(\"d{s}\")\n    }}\n" if s % 2 else ""
+    third = ", c: u32" if s % 4 >= 2 else ""
+    ret, cast = ("u64", " as u64") if s % 4 == 3 else ("u32", "")
+    mid = "    Mid(u8),\n" if s % 2 else ""
+    mid_arm = "            Mode::Mid(n) => *n as u32,\n" if s % 2 else ""
+    return (f"pub struct Config {{\n{fields}}}\n\nimpl Config {{\n    pub fn new() -> Config {{\n        Config {{ {init} }}\n    }}\n}}\n\npub trait Scaled {{\n    fn scaled(&self, c: &Config) -> u64;\n{describe}}}\n\npub fn combine(a: u32, b: u32{third}) -> {ret} {{\n    (a * {s + 1} + b{' + c' if third else ''}){cast}\n}}\n\nmacro_rules! shared_sum {{\n    ($($x:expr),*) => {{ 0u64 $(+ ($x as u64) * {s + 1})* }};\n}}\npub(crate) use shared_sum;\n\n#[allow(dead_code)]\npub enum Mode {{\n    Fast,\n    Slow,\n{mid}}}\n\nimpl Mode {{\n    pub fn cost(&self) -> u32 {{\n        match self {{\n            Mode::Fast => 1,\n            Mode::Slow => {s + 5},\n{mid_arm}        }}\n    }}\n}}\n\npub static BASE: u32 = {s * 7};\n\npub const fn konst() -> usize {{\n    {s % 5 + 1}\n}}\n")
+
+
+def user(k, v):
+    s = SHARED
+    offset = " + c.offset as u64" if s % 3 >= 1 else ""
+    label = " + c.label.len() as u64" if s % 3 == 2 else ""
+    third = ", 3" if s % 4 >= 2 else ""
+    describe = "Item(1).describe()" if s % 2 else '"-"'
+    return (f"use super::rustd_ushared::{{self as shared, Config, Mode, Scaled}};\n\nstruct Item(u32);\n\nimpl Scaled for Item {{\n    fn scaled(&self, c: &Config) -> u64 {{\n        (self.0 * c.scale) as u64 + {v}{offset}{label}\n    }}\n}}\n\npub fn used() -> String {{\n    let c = Config::new();\n    let arr = [0u8; shared::konst()];\n    let comb = shared::combine({k}, {v}{third}) as u64;\n    let modes = [Mode::Fast, Mode::Slow];\n    format!(\"{{}} {{}} {{}} {{}} {{}} {{}}\", Item({k}).scaled(&c), comb, shared::shared_sum!(1, {v}), modes.iter().map(|m| m.cost()).sum::<u32>(), shared::BASE + arr.len() as u32, {describe})\n}}\n",
+            "used()")
+
+
 KINDS = {"plain": plain, "struct": struct, "trait": trait, "generic": generic, "macro": macro, "static": static,
-         "closure": closure, "async": asynch, "collections": collections, "enum": enum}
+         "closure": closure, "async": asynch, "collections": collections, "enum": enum,
+         "ops": ops, "user": user, "user2": user}
 
 
 class Source:
@@ -129,6 +167,7 @@ class Source:
     def __init__(self, ws, main, lib, noise, rng):
         self.ws, self.main, self.lib, self.noise, self.rng = ws, main, lib, noise, rng
         self.units, self.libs, self.next, self.broken = {}, {}, 0, None
+        self.shared = 0
         self.first = {p: open(p).read() for p in [main, *noise] + ([lib[0]] if lib else [])}
         self.text = dict(self.first)
 
@@ -137,8 +176,13 @@ class Source:
 
     def files(self):
         """Every file the steps own or change, as it should be now."""
+        global SHARED
+        SHARED = self.shared
         out = dict(self.text)
         mods, probes = "", ""
+        if any(kind.startswith("user") for kind, _ in self.units.values()):
+            out[os.path.join(os.path.dirname(self.main), "rustd_ushared.rs")] = shared_text(self.shared).replace("pub ", "pub(crate) ")
+            mods += "mod rustd_ushared;\n"
         for k, (kind, v) in sorted(self.units.items()):
             text, call = KINDS[kind](k, v)
             # A program can deny `unreachable_pub`.
@@ -172,6 +216,8 @@ class Source:
             choices += ["bump"] * 6 + ["remove"]
         if self.lib:
             choices += ["lib"] * 2
+        if any(kind.startswith("user") for kind, _ in self.units.values()):
+            choices += ["shared"] * 4
         what = self.rng.choice(choices)
         if what == "burst":
             return "burst: " + "; ".join(self.one(self.rng.choice([c for c in choices if c not in ("burst", "break")])) for _ in range(self.rng.randint(2, 5))), True
@@ -181,6 +227,10 @@ class Source:
                 ("syntax error", lambda t: t.replace("{", "{ (", 1)),
                 ("type error", lambda t: t + "\nfn rustd_wrong() -> u32 {\n    \"text\"\n}\n"),
                 ("unresolved name", lambda t: t + "\nfn rustd_wrong() -> u32 {\n    rustd_missing(1)\n}\n"),
+                ("missing match arm", lambda t: t + "\n#[allow(dead_code)]\nfn rustd_wrong(x: Option<u8>) -> u8 {\n    match x {\n        Some(n) => n,\n    }\n}\n"),
+                ("wrong argument count", lambda t: t + "\n#[allow(dead_code)]\nfn rustd_wrong() -> u32 {\n    rustd_two(1)\n}\n\n#[allow(dead_code)]\nfn rustd_two(a: u32, b: u32) -> u32 {\n    a + b\n}\n"),
+                ("missing trait item", lambda t: t + "\n#[allow(dead_code)]\ntrait RustdT {\n    fn f(&self);\n}\n\nimpl RustdT for u8 {}\n"),
+                ("missing field", lambda t: t + "\n#[allow(dead_code)]\nstruct RustdS {\n    a: u8,\n    b: u8,\n}\n\n#[allow(dead_code)]\nfn rustd_wrong() -> RustdS {\n    RustdS { a: 1 }\n}\n"),
             ])
             self.broken = (path, how[1])
             return f"BROKEN: {how[0]} in {os.path.relpath(path, self.ws)}", False
@@ -202,6 +252,9 @@ class Source:
             k = rng.choice(list(self.units))
             kind, _ = self.units.pop(k)
             return f"unit {k} ({kind}) removed"
+        if what == "shared":
+            self.shared += 1
+            return f"shared module to version {self.shared}"
         if what == "lib":
             if self.libs and rng.random() < 0.6:
                 k = rng.choice(list(self.libs))
@@ -250,7 +303,7 @@ def main():
     workspace, package, crates = argv[0], argv[1], argv[2].split(",")
     steps, seed = int(opt("--steps", "60")), int(opt("--seed", "1"))
     ws = tempfile.mkdtemp(prefix="rustd-agents-")
-    shutil.copytree(workspace, ws, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns("target", ".git"))
+    shutil.copytree(workspace, ws, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns("target", "target-*", ".git"))
     work = tempfile.mkdtemp(prefix="rustd-agents-out-")
     obj, patch, binary = (os.path.join(work, n) for n in ("rustd.o", "rustd.patch.o", "bin-rustd"))
     socket, log_path, reference = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log"), os.path.join(work, "reference")
@@ -278,7 +331,7 @@ def main():
         seen = len(open(log_path).read())
         began = time.time()
         daemon = subprocess.Popen(
-            [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
+            [RUSTD, os.path.join(ws, opt("--project", "")), *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
              "--patch", patch, "--link-cmd", shlex.join(link), *symbols], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
@@ -301,7 +354,7 @@ def main():
     print(f"warm in {warmup:.1f}s, rss {rss(daemon)} MB, log {log_path}, source {ws}", flush=True)
     rows, restarts, last = [], 0, None
     for index in range(steps):
-        if index and index % 25 == 0:
+        if index and index % 25 == 0 and not source.broken:
             name, compiles = "back to the first source", True
             last = source.files()
             source.write({**{p: t for p, t in source.first.items()}})
@@ -361,7 +414,8 @@ def main():
     times = sorted(r[3] for r in rows if r[2] == "patch")
     summary = (f"{good} of {len(rows)} steps right, {restarts} restarts, {sum(r[2] == 'patch' for r in rows)} patches "
                f"(median {times[len(times) // 2] if times else 0:.0f} ms with the link), {sum(r[2] == 'full' for r in rows)} full objects, rss {memory} MB at the end")
-    with open(os.path.join(HERE, f"AGENTS-{package}.md"), "w") as md:
+    tag = opt("--tag")
+    with open(os.path.join(HERE, f"AGENTS-{package}{'-' + tag if tag else ''}.md"), "w") as md:
         md.write(f"# Agent-style edits: {package}, seed {seed}\n\n{summary}. Warmup {warmup:.1f} s.\n\n| # | Edit | Reply | ms | Result |\n|---|---|---|---:|---|\n")
         for index, name, kind, took, verdict in rows:
             md.write(f"| {index} | {name} | {kind} | {took:.0f} | {verdict} |\n")

@@ -336,14 +336,12 @@ impl Resolver<'_> {
         if params.is_empty() {
             return Some(path);
         }
-        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`,
-        // and writes a lifetime as `'_`.
+        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`.
         // FIXME: name those too.
-        let only_types = params.iter().all(|it| it.as_type_param(self.db).is_some())
-            && generics.lifetime_params(self.db).is_empty();
-        if !only_types {
+        if !params.iter().all(|it| it.as_type_param(self.db).is_some()) {
             return None;
         }
+        // Lifetimes are erased, and rustc leaves erased ones out of the name.
         let args: Option<Vec<_>> = ty.type_arguments().map(|arg| self.type_path(&arg)).collect();
         Some(format!("{path}<{}>", args?.join(", ")))
     }
@@ -547,7 +545,7 @@ fn is_definition(node: &SyntaxNode) -> bool {
 }
 
 /// The place of a node among those of the definition it is written in that `counts` holds
-/// of, through the macros used in the definition. This is how rustc tells apart the closures
+/// of, in the order rustc comes across them. This is how rustc tells apart the closures
 /// of a function, and the statics of one name that a macro used twice in it declares.
 fn place_in_definition(
     sema: &hir::Semantics<'_, RootDatabase>,
@@ -576,16 +574,26 @@ struct Place<'a, 'db> {
 impl Place<'_, '_> {
     /// Counts the nodes before the target in the definition `node` is of. Whether the target
     /// is there.
+    ///
+    /// rustc numbers what is written in the definition before what the macros used in it
+    /// expand to, and then goes through the macros in turn, each the same way.
     fn find_in(&mut self, node: &SyntaxNode) -> bool {
+        let mut calls = Vec::new();
+        if self.find_written_in(node, &mut calls) {
+            return true;
+        }
+        calls.iter().any(|call| {
+            self.sema
+                .expand_macro_call(call)
+                .is_some_and(|expansion| self.find_in(&expansion.value))
+        })
+    }
+
+    /// As `find_in`, of what is not in a macro: `calls` gets the macros come across.
+    fn find_written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) -> bool {
         for child in node.children() {
             if let Some(call) = ast::MacroCall::cast(child.clone()) {
-                let found = self
-                    .sema
-                    .expand_macro_call(&call)
-                    .is_some_and(|expansion| self.find_in(&expansion.value));
-                if found {
-                    return true;
-                }
+                calls.push(call);
                 continue;
             }
             if child == *self.target {
@@ -594,7 +602,7 @@ impl Place<'_, '_> {
             if (self.counts)(&child) {
                 *self.earlier += 1;
             }
-            if !is_definition(&child) && self.find_in(&child) {
+            if !is_definition(&child) && self.find_written_in(&child, calls) {
                 return true;
             }
         }
@@ -636,6 +644,9 @@ fn load(
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
+        if !cargo_config.set_test {
+            cargo.drop_dev_dependencies();
+        }
         let built = built_features(manifest.manifest_path().as_ref(), cargo_config)?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
@@ -1110,46 +1121,69 @@ fn refusal(
     ))
 }
 
-/// A function written in one of the edited files that does not type-check. Nothing may reach
-/// it, so the build never looks at it, and cargo still turns the crate down for it.
-fn broken_in(db: &RootDatabase, listed: &Listed, edited: &[vfs::FileId]) -> Option<String> {
-    use hir_ty::InferenceDiagnostic as Diagnostic;
-    let functions: Vec<FunctionId> =
-        edited.iter().filter_map(|&file| listed.in_file(db, file)).flatten().collect();
+/// Something written in one of the edited files that cargo turns the crate down for. Nothing
+/// may reach it, so the build never looks at it.
+fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
+    use hir::AnyDiagnostic as Diagnostic;
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let broken = std::thread::scope(|scope| {
-        let checks: Vec<_> = (0..threads.min(functions.len()))
+        let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
-                let (db, functions) = (db.clone(), &functions);
+                let db = db.clone();
                 scope.spawn(move || {
                     hir::attach_db(&db, || {
-                        functions.iter().skip(part).step_by(threads).find_map(|&func| {
-                            if !hir_def::signatures::FunctionSignature::of(&db, func).has_body() {
-                                return None;
+                        let sema = hir::Semantics::new(&db);
+                        let modules = edited
+                            .iter()
+                            .skip(part)
+                            .step_by(threads)
+                            .flat_map(|&file| sema.file_to_module_defs(file));
+                        for module in modules {
+                            let mut found = Vec::new();
+                            module.diagnostics(&db, &mut found, false);
+                            // Only what rust-analyzer is as sure of as rustc is: a wrong
+                            // refusal costs a cargo build.
+                            let why = found.iter().find_map(|it| match it {
+                                Diagnostic::TypeMismatch(_) => Some("mismatched types"),
+                                Diagnostic::UnresolvedIdent(_) => Some("unresolved name"),
+                                Diagnostic::MismatchedArgCount(_)
+                                | Diagnostic::MismatchedTupleStructPatArgCount(_) => {
+                                    Some("wrong number of arguments")
+                                }
+                                Diagnostic::MissingFields(_) => Some("missing fields"),
+                                Diagnostic::NoSuchField(_) | Diagnostic::UnresolvedField(_) => {
+                                    Some("no such field")
+                                }
+                                Diagnostic::UnresolvedMethodCall(_)
+                                | Diagnostic::UnresolvedAssocItem(_) => Some("no such method"),
+                                Diagnostic::MissingMatchArms(_)
+                                | Diagnostic::NonExhaustiveLet(_) => Some("patterns not covered"),
+                                Diagnostic::TraitImplMissingAssocItems(_)
+                                | Diagnostic::TraitImplRedundantAssocItems(_) => {
+                                    Some("an impl does not match its trait")
+                                }
+                                Diagnostic::UnresolvedModule(_) => Some("a module without a file"),
+                                Diagnostic::UnresolvedImport(_) => Some("unresolved import"),
+                                Diagnostic::UnresolvedMacroCall(_) => Some("unresolved macro"),
+                                _ => None,
+                            });
+                            if let Some(why) = why {
+                                let name = module.name(&db).map_or_else(
+                                    || "the crate root".to_owned(),
+                                    |it| format!("`{}`", it.display(&db, syntax::Edition::CURRENT)),
+                                );
+                                return Some((name, why));
                             }
-                            let infer = hir_ty::InferenceResult::of(&db, DefWithBodyId::from(func));
-                            let why = if infer.has_type_mismatches() {
-                                "mismatched types"
-                            } else {
-                                infer.diagnostics().iter().find_map(|it| match it {
-                                    Diagnostic::UnresolvedIdent { .. } => Some("unresolved name"),
-                                    Diagnostic::MismatchedArgCount { .. } => {
-                                        Some("wrong number of arguments")
-                                    }
-                                    _ => None,
-                                })?
-                            };
-                            Some((func, why))
-                        })
+                        }
+                        None
                     })
                 })
             })
             .collect();
         checks.into_iter().find_map(|it| it.join().ok().flatten())
     });
-    let (func, why) = broken?;
-    let name = hir::Function::from(func).name(db).display(db, syntax::Edition::CURRENT).to_string();
-    Some(format!("`{name}` has errors, `cargo check` shows them: {why}"))
+    let (module, why) = broken?;
+    Some(format!("{module} has errors, `cargo check` shows them: {why}"))
 }
 
 /// A file whose changes the daemon picks up.
@@ -1397,6 +1431,12 @@ fn main() -> anyhow::Result<()> {
         None => return Ok(()),
     };
 
+    // The first change after a build of everything waits for what that build left behind.
+    // Paid here, the first edit does not.
+    {
+        use ide_db::base_db::salsa::{Database, Durability};
+        db.synthetic_write(Durability::LOW);
+    }
     let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
@@ -1526,7 +1566,16 @@ fn main() -> anyhow::Result<()> {
             listed.touch(&db, crates);
         }
         let apply = start.elapsed();
-        let warm = build(&db, &table, &args, &mut known, &mut listed)?;
+        // The check of the edited files does not wait for the build: it reads other things.
+        let (warm, broken) = std::thread::scope(|scope| {
+            let check = {
+                let (db, edited) = (db.clone(), &edited);
+                scope.spawn(move || broken_in(&db, edited))
+            };
+            let warm = build(&db, &table, &args, &mut known, &mut listed);
+            (warm, check.join().ok().flatten())
+        });
+        let warm = warm?;
         let built = start.elapsed();
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
@@ -1540,8 +1589,7 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
-        let mut failed =
-            refusal(&db, &edited, &paths, out_of_date).or_else(|| broken_in(&db, &listed, &edited));
+        let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
         if failed.is_none() && !matches!(client, Some((Request::Patch, _))) {
             failed = link(&args).err().map(|it| it.to_string());
         }

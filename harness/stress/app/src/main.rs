@@ -54,6 +54,7 @@ fn main() {
     report::line("checked", format!("{:?} {}", smid::checked(5).ok(), smid::checked(500).unwrap_err()));
     report::line("closures", smid::multiplier(3)(4) + smid::boxed_op(1)(1) + smid::boxed_op(2)(2));
     report::line("drops", smid::drops());
+    report::line("seeded", smid::seeded() + smid::seeded());
     report::line("evens", smid::Evens::up_to(9).map(|x| x.to_string()).collect::<Vec<_>>().join(""));
     report::line("text", format!("{} {}", smid::text::shout("hi"), smid::text::initials("a big cat")));
     report::line("async", smid::tasks::block_on(smid::tasks::pipeline(1)));

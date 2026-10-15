@@ -534,6 +534,13 @@ impl CargoWorkspace {
         self.packages[package].active_features = features;
     }
 
+    /// Leaves out what only tests, examples and benchmarks depend on.
+    pub fn drop_dev_dependencies(&mut self) {
+        for (_, package) in self.packages.iter_mut() {
+            package.dependencies.retain(|it| it.kind != DepKind::Dev);
+        }
+    }
+
     pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
         self.packages.iter().map(|(id, _pkg)| id)
     }

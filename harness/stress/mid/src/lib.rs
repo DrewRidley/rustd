@@ -69,6 +69,17 @@ thread_local! {
     pub static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    static SEED: std::cell::Cell<u32> = const { std::cell::Cell::new(4) };
+}
+
+pub fn seeded() -> u32 {
+    SEED.with(|seed| {
+        seed.set(seed.get() * 3);
+        seed.get()
+    })
+}
+
 pub struct Noisy(pub &'static str);
 
 impl Drop for Noisy {

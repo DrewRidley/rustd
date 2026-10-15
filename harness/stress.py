@@ -6,8 +6,8 @@ usage: stress.py [--only TEXT] [--from N] [--keep]
 Copies harness/stress (three crates) to a scratch directory, starts the daemon on all of them, and
 applies STEPS in order. The edits stay: each step builds on the ones before. After each, `rustd
 sync` is asked for a build, the program is run, and `cargo build` of the same source is run and its
-program's output compared. A step marked broken is one cargo rejects: the daemon only has to
-survive it. Writes STRESS.md.
+program's output compared. A step marked broken is one cargo rejects: the daemon has to say
+so and survive it. Writes STRESS.md.
 """
 import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
@@ -180,6 +180,18 @@ STEPS = [
     # Many at once, and going back.
     step("file restored and three crates edited in one build", write(TEXT, "pub fn shout(s: &str, times: usize) -> String {\n    format!(\"{}{}\", s.to_uppercase(), \"*\".repeat(times))\n}\n\npub fn words(s: &str) -> Vec<&str> {\n    s.split_whitespace().collect()\n}\n\npub fn count_words(s: &str) -> usize {\n    words(s).len()\n}\n\npub async fn count_later(s: &str) -> usize {\n    count_words(s) + 1\n}\n\npub fn initials(s: String) -> String {\n    words(&s).iter().filter_map(|w| w.chars().next()).collect()\n}\n"),
          sub(BASE, "    let _ = 1;\n", ""), sub(MAIN, "local_sum(&[1, 2, 3, 4])", "local_sum(&[1u64, 2, 3, 4, 5])")),
+    # What only a check of the edited files finds: nothing reaches these.
+    step("thread_local of the first source given another value", sub(MID, "std::cell::Cell::new(4)", "std::cell::Cell::new(9)")),
+    step("BROKEN: struct literal without one of its fields", append(BASE, "\nstruct Pair {\n    a: u8,\n    b: u8,\n}\n\nfn pair() -> Pair {\n    Pair { a: 1 }\n}\n"), broken=True),
+    step("mended: the field given", sub(BASE, "    Pair { a: 1 }\n", "    Pair { a: 1, b: 2 }\n")),
+    step("BROKEN: match without one of its arms", append(MID, "\nfn unwrapped(x: Option<u8>) -> u8 {\n    match x {\n        Some(n) => n,\n    }\n}\n"), broken=True),
+    step("mended: the arm given", sub(MID, "        Some(n) => n,\n    }\n}\n", "        Some(n) => n,\n        None => 0,\n    }\n}\n")),
+    step("BROKEN: impl without one of its trait's methods", append(MAIN, "\ntrait Greets {\n    fn greet(&self) -> u8;\n}\n\nimpl Greets for u8 {}\n"), broken=True),
+    step("mended: the method given", sub(MAIN, "impl Greets for u8 {}\n", "impl Greets for u8 {\n    fn greet(&self) -> u8 {\n        *self\n    }\n}\n")),
+    step("BROKEN: method that no type has", append(TEXT, "\nfn lost(s: &str) -> usize {\n    s.lenn()\n}\n"), broken=True),
+    step("mended: the method named right", sub(TEXT, "s.lenn()", "s.len()")),
+    step("BROKEN: import of a name that is not there", sub(MAIN, "\ntrait Greets {", "\nuse smid::text::nothing_here;\n\ntrait Greets {"), broken=True),
+    step("mended: the import removed", sub(MAIN, "\nuse smid::text::nothing_here;\n", "")),
     step("whole file rewritten in another order", "reorder"),
     step("large generated function added", "bulk"),
     step("everything back to the first source", "reset"),
@@ -302,7 +314,7 @@ def main():
         if died:
             verdict = "DAEMON DIED"
         elif broken:
-            verdict = "survived (" + reply[:60].replace("|", "/") + ")"
+            verdict = ("said so (" if kind == "error" else "ANSWERED OK (") + reply[:60].replace("|", "/") + ")"
         elif kind == "error":
             verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
         else:
@@ -315,7 +327,7 @@ def main():
                 verdict = "WRONG: " + ("; ".join(diff) or f"{len(a)} lines for {len(b)}")
         rows.append((index, name, kind, took, verdict))
         print(f"{index:3} {kind:9} {took:7.0f} ms  {verdict[:150]}  | {name}", flush=True)
-        if died or kind == "error" and not broken or verdict.startswith("WRONG"):
+        if died or (kind == "error") != broken or verdict.startswith("WRONG"):
             # Start again from the source as it is, so that one failure is not counted many times.
             if not died:
                 daemon.kill()
@@ -327,7 +339,7 @@ def main():
                 print(f'    cargo cannot build this source: {str(error)[:200]}', flush=True)
             restarts += 1
     daemon.kill()
-    good = sum(1 for r in rows if r[4] == "same" or r[4].startswith("survived"))
+    good = sum(1 for r in rows if r[4] == "same" or r[4].startswith("said so"))
     with open(os.path.join(HERE, "STRESS.md"), "w") as md:
         md.write(f"# Stress edits\n\n{good} of {len(rows)} steps right, {restarts} restarts. Log: {log_path}\n\n| # | Edit | Reply | ms | Result |\n|---|---|---|---:|---|\n")
         for index, name, kind, took, verdict in rows:

@@ -542,7 +542,6 @@ impl OwnStatics {
     fn replaces(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
         self.owns(db, id)
             && !self.shared.contains(&id.krate(db))
-            && !is_thread_local(db, id)
             && !AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE)
             && AttrFlags::export_name(db, id.into()).is_none()
     }

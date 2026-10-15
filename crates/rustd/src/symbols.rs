@@ -392,7 +392,11 @@ impl V0<'_> {
 
     fn identifier(&mut self) -> Option<()> {
         self.eat(b'u');
-        let digits = self.rest.iter().take_while(|it| it.is_ascii_digit()).count();
+        // A length of zero is one `0`: the digits after it start the next name.
+        let digits = match self.rest.first()? {
+            b'0' => 1,
+            _ => self.rest.iter().take_while(|it| it.is_ascii_digit()).count(),
+        };
         let len: usize = str::from_utf8(&self.rest[..digits]).ok()?.parse().ok()?;
         self.rest = &self.rest[digits..];
         self.eat(b'_');
@@ -530,5 +534,22 @@ impl V0<'_> {
         self.ty()?;
         while self.next()? != b'_' {}
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::V0;
+
+    #[test]
+    fn place_of_a_static_in_a_closure() {
+        let in_function = "_RNvNvMNtCs7aCYEL8njSF_2h24sendNtB4_4Send5apply10___CALLSITE";
+        let first = "_RNvNCNvMNtCs7aCYEL8njSF_2h24sendNtB6_4Send5apply010___CALLSITE";
+        let second = "_RNvNCNvMNtCs7aCYEL8njSF_2h24sendNtB6_4Send5apply0s_10___CALLSITE";
+        let third = "_RNvNCNvMNtCs7aCYEL8njSF_2h24sendNtB6_4Send5apply0s0_10___CALLSITE";
+        assert_eq!(V0::place(in_function), Some(0));
+        assert_eq!(V0::place(first), Some(0));
+        assert_eq!(V0::place(second), Some(1));
+        assert_eq!(V0::place(third), Some(2));
     }
 }
