@@ -5053,3 +5053,111 @@ pub mod cfg_macro_arguments {
         ]
     }
 }
+
+/// A `move` closure that takes a struct apart: fields read, borrowed, emptied and moved out
+/// one by one, a `Copy` field only compared, and a callback of the function called last.
+pub mod move_closure_fields {
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum Separator {
+        Undecided,
+        Comma,
+    }
+
+    pub struct Evaluated {
+        pub positional: Vec<u32>,
+        pub named: BTreeMap<u32, u32>,
+        pub separator: Separator,
+        pub span: (u32, u32),
+    }
+
+    struct Visitor {
+        seen: Vec<u32>,
+    }
+
+    type Outcome<T> = Result<T, String>;
+
+    impl Visitor {
+        fn with_scope<T, F: FnOnce(&mut Self) -> T>(&mut self, when: bool, callback: F) -> T {
+            if !when {
+                return callback(self);
+            }
+            self.seen.push(0);
+            callback(self)
+        }
+
+        fn bump(&mut self, by: &u32) -> Result<u32, String> {
+            self.seen.push(*by);
+            if *by > 1000 { Err("too far".to_owned()) } else { Ok(*by * 2) }
+        }
+
+        fn with_environment<T>(&mut self, callback: impl FnOnce(&mut Self) -> T) -> T {
+            self.seen.push(1);
+            callback(self)
+        }
+
+        fn run_callable<F: Copy + Into<u32>, V, R: FnOnce(F, &mut Self) -> Result<V, String>>(
+            &mut self,
+            func: F,
+            mut evaluated: Evaluated,
+            run: R,
+        ) -> Result<V, String> {
+            self.with_environment(|visitor| {
+                visitor.with_scope(true, move |visitor| {
+                    verify(evaluated.positional.len(), &evaluated.named, evaluated.span)?;
+                    let positional_len = evaluated.positional.len();
+                    for i in (0..positional_len.min(2)).rev() {
+                        visitor.seen.push(evaluated.positional.remove(i));
+                    }
+                    let all = [11u32, 12, 13];
+                    let more = if positional_len > 1 { &all[1..all.len()] } else { &[] };
+                    for one in more {
+                        let value = evaluated.named.remove(one).map_or_else(
+                            || {
+                                let bumped = visitor.bump(one)?;
+                                Ok(bumped + 1)
+                            },
+                            Outcome::Ok,
+                        )?;
+                        visitor.seen.push(value);
+                    }
+                    let value = evaluated.named.remove(&func.into()).map_or_else(|| Ok(7), Result::<u32, String>::Ok)?;
+                    visitor.seen.push(value);
+                    let num_named = evaluated.named.len();
+                    let has_rest = if positional_len > 2 {
+                        let rest = if !evaluated.positional.is_empty() { evaluated.positional } else { Vec::new() };
+                        visitor.seen.extend(rest);
+                        visitor.seen.extend(evaluated.named.clone().into_values());
+                        visitor.seen.push(if evaluated.separator == Separator::Undecided { 100 } else { 200 });
+                        true
+                    } else {
+                        false
+                    };
+                    let val = run(func, visitor)?;
+                    if !has_rest || num_named == 0 {
+                        return Ok(val);
+                    }
+                    visitor.seen.push(300);
+                    Ok(val)
+                })
+            })
+        }
+    }
+
+    fn verify(len: usize, named: &BTreeMap<u32, u32>, span: (u32, u32)) -> Result<(), String> {
+        if len + named.len() > span.1 as usize { Err(format!("too many at {}", span.0)) } else { Ok(()) }
+    }
+
+    pub fn run(positional: Vec<u32>, separator: Separator) -> Result<Vec<u32>, String> {
+        let mut visitor = Visitor { seen: Vec::new() };
+        let named = BTreeMap::from([(3, 30), (4, 40)]);
+        let evaluated = Evaluated { positional, named, separator, span: (5, 6) };
+        let extra = visitor.run_callable(3u8, evaluated, |func, visitor| {
+            visitor.seen.push(func as u32);
+            Ok(visitor.seen.len() as u32)
+        })?;
+        visitor.seen.push(extra);
+        Ok(visitor.seen)
+    }
+}

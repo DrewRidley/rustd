@@ -654,3 +654,28 @@ fn fun(wrapper: Wrapper) {
         expect!["319..411;206..213;350..357,391..398 ByValue wrapper Wrapper"],
     );
 }
+
+#[test]
+fn variant_through_type_alias() {
+    check_closure_captures(
+        r#"
+//- minicore:copy, fn, result
+type Outcome<T> = Result<T, ()>;
+
+struct Pair {
+    first: i32,
+    second: i32,
+}
+
+fn wrap(f: fn(i32) -> Outcome<i32>) {}
+
+fn fun(pair: Pair) {
+    move || {
+        wrap(Outcome::Ok);
+        pair.second
+    };
+}
+    "#,
+        expect!["149..211;131..135;194..205 ByValue pair.second i32"],
+    );
+}

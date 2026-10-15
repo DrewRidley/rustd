@@ -1372,6 +1372,10 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                     (Some(ValueNs::LocalBinding(var_id)), None) => {
                         self.cat_local(expr.into(), expr_ty, var_id)
                     }
+                    // `Alias::Variant`, which only inference resolves.
+                    (None, None) if self.cx.result.variant_resolution_for_expr(expr).is_some() => {
+                        Ok(self.cat_rvalue(expr.into(), expr_ty))
+                    }
                     (None, None) => Err(ErrorGuaranteed),
                 }
             }

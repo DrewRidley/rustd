@@ -302,6 +302,16 @@ fn main() {
     println!("joined_words {:?}", cases::added_strings::joined_words(vec![1, 2, 3]));
     println!("macro_type_arguments {:?}", cases::macro_type_arguments::run("x"));
     println!("cfg_macro_arguments {:?}", cases::cfg_macro_arguments::run("x"));
+    {
+        use cases::move_closure_fields::{Separator, run};
+        println!(
+            "move_closure_fields {:?} {:?} {:?} {:?}",
+            run(vec![1, 2, 3, 4], Separator::Undecided),
+            run(vec![9], Separator::Comma),
+            run(vec![1, 2, 3], Separator::Comma),
+            run(vec![1, 2, 3, 4, 5], Separator::Comma)
+        );
+    }
     println!("downstream_add {}", String::from("a") + Tail(3));
 }
 
