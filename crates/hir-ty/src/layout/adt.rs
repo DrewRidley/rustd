@@ -87,7 +87,7 @@ pub fn layout_of_adt_query(
         .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
         .collect::<SmallVec<[_; 1]>>();
     let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
-    let result = if matches!(def, AdtId::UnionId(..)) {
+    let mut result = if matches!(def, AdtId::UnionId(..)) {
         cx.calc.layout_of_union(&repr, &variants)?
     } else {
         cx.calc.layout_of_struct_or_enum(
@@ -104,6 +104,21 @@ pub fn layout_of_adt_query(
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
     };
+    let valid_range = AttrFlags::rustc_layout_scalar_valid_range(db, def);
+    if valid_range.start.is_some() || valid_range.end.is_some() {
+        if let rustc_abi::BackendRepr::Scalar(scalar)
+        | rustc_abi::BackendRepr::ScalarPair(scalar, _) = &mut result.backend_repr
+        {
+            if let Some(start) = valid_range.start {
+                scalar.valid_range_mut().start = start;
+            }
+            if let Some(end) = valid_range.end {
+                scalar.valid_range_mut().end = end;
+            }
+            result.largest_niche =
+                rustc_abi::Niche::from_scalar(&dl, rustc_abi::Size::ZERO, *scalar);
+        }
+    }
     Ok(Arc::new(result))
 }
 

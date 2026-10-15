@@ -2,6 +2,7 @@
 //! functions to native code that links against rustc-built artifacts.
 
 mod outline;
+mod surreal;
 mod symbols;
 mod tree;
 
@@ -992,9 +993,16 @@ fn build(
     let start = Instant::now();
     if let Some(object) = &unit.object {
         std::fs::write(&args.out, object)?;
+        if let Some(patch_path) = &args.patch
+            && !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32"))
+        {
+            inject_hotpatch_rt(&args.out, patch_path)?;
+        }
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
-        std::fs::write(path, patch)?;
+        let tmp = path.with_extension("o.tmp");
+        std::fs::write(&tmp, patch)?;
+        std::fs::rename(&tmp, path)?;
     }
     let build = Build {
         compiled: unit.compiled.len(),
@@ -1347,21 +1355,59 @@ fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path) -> anyhow::Result<()> {
+    let rt_src = include_str!("hotpatch_rt.rs");
+    let rt_rs = base_o.with_extension("rt.rs");
+    let rt_o = base_o.with_extension("rt.o");
+    std::fs::write(&rt_rs, rt_src)?;
+    let abs_patch = std::env::current_dir()?.join(patch_o);
+    let status = Command::new("rustc")
+        .args([
+            "--edition=2024",
+            "--crate-name=rustd_hotpatch_rt",
+            "--crate-type=rlib",
+            "--emit=obj",
+            "-C",
+            "panic=abort",
+            "-O",
+        ])
+        .arg(&rt_rs)
+        .arg("-o")
+        .arg(&rt_o)
+        .env("RUSTD_DEFAULT_PATCH_PATH", &abs_patch)
+        .status()
+        .context("compiling hotpatch_rt.rs")?;
+    anyhow::ensure!(status.success(), "rustc failed on hotpatch_rt.rs ({status})");
+    let _ = std::fs::remove_file(&rt_rs);
+    Ok(())
+}
+
 /// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener) -> anyhow::Result<(Request, UnixStream)> {
+fn requested(listener: &UnixListener, watch: bool) -> anyhow::Result<Option<(Request, UnixStream)>> {
     loop {
-        let (stream, _) = listener.accept()?;
-        let mut request = String::new();
-        BufReader::new(&stream).read_line(&mut request)?;
-        if let Some(request) = Request::parse(request.trim_end()) {
-            return Ok((request, stream));
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request)?;
+                if let Some(request) = Request::parse(request.trim_end()) {
+                    return Ok(Some((request, stream)));
+                }
+                let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
+            }
+            Err(e) if watch && e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
         }
-        // A client that hangs up before the answer is not the daemon's problem.
-        let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("surreal") {
+        return surreal::run(std::env::args().skip(2).collect());
+    }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
     {
@@ -1435,7 +1481,11 @@ fn main() -> anyhow::Result<()> {
         Some(path) => {
             // A socket file left by a daemon that is gone can't be bound again.
             let _ = std::fs::remove_file(path);
-            Some(UnixListener::bind(path)?)
+            let l = UnixListener::bind(path)?;
+            if args.watch {
+                l.set_nonblocking(true)?;
+            }
+            Some(l)
         }
         None if args.watch => None,
         None => return Ok(()),
@@ -1462,8 +1512,8 @@ fn main() -> anyhow::Result<()> {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
         }
-        let client = match &listener {
-            Some(listener) => Some(requested(listener)?),
+        let mut client = match &listener {
+            Some(listener) => requested(listener, args.watch)?,
             None => {
                 std::thread::sleep(Duration::from_millis(5));
                 None
@@ -1501,6 +1551,11 @@ fn main() -> anyhow::Result<()> {
                     touched.insert(index);
                     noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
+            }
+            if client.is_none()
+                && let Some(listener) = &listener
+            {
+                client = requested(listener, true)?;
             }
             if touched.len() + gone.len() == before || client.is_some() {
                 break;
@@ -1600,7 +1655,10 @@ fn main() -> anyhow::Result<()> {
             })
             .collect();
         let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
-        if failed.is_none() && !matches!(client, Some((Request::Patch, _))) {
+        let is_live_patch = args.patch.is_some()
+            && known.stats.patched.is_some()
+            && !matches!(client, Some((Request::Sync, _)));
+        if failed.is_none() && !is_live_patch && !matches!(client, Some((Request::Patch, _))) {
             failed = link(&args).err().map(|it| it.to_string());
         }
         if let Some(why) = &failed {

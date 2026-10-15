@@ -105,7 +105,12 @@ impl SymbolTable {
                         let name = &unique_names[start + offset];
                         let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
                         let with_ids = demangled.to_string();
-                        let path = format!("{demangled:#}");
+                        let raw_path = format!("{demangled:#}");
+                        let path = if name.starts_with("_ZN") {
+                            normalize_legacy_path(&raw_path)
+                        } else {
+                            raw_path
+                        };
                         *slot = Some(Symbol {
                             name: name.clone(),
                             place: V0::place(name),
@@ -376,7 +381,11 @@ impl SymbolTable {
     }
 
     pub(crate) fn get(&self, path: &str) -> Option<&str> {
-        match &**self.by_path.get(path)? {
+        let entries = match self.by_path.get(path) {
+            Some(entries) => entries,
+            None => self.by_path.get(&strip_inherent_angles(path)?)?,
+        };
+        match &**entries {
             [only] => Some(&only.name),
             _ => None,
         }
@@ -385,7 +394,11 @@ impl SymbolTable {
     /// The symbol of the item at `path` that is the `place`th of its name in what it is
     /// written in.
     pub(crate) fn get_at(&self, path: &str, place: u64) -> Option<&str> {
-        let mut symbols = match &**self.by_path.get(path)? {
+        let entries = match self.by_path.get(path) {
+            Some(entries) => entries,
+            None => self.by_path.get(&strip_inherent_angles(path)?)?,
+        };
+        let mut symbols = match &**entries {
             [only] => {
                 return Some(only)
                     .filter(|it| it.place.is_none_or(|it| it == place))
@@ -405,7 +418,11 @@ impl SymbolTable {
     /// no symbol here.
     pub(crate) fn get_nested(&self, named: &str, closures: &[u32], place: u64) -> Option<&str> {
         let here = |it: &&NestedSymbol| it.place.is_none_or(|known| known == place);
-        let mut symbols = match &**self.nested.get(named)? {
+        let entries = match self.nested.get(named) {
+            Some(entries) => entries,
+            None => self.nested.get(&strip_inherent_angles(named)?)?,
+        };
+        let mut symbols = match &**entries {
             [only] => return Some(only).filter(here).map(|it| &*it.name),
             symbols => symbols.iter().filter(here).filter(|it| it.closures == closures),
         };
@@ -433,6 +450,89 @@ fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
     // FIXME: a path with a space in it is escaped.
     let source = sources.split(' ').next()?;
     Some((name.to_owned(), root.join(source)))
+}
+
+/// Normalizes legacy (`_ZN`) demangled `<module>::<impl Trait for Type>::item` and
+/// `<module>::<impl Type>::item` paths into the v0 `<Type as Trait>::item` / `<Type>::item` form.
+fn normalize_legacy_path(s: &str) -> String {
+    let mut result = s.to_owned();
+    while let Some(impl_pos) = result.find("::<impl ") {
+        let mod_start = result[..impl_pos]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map_or(0, |i| i + 1);
+        let open_pos = impl_pos + 2;
+        let mut depth = 0usize;
+        let mut close_pos = None;
+        for (off, ch) in result[open_pos..].char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(open_pos + off);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close_pos) = close_pos else { break };
+        let inner = normalize_legacy_path(&result[open_pos + 6..close_pos]);
+        let mut d = 0usize;
+        let mut for_pos = None;
+        for (i, ch) in inner.char_indices() {
+            match ch {
+                '<' | '(' | '[' => d += 1,
+                '>' | ')' | ']' => d = d.saturating_sub(1),
+                ' ' if d == 0 && inner[i..].starts_with(" for ") => {
+                    for_pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let replacement = match for_pos {
+            Some(fp) => {
+                let trait_part = &inner[..fp];
+                let type_part = &inner[fp + 5..];
+                format!("<{type_part} as {trait_part}>")
+            }
+            None => format!("<{inner}>"),
+        };
+        result.replace_range(mod_start..=close_pos, &replacement);
+    }
+    result
+}
+
+/// Converts v0 inherent paths like `<a::b::Type>::method` into legacy `a::b::Type::method`.
+fn strip_inherent_angles(path: &str) -> Option<String> {
+    if !path.starts_with('<') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut has_top_as = false;
+    let mut close_pos = None;
+    for (i, ch) in path.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            ' ' if depth == 1 && path[i..].starts_with(" as ") => {
+                has_top_as = true;
+            }
+            _ => {}
+        }
+    }
+    let close = close_pos?;
+    if has_top_as || !path[close + 1..].starts_with("::") {
+        return None;
+    }
+    Some(format!("{}{}", &path[1..close], &path[close + 1..]))
 }
 
 /// A v0 symbol without the crate that instantiated it, which ends the symbol of a generic

@@ -1436,6 +1436,152 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
     }
 }
 
+fn emit_native_trampolines(
+    product: &mut cranelift_object::ObjectProduct,
+) -> std::result::Result<(), String> {
+    use cranelift_object::object::{
+        Architecture, BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind,
+        SymbolFlags, SymbolKind, SymbolScope,
+        write::{Relocation, StandardSection, Symbol, SymbolSection},
+    };
+    let arch = product.object.architecture();
+    let format = product.object.format();
+    if arch != Architecture::Aarch64 && arch != Architecture::X86_64 {
+        return Ok(());
+    }
+    let data_sec = product.object.section_id(StandardSection::Data);
+    for slot in product.functions.values_mut() {
+        let Some((sym_id, _)) = slot else { continue };
+        let sym = product.object.symbol(*sym_id);
+        if sym.is_local() || sym.is_undefined() {
+            continue;
+        }
+        let SymbolSection::Section(text_sec) = sym.section else { continue };
+        let base_name = if format == BinaryFormat::MachO && sym.name.starts_with(b"_") {
+            sym.name[1..].to_vec()
+        } else {
+            sym.name.clone()
+        };
+        let orig_value = sym.value;
+        let orig_size = sym.size;
+        let orig_flags = sym.flags;
+
+        let mut impl_name = base_name.clone();
+        impl_name.extend_from_slice(b"$rustd_impl");
+        let impl_sym_id = product.object.add_symbol(Symbol {
+            name: impl_name,
+            value: orig_value,
+            size: orig_size,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Section(text_sec),
+            flags: orig_flags,
+        });
+
+        let ptr_offset = product.object.append_section_data(data_sec, &[0u8; 8], 8);
+        let mut ptr_name = base_name;
+        ptr_name.extend_from_slice(b"$rustd_ptr");
+        let ptr_sym_id = product.object.add_symbol(Symbol {
+            name: ptr_name,
+            value: ptr_offset,
+            size: 8,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Section(data_sec),
+            flags: SymbolFlags::None,
+        });
+        product
+            .object
+            .add_relocation(
+                data_sec,
+                Relocation {
+                    offset: ptr_offset,
+                    symbol: impl_sym_id,
+                    flags: RelocationFlags::Generic {
+                        kind: RelocationKind::Absolute,
+                        encoding: RelocationEncoding::Generic,
+                        size: 64,
+                    },
+                    addend: 0,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+
+        if arch == Architecture::Aarch64 {
+            let tramp_bytes: [u8; 12] = [
+                0x10, 0x00, 0x00, 0x90, // adrp x16, 0
+                0x10, 0x02, 0x40, 0xf9, // ldr  x16, [x16]
+                0x00, 0x02, 0x1f, 0xd6, // br   x16
+            ];
+            let tramp_offset = product.object.append_section_data(text_sec, &tramp_bytes, 4);
+            let hi_flags = RelocationFlags::MachO {
+                r_type: cranelift_object::object::macho::ARM64_RELOC_PAGE21,
+                r_pcrel: true,
+                r_length: 2,
+            };
+            let lo_flags = RelocationFlags::MachO {
+                r_type: cranelift_object::object::macho::ARM64_RELOC_PAGEOFF12,
+                r_pcrel: false,
+                r_length: 2,
+            };
+            let _ = format;
+            product
+                .object
+                .add_relocation(
+                    text_sec,
+                    Relocation {
+                        offset: tramp_offset,
+                        symbol: ptr_sym_id,
+                        flags: hi_flags,
+                        addend: 0,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            product
+                .object
+                .add_relocation(
+                    text_sec,
+                    Relocation {
+                        offset: tramp_offset + 4,
+                        symbol: ptr_sym_id,
+                        flags: lo_flags,
+                        addend: 0,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let sym_mut = product.object.symbol_mut(*sym_id);
+            sym_mut.value = tramp_offset;
+            sym_mut.size = 12;
+        } else {
+            let tramp_bytes: [u8; 6] = [0xff, 0x25, 0x00, 0x00, 0x00, 0x00]; // jmp *0(%rip)
+            let tramp_offset = product.object.append_section_data(text_sec, &tramp_bytes, 1);
+            product
+                .object
+                .add_relocation(
+                    text_sec,
+                    Relocation {
+                        offset: tramp_offset + 2,
+                        symbol: ptr_sym_id,
+                        flags: RelocationFlags::Generic {
+                            kind: RelocationKind::Relative,
+                            encoding: RelocationEncoding::Generic,
+                            size: 32,
+                        },
+                        addend: -4,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let sym_mut = product.object.symbol_mut(*sym_id);
+            sym_mut.value = tramp_offset;
+            sym_mut.size = 6;
+        }
+        *sym_id = impl_sym_id;
+    }
+    Ok(())
+}
+
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
 /// resolved.
 fn root_body<'db>(
@@ -1528,18 +1674,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return wasm.finish(self.module.declarations(), is_base, self.patching);
         }
         let mut product = self.module.finish();
-        if is_base && product.object.format() == cranelift_object::object::BinaryFormat::MachO {
-            for sym_id in product
-                .functions
-                .values()
-                .filter_map(|x| x.map(|(id, _)| id))
-                .chain(product.data_objects.values().filter_map(|x| x.map(|(id, _)| id)))
-            {
-                let sym = product.object.symbol_mut(sym_id);
-                if !sym.is_local() && !sym.is_undefined() {
-                    sym.weak = true;
-                }
-            }
+        if is_base && (self.patching || std::env::var_os("RUSTD_NATIVE_TRAMPOLINES").is_some()) {
+            emit_native_trampolines(&mut product).map_err(CodegenError::Backend)?;
         }
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
