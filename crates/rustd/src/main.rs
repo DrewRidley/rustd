@@ -1,8 +1,8 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+mod cli;
 mod outline;
-mod surreal;
 mod symbols;
 mod tree;
 
@@ -996,7 +996,7 @@ fn build(
         if let Some(patch_path) = &args.patch
             && !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32"))
         {
-            inject_hotpatch_rt(&args.out, patch_path)?;
+            inject_hotpatch_rt(&args.out, patch_path, &args.root()?)?;
         }
     }
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
@@ -1355,13 +1355,14 @@ fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path) -> anyhow::Result<()> {
+fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path, root: &Path) -> anyhow::Result<()> {
     let rt_src = include_str!("hotpatch_rt.rs");
     let rt_rs = base_o.with_extension("rt.rs");
     let rt_o = base_o.with_extension("rt.o");
     std::fs::write(&rt_rs, rt_src)?;
     let abs_patch = std::env::current_dir()?.join(patch_o);
     let status = Command::new("rustc")
+        .current_dir(root)
         .args([
             "--edition=2024",
             "--crate-name=rustd_hotpatch_rt",
@@ -1405,13 +1406,16 @@ fn requested(listener: &UnixListener, watch: bool) -> anyhow::Result<Option<(Req
 }
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("surreal") {
-        return surreal::run(std::env::args().skip(2).collect());
-    }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
+        && Path::new(&socket).extension().is_some_and(|e| e == "sock")
     {
         return ask(request, Path::new(&socket));
+    }
+    if let Some(first) = std::env::args().nth(1)
+        && cli::is_subcommand(&first)
+    {
+        return cli::dispatch(&first, std::env::args().skip(2).collect());
     }
     let args = Args::parse()?;
     if args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
