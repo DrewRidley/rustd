@@ -24,6 +24,7 @@ pub(crate) fn is_subcommand(arg: &str) -> bool {
         "build"
             | "check"
             | "clippy"
+            | "fmt"
             | "rebase"
             | "run"
             | "test"
@@ -41,7 +42,8 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
     match sub {
         "build" => cmd_build(&args),
         "check" => cmd_check(&args, "check"),
-        "clippy" => cmd_check(&args, "clippy"),
+        "clippy" => cmd_clippy(&args),
+        "fmt" => cmd_fmt(&args),
         "rebase" => cmd_rebase(&args),
         "run" => cmd_run(&args),
         "test" => cmd_test(&args),
@@ -53,7 +55,8 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
             eprintln!(
                 "Usage:\n  \
                  rustd check  [-p PACKAGE] [--bin NAME] [--test NAME] [--watch]\n  \
-                 rustd clippy [-p PACKAGE] [--bin NAME] [--test NAME] [--since SHA] [--watch]\n  \
+                 rustd clippy [-p PACKAGE] [--since SHA] [--watch] [-- ARGS...]\n  \
+                 rustd fmt    [--check] [--since SHA]\n  \
                  rustd rebase [-p PACKAGE] [--bin NAME] [--test NAME]\n  \
                  rustd build  [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
                  rustd run    [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
@@ -906,6 +909,278 @@ fn cmd_check(args: &[String], req_cmd: &str) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(&paths.dir)?;
+    let clippy_sh = paths.dir.join("clippy.sh");
+    if let Ok(meta) = fs::metadata(&clippy_sh)
+        && let Ok(mtime) = meta.modified()
+    {
+        let manifest_newer = fs::metadata(&opts.manifest_path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t > mtime);
+        let lock_newer = fs::metadata(opts.workspace_root.join("Cargo.lock"))
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t > mtime);
+        if !manifest_newer
+            && !lock_newer
+            && let Ok(txt) = fs::read_to_string(&clippy_sh)
+        {
+            let deps_exist = shell_words(&txt)
+                .into_iter()
+                .filter_map(|w| w.split_once('=').map(|(_, r)| r.to_owned()))
+                .filter(|p| p.ends_with(".rmeta") || p.ends_with(".rlib") || p.ends_with(".dylib") || p.ends_with(".so"))
+                .all(|p| Path::new(&p).exists());
+            if deps_exist {
+                return Ok(clippy_sh);
+            }
+        }
+    }
+    let pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
+    let krate = pkg.replace('-', "_");
+    let deps_dir = opts.workspace_root.join("target").join("debug").join("deps");
+    if let Ok(entries) = fs::read_dir(&deps_dir) {
+        let prefix1 = format!("{krate}-");
+        let prefix2 = format!("lib{krate}-");
+        for e in entries.flatten() {
+            let p = e.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && (name.starts_with(&prefix1) || name.starts_with(&prefix2))
+                && p.extension().is_some_and(|ext| ext == "rmeta")
+            {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+    eprintln!(
+        "[rustd] capturing real `clippy-driver` invocation via `cargo clippy -p {pkg} --no-deps`..."
+    );
+    let out = Command::new("cargo")
+        .current_dir(&opts.workspace_root)
+        .args(["clippy", "-p", pkg, "--profile", "test", "--no-deps", "-vv"])
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .output()
+        .context("running `cargo clippy -vv`")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let crate_flag = format!("--crate-name {krate} ");
+    let running_line = stderr
+        .lines()
+        .rfind(|l| l.contains("Running `") && l.contains("clippy-driver") && l.contains(&crate_flag))
+        .or_else(|| {
+            stderr
+                .lines()
+                .rfind(|l| l.contains("Running `") && l.contains("clippy-driver"))
+        })
+        .context("could not find `clippy-driver` invocation in `cargo clippy -vv` output")?;
+    let raw_cmd = running_line
+        .split_once("Running `")
+        .and_then(|(_, rest)| rest.rsplit_once('`'))
+        .map(|(c, _)| c)
+        .context("malformed Running line in cargo clippy output")?;
+
+    let words = shell_words(raw_cmd);
+    let mut env_pairs = Vec::new();
+    let mut argv = Vec::new();
+    let mut in_env = true;
+    let mut skip_next = false;
+    let incr_dir = paths.dir.join("clippy-incr");
+    for w in words {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if in_env && w.contains('=') && !w.starts_with('-') {
+            env_pairs.push(w);
+            continue;
+        }
+        in_env = false;
+        if w.starts_with("--error-format=") || w.starts_with("--json=") {
+            continue;
+        }
+        if w == "-C" {
+            argv.push(w);
+            continue;
+        }
+        if w.starts_with("incremental=") {
+            argv.push(format!("incremental={}", incr_dir.display()));
+            continue;
+        }
+        argv.push(w);
+    }
+    argv.push("--color=always".to_owned());
+
+    let mut script = String::from("#!/bin/sh\n");
+    for ep in &env_pairs {
+        if let Some((k, v)) = ep.split_once('=') {
+            script.push_str(&format!("export {}={}\n", k, quote_sh(v)));
+        }
+    }
+    script.push_str(&format!(
+        "exec {} \"$@\"\n",
+        argv.iter().map(|a| quote_sh(a)).collect::<Vec<_>>().join(" ")
+    ));
+    fs::write(&clippy_sh, script)?;
+    fs::set_permissions(&clippy_sh, fs::Permissions::from_mode(0o755))?;
+    let _ = Command::new(&clippy_sh)
+        .current_dir(&opts.workspace_root)
+        .output();
+    Ok(clippy_sh)
+}
+
+fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
+    let mut opts = parse_opts_with_mode(args, true)?;
+    opts.cfg_test = true;
+    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    let clippy_sh = ensure_clippy_script(&opts, &paths)?;
+    let run_once = || -> anyhow::Result<bool> {
+        let t0 = Instant::now();
+        let out = Command::new(&clippy_sh)
+            .current_dir(&opts.workspace_root)
+            .args(&opts.run_args)
+            .output()
+            .context("running cached clippy-driver")?;
+        let elapsed = t0.elapsed();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.is_empty() {
+            eprint!("{stderr}");
+        }
+        if out.status.success() {
+            eprintln!(
+                "    \x1b[1;32mFinished\x1b[0m `dev` profile [unoptimized + debuginfo] target(s) in {:.2}s ({:.1?})",
+                elapsed.as_secs_f64(),
+                elapsed
+            );
+        }
+        Ok(out.status.success())
+    };
+    let ok = run_once()?;
+    if !opts.watch {
+        if !ok {
+            std::process::exit(101);
+        }
+        return Ok(());
+    }
+    eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
+    let pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
+    let mut last_max_mtime: Option< std::time::SystemTime> = None;
+    loop {
+        thread::sleep(Duration::from_millis(50));
+        let mut cur_max: Option<std::time::SystemTime> = None;
+        let mut stack = vec![opts.workspace_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if !p.ends_with("target") && !p.ends_with(".git") {
+                        stack.push(p);
+                    }
+                } else if p.extension().is_some_and(|ext| ext == "rs")
+                    && let Ok(m) = p.metadata().and_then(|m| m.modified())
+                {
+                    cur_max = Some(cur_max.map_or(m, |prev| prev.max(m)));
+                }
+            }
+        }
+        if last_max_mtime.is_none() {
+            last_max_mtime = cur_max;
+            continue;
+        }
+        if cur_max != last_max_mtime {
+            last_max_mtime = cur_max;
+            eprintln!("    \x1b[1;32mChecking\x1b[0m {pkg}...");
+            let _ = run_once()?;
+        }
+    }
+}
+
+fn cmd_fmt(args: &[String]) -> anyhow::Result<()> {
+    let check_only = args.iter().any(|a| a == "--check");
+    let mut since = None;
+    let mut manifest = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--check" => {}
+            "--since" => {
+                since = Some(it.next().context("--since requires a git revision/sha")?.clone());
+            }
+            "--manifest-path" => {
+                manifest = Some(PathBuf::from(
+                    it.next().context("--manifest-path requires a path")?,
+                ));
+            }
+            _ => {}
+        }
+    }
+    let (_, workspace_root) = find_manifest_path(manifest)?;
+    let t0 = Instant::now();
+    let sha = since.as_deref().unwrap_or("HEAD");
+    let mut rs_files = Vec::new();
+    if let Ok(out) = Command::new("git")
+        .current_dir(&workspace_root)
+        .args(["diff", "--name-only", sha])
+        .output()
+        && out.status.success()
+    {
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            let p = l.trim();
+            if p.ends_with(".rs") && workspace_root.join(p).exists() {
+                rs_files.push(p.to_owned());
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git")
+        .current_dir(&workspace_root)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        && out.status.success()
+    {
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            let p = l.trim();
+            if p.ends_with(".rs") && !rs_files.iter().any(|x| x == p) && workspace_root.join(p).exists() {
+                rs_files.push(p.to_owned());
+            }
+        }
+    }
+    if rs_files.is_empty() {
+        eprintln!(
+            "    \x1b[1;32mFinished\x1b[0m `rustfmt` (0 modified .rs files) in {:.1?}",
+            t0.elapsed()
+        );
+        return Ok(());
+    }
+    let rustfmt_bin = env::var_os("HOME")
+        .and_then(|h| {
+            let tc_dir = PathBuf::from(h).join(".rustup").join("toolchains");
+            fs::read_dir(tc_dir).ok()
+        })
+        .and_then(|entries| {
+            entries
+                .flatten()
+                .find(|e| e.file_name().to_string_lossy().starts_with("nightly-"))
+                .map(|e| e.path().join("bin").join("rustfmt"))
+                .filter(|p| p.exists())
+        })
+        .unwrap_or_else(|| PathBuf::from("rustfmt"));
+    let mut cmd = Command::new(rustfmt_bin);
+    cmd.current_dir(&workspace_root).arg("--edition=2024");
+    if check_only {
+        cmd.arg("--check");
+    }
+    cmd.args(&rs_files);
+    let status = cmd.status().context("running `rustfmt`")?;
+    eprintln!(
+        "    \x1b[1;32mFinished\x1b[0m `rustfmt` ({} file(s)) in {:.1?}",
+        rs_files.len(),
+        t0.elapsed()
+    );
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 fn cmd_rebase(args: &[String]) -> anyhow::Result<()> {
