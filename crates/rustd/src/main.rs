@@ -2704,6 +2704,8 @@ enum Request {
     /// Bring the objects up to date and leave the linking to the client, which loads the
     /// patch object into a program that is running.
     Patch,
+    /// Compact accumulated patches into the base binary via a full `wild` link and reset baseline.
+    Rebase,
     /// Run incremental syntax and semantic diagnostics and write a cargo-style report.
     Check,
     /// Run incremental syntax, semantic, and Clippy lint diagnostics.
@@ -2721,6 +2723,7 @@ impl Request {
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
+            "rebase" => Some(Request::Rebase),
             "check" => Some(Request::Check),
             "clippy" => Some(Request::Clippy),
             _ => None,
@@ -2731,6 +2734,7 @@ impl Request {
         match self {
             Request::Sync => "sync\n",
             Request::Patch => "patch\n",
+            Request::Rebase => "rebase\n",
             Request::Check => "check\n",
             Request::Clippy => "clippy\n",
             Request::Backtest(_) => "backtest 20\n",
@@ -3173,11 +3177,12 @@ fn main() -> anyhow::Result<()> {
     if !skip_cold_link {
         link(&args)?;
     }
-    let bin_index = cold_bin_path
+    let mut bin_index = cold_bin_path
+        .as_ref()
         .filter(|p| p.exists())
         .and_then(|bin_path| {
-            table.filter_to_binary(&bin_path);
-            incremental_link::BinaryIndex::from_cold_binary(&bin_path)
+            table.filter_to_binary(bin_path);
+            incremental_link::BinaryIndex::from_cold_binary(bin_path)
         });
     hir::attach_db(&db, || known.out_of_date(&db));
     if args.socket.is_none() && !args.watch {
@@ -3509,6 +3514,100 @@ fn main() -> anyhow::Result<()> {
                             let _ = writeln!(&client, "error: {e}");
                         }
                     }
+                } else if matches!(req, Request::Rebase) {
+                    if let Some(why) = &last_failed {
+                        let _ = writeln!(&client, "error: {}", why.replace('\n', " "));
+                    } else {
+                        let t0 = Instant::now();
+                        let compacted_files = dirty_files.len();
+                        if !dirty_files.is_empty()
+                            && let Some(patch_path) = &args.patch
+                        {
+                            let mut seq = 1u32;
+                            let rebased_o = loop {
+                                let p = args.out.with_extension(format!("rebased.{seq}.o"));
+                                if !p.exists() {
+                                    break p;
+                                }
+                                seq += 1;
+                            };
+                            let _ = std::fs::copy(patch_path, &rebased_o);
+                            if let Some(link_sh) = &args.link_cmd
+                                && let Ok(sh_txt) = std::fs::read_to_string(link_sh)
+                            {
+                                let needle = format!("'{}'", patch_path.display());
+                                let replacement =
+                                    format!("'{}' '{}'", patch_path.display(), rebased_o.display());
+                                if sh_txt.contains(&needle) {
+                                    let _ = std::fs::write(
+                                        link_sh,
+                                        sh_txt.replacen(&needle, &replacement, 1),
+                                    );
+                                }
+                            }
+                            let _ = std::fs::copy(&args.out, patch_path);
+                        }
+                        if let Err(e) = link(&args) {
+                            let _ = writeln!(&client, "error: {e}");
+                        } else {
+                            if let Some(bp) = &cold_bin_path
+                                && bp.exists()
+                            {
+                                let _ = std::fs::copy(bp, bp.with_extension("base"));
+                                bin_index = incremental_link::BinaryIndex::from_cold_binary(bp);
+                            }
+                            for &df in &dirty_files {
+                                let txt = db.file_text(df).text(&db).clone();
+                                if let Some(wf) = files
+                                    .iter()
+                                    .find(|w| matches!(w.file, Watched::Source(wid) if wid == df))
+                                {
+                                    baseline_by_path.insert(wf.path.clone(), txt.to_string());
+                                }
+                                initial_texts.insert(df, txt);
+                                initial_adts.insert(
+                                    df,
+                                    hir::attach_db(&db, || snapshot_file_adts(&db, df)),
+                                );
+                                for &krate in ide_db::base_db::relevant_crates(&db, df) {
+                                    let l = listed.of(&db, Crate::from(krate));
+                                    hir::attach_db(&db, || {
+                                        for &func in &l.functions {
+                                            let f = func
+                                                .lookup(&db)
+                                                .id
+                                                .file_id
+                                                .original_file_respecting_includes(&db)
+                                                .file_id(&db);
+                                            if f == df {
+                                                initial_serials.insert(
+                                                    func,
+                                                    hir_ty::mir::codegen::function_tree_serial(
+                                                        &db, func,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            dirty_files.clear();
+                            save_baseline(
+                                baseline_cache_path.as_deref(),
+                                &baseline_fp,
+                                &baseline_by_path,
+                            );
+                            let out_disp = cold_bin_path
+                                .as_deref()
+                                .unwrap_or(&args.out)
+                                .display();
+                            let _ = writeln!(
+                                &client,
+                                "ok rebased={out_disp} files={compacted_files} ms={}",
+                                t0.elapsed().as_millis()
+                            );
+                        }
+                    }
                 } else if let Some(why) = &last_failed {
                     let _ = writeln!(&client, "error: {}", why.replace('\n', " "));
                 } else {
@@ -3783,10 +3882,87 @@ fn main() -> anyhow::Result<()> {
             eprintln!("warning: {w}");
         }
         let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
+        let auto_compact = failed.is_none()
+            && (dirty_files.len() >= 32
+                || args
+                    .patch
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .is_some_and(|m| m.len() > 2 * 1024 * 1024));
+        let want_rebase = matches!(client, Some((Request::Rebase, _))) || auto_compact;
         let is_live_patch = args.patch.is_some()
             && known.stats.patched.is_some()
-            && !matches!(client, Some((Request::Sync, _)));
-        if failed.is_none() && !is_live_patch && !matches!(client, Some((Request::Patch, _))) {
+            && !matches!(client, Some((Request::Sync, _)))
+            && !want_rebase;
+        if failed.is_none() && want_rebase {
+            if !dirty_files.is_empty()
+                && let Some(patch_path) = &args.patch
+            {
+                let mut seq = 1u32;
+                let rebased_o = loop {
+                    let p = args.out.with_extension(format!("rebased.{seq}.o"));
+                    if !p.exists() {
+                        break p;
+                    }
+                    seq += 1;
+                };
+                let _ = std::fs::copy(patch_path, &rebased_o);
+                if let Some(link_sh) = &args.link_cmd
+                    && let Ok(sh_txt) = std::fs::read_to_string(link_sh)
+                {
+                    let needle = format!("'{}'", patch_path.display());
+                    let replacement =
+                        format!("'{}' '{}'", patch_path.display(), rebased_o.display());
+                    if sh_txt.contains(&needle) {
+                        let _ = std::fs::write(link_sh, sh_txt.replacen(&needle, &replacement, 1));
+                    }
+                }
+                let _ = std::fs::copy(&args.out, patch_path);
+            }
+            if let Err(e) = link(&args) {
+                failed = Some(e.to_string());
+            } else {
+                if let Some(bp) = &cold_bin_path
+                    && bp.exists()
+                {
+                    let _ = std::fs::copy(bp, bp.with_extension("base"));
+                    bin_index = incremental_link::BinaryIndex::from_cold_binary(bp);
+                }
+                for &df in &dirty_files {
+                    let txt = db.file_text(df).text(&db).clone();
+                    if let Some(wf) = files
+                        .iter()
+                        .find(|w| matches!(w.file, Watched::Source(wid) if wid == df))
+                    {
+                        baseline_by_path.insert(wf.path.clone(), txt.to_string());
+                    }
+                    initial_texts.insert(df, txt);
+                    initial_adts
+                        .insert(df, hir::attach_db(&db, || snapshot_file_adts(&db, df)));
+                    for &krate in ide_db::base_db::relevant_crates(&db, df) {
+                        let l = listed.of(&db, Crate::from(krate));
+                        hir::attach_db(&db, || {
+                            for &func in &l.functions {
+                                let f = func
+                                    .lookup(&db)
+                                    .id
+                                    .file_id
+                                    .original_file_respecting_includes(&db)
+                                    .file_id(&db);
+                                if f == df {
+                                    initial_serials.insert(
+                                        func,
+                                        hir_ty::mir::codegen::function_tree_serial(&db, func),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+                dirty_files.clear();
+                save_baseline(baseline_cache_path.as_deref(), &baseline_fp, &baseline_by_path);
+            }
+        } else if failed.is_none() && !is_live_patch && !matches!(client, Some((Request::Patch, _))) {
             let t0 = Instant::now();
             let inc = if known.stats.patched.is_some() {
                 bin_index

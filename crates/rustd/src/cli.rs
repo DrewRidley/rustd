@@ -283,7 +283,13 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                     }
                 }
             }
-            "--workspace" | "--all-targets" | "--lib" | "--bins" | "--tests" => {}
+            "--workspace"
+            | "--all-targets"
+            | "--lib"
+            | "--bins"
+            | "--tests"
+            | "--link-only"
+            | "--cargo" => {}
             "-F" | "--features" => {
                 let val = it.next().context("--features requires feature name(s)")?;
                 for f in val.split([' ', ',']).map(str::trim).filter(|s| !s.is_empty()) {
@@ -1274,11 +1280,29 @@ fn cmd_rebase(args: &[String]) -> anyhow::Result<()> {
     let has_test_flag = args
         .iter()
         .any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests");
+    let force_cargo = args.iter().any(|a| a == "--cargo");
+    let link_only = args.iter().any(|a| a == "--link-only");
     let mut opts = parse_opts_with_mode(args, has_test_flag)?;
     if opts.bin_name.starts_with("test-") {
         opts.cfg_test = true;
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    if !force_cargo {
+        let _ = ensure_daemon(&opts, &paths)?;
+        let t0 = Instant::now();
+        if let Ok(reply) = send_unix_line(&paths.rustd_sock, "rebase\n")
+            && reply.starts_with("ok")
+        {
+            eprintln!(
+                "[rustd] rebased `{}` via wild full link in {:.2?} ({reply})",
+                opts.bin_name,
+                t0.elapsed()
+            );
+            return Ok(());
+        } else if link_only {
+            anyhow::bail!("--link-only rebase failed; run `rustd rebase --cargo` for full rebuild");
+        }
+    }
     eprintln!(
         "[rustd] rebasing `{}` with full LLVM/cargo optimization...",
         opts.bin_name
@@ -1287,7 +1311,6 @@ fn cmd_rebase(args: &[String]) -> anyhow::Result<()> {
     let _ = fs::remove_file(&paths.link_args_txt);
     let _ = fs::remove_file(paths.out_bin.with_extension("base"));
     let _ = fs::remove_file(paths.base_o.with_extension("baseline.cache"));
-    let _ = fs::remove_file(paths.base_o.with_extension("symbols.cache"));
     let _ = fs::remove_file(&paths.patch_o);
     ensure_daemon(&opts, &paths)?;
     eprintln!(

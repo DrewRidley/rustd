@@ -198,16 +198,6 @@ impl SymbolTable {
     pub(crate) fn files_fingerprint(files: &[PathBuf]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
-        if let Ok(exe) = std::env::current_exe()
-            && let Ok(m) = std::fs::metadata(&exe)
-        {
-            m.len().hash(&mut h);
-            if let Ok(t) = m.modified()
-                && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
-            {
-                d.as_nanos().hash(&mut h);
-            }
-        }
         files.len().hash(&mut h);
         for f in files {
             f.hash(&mut h);
