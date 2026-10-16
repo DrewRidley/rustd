@@ -51,7 +51,7 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
                  rustd check [-p PACKAGE] [--bin NAME] [--test NAME] [--watch]\n  \
                  rustd build [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
                  rustd run   [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
-                 rustd test  [FILTER] [-p PACKAGE] [--test NAME] [--bin NAME] [--watch] [-- ARGS...]\n  \
+                 rustd test  [FILTER] [-p PACKAGE] [--since SHA] [--junit PATH] [--json] [--also-run FILE] [--retries N] [--explain TEST] [--backtest] [--faults N] [--watch] [-- ARGS...]\n  \
                  rustd patch [--manifest-path PATH] [--bin NAME]\n  \
                  rustd sync  [--manifest-path PATH] [--bin NAME]\n  \
                  rustd status [--manifest-path PATH] [--bin NAME]\n  \
@@ -74,6 +74,15 @@ struct CliOpts {
     target: Option<String>,
     watch: bool,
     all_tests: bool,
+    list_changed: bool,
+    since: Option<String>,
+    junit: Option<PathBuf>,
+    json: bool,
+    also_run: Option<PathBuf>,
+    retries: Option<usize>,
+    explain: Option<String>,
+    backtest: bool,
+    faults: usize,
     cfg_test: bool,
     run_args: Vec<String>,
 }
@@ -208,6 +217,15 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let mut target = None;
     let mut watch = false;
     let mut all_tests = false;
+    let mut list_changed = false;
+    let mut since = None;
+    let mut junit = None;
+    let mut json = false;
+    let mut also_run = None;
+    let mut retries = None;
+    let mut explain = None;
+    let mut backtest = false;
+    let mut faults = 20usize;
     let mut run_args = Vec::new();
 
     let mut it = args.iter();
@@ -245,7 +263,37 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             }
             "-w" | "--watch" => watch = true,
             "-c" | "--changed" => all_tests = false,
+            "--list-changed" => list_changed = true,
             "--all" => all_tests = true,
+            "--since" => {
+                since = Some(it.next().context("--since requires a git revision/sha")?.clone());
+            }
+            "--junit" => {
+                junit = Some(PathBuf::from(it.next().context("--junit requires a path")?));
+            }
+            "--json" => json = true,
+            "--also-run" => {
+                also_run = Some(PathBuf::from(it.next().context("--also-run requires a file path")?));
+            }
+            "--retries" => {
+                retries = Some(
+                    it.next()
+                        .context("--retries requires a count")?
+                        .parse::<usize>()
+                        .context("invalid --retries value")?,
+                );
+            }
+            "--explain" => {
+                explain = Some(it.next().context("--explain requires a test name")?.clone());
+            }
+            "--backtest" => backtest = true,
+            "--faults" => {
+                faults = it
+                    .next()
+                    .context("--faults requires a number")?
+                    .parse::<usize>()
+                    .context("invalid --faults value")?;
+            }
             other if other.starts_with('-') => bail!("unknown option `{other}`"),
             positional if manifest.is_none() && Path::new(positional).exists() => {
                 manifest = Some(PathBuf::from(positional));
@@ -258,11 +306,23 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     }
 
     let (manifest_path, workspace_root) = find_manifest_path(manifest)?;
+    if cfg_test
+        && pkg_name.is_none()
+        && bin_name.is_none()
+        && let Some(sha) = &since
+    {
+        let diff_files = crate::ci::analyze_git_diff_since(&workspace_root, sha)?;
+        let inferred = crate::ci::infer_packages_from_diff(&workspace_root, &diff_files);
+        if let Some(first_pkg) = inferred.into_iter().next() {
+            pkg_name = Some(first_pkg);
+        }
+    }
     let bin_name = if cfg_test {
         let pkg = pkg_name
             .clone()
             .or_else(|| bin_name.clone())
             .or_else(|| infer_default_bin(&workspace_root))
+            .map(|p| p.strip_prefix("test-").unwrap_or(&p).replace('_', "-"))
             .context("could not infer package for `rustd test`; pass `-p <PACKAGE>`")?;
         if pkg_name.is_none() {
             pkg_name = Some(pkg.clone());
@@ -290,6 +350,15 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         target,
         watch,
         all_tests,
+        list_changed,
+        since,
+        junit,
+        json,
+        also_run,
+        retries,
+        explain,
+        backtest,
+        faults,
         cfg_test,
         run_args,
     })
@@ -629,9 +698,11 @@ fn send_unix_line(sock: &Path, line: &str) -> anyhow::Result<String> {
     Ok(reply.trim().to_owned())
 }
 
-fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
-    if paths.rustd_sock.exists() && send_unix_line(&paths.rustd_sock, "patch").is_ok() {
-        return Ok(());
+fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<String>> {
+    if paths.rustd_sock.exists()
+        && let Ok(reply) = send_unix_line(&paths.rustd_sock, "patch")
+    {
+        return Ok(Some(reply));
     }
     let _ = fs::remove_file(&paths.rustd_sock);
     let _ = fs::remove_file(&paths.ack);
@@ -710,8 +781,23 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
         child.id(),
         paths.out_bin.display()
     );
-    let _ = send_unix_line(&paths.rustd_sock, "patch");
-    Ok(())
+    let reply = send_unix_line(&paths.rustd_sock, "patch").ok();
+    Ok(reply)
+}
+
+fn check_compile_error(opts: &CliOpts, paths: &TargetPaths, reply: Option<&str>) -> bool {
+    let Some(r) = reply else { return false };
+    if !r.starts_with("error:") {
+        return false;
+    }
+    let check_txt = paths.base_o.with_extension("check.txt");
+    if print_check_file(opts, &check_txt, None) == 0 {
+        eprintln!(
+            "\x1b[1;31merror\x1b[0m\x1b[1m: {}\x1b[0m",
+            r.trim_start_matches("error:").trim()
+        );
+    }
+    true
 }
 
 fn print_check_file(opts: &CliOpts, check_txt: &Path, fallback_elapsed: Option<Duration>) -> usize {
@@ -799,7 +885,10 @@ fn cmd_build(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     if opts.watch || paths.rustd_sock.exists() {
-        ensure_daemon(&opts, &paths)?;
+        let reply = ensure_daemon(&opts, &paths)?;
+        if !opts.watch && check_compile_error(&opts, &paths, reply.as_deref()) {
+            std::process::exit(101);
+        }
         println!("{}", paths.out_bin.display());
         return Ok(());
     }
@@ -831,7 +920,10 @@ fn cmd_build(args: &[String]) -> anyhow::Result<()> {
 fn cmd_run(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    ensure_daemon(&opts, &paths)?;
+    let reply = ensure_daemon(&opts, &paths)?;
+    if check_compile_error(&opts, &paths, reply.as_deref()) {
+        std::process::exit(101);
+    }
     let mut cmd = Command::new(&paths.out_bin);
     cmd.args(&opts.run_args);
     let err = cmd.exec();
@@ -868,11 +960,194 @@ fn resolve_test_args(opts: &CliOpts, paths: &TargetPaths) -> Vec<String> {
     opts.run_args.clone()
 }
 
+fn stop_target_daemon(paths: &TargetPaths) {
+    if let Ok(pid_str) = fs::read_to_string(&paths.pid_file)
+        && let Ok(pid) = pid_str.trim().parse::<u32>()
+        && pid > 0
+    {
+        let _ = Command::new("kill").arg("-15").arg(pid.to_string()).status();
+    }
+    let _ = fs::remove_file(&paths.rustd_sock);
+    let _ = fs::remove_file(&paths.pid_file);
+}
+
 fn cmd_test(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts_with_mode(args, true)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    ensure_daemon(&opts, &paths)?;
+    let had_daemon = paths.rustd_sock.exists();
+
+    if let Some(sha) = &opts.since {
+        let diff_files = crate::ci::analyze_git_diff_since(&opts.workspace_root, sha)?;
+        fs::create_dir_all(&paths.dir)?;
+        let baseline_cache = paths.base_o.with_extension("baseline.cache");
+        crate::ci::write_since_baseline_cache(
+            &baseline_cache,
+            &format!("SINCE:{sha}"),
+            &diff_files,
+        )?;
+        let since_sha_file = paths.base_o.with_extension("since.sha");
+        let prev_sha = fs::read_to_string(&since_sha_file).unwrap_or_default();
+        if had_daemon && prev_sha.trim() != sha {
+            stop_target_daemon(&paths);
+        }
+        let _ = fs::write(&since_sha_file, format!("{sha}\n"));
+    }
+
+    let reply = ensure_daemon(&opts, &paths)?;
+    let cleanup_oneshot = || {
+        if (opts.since.is_some() || opts.backtest) && !had_daemon {
+            stop_target_daemon(&paths);
+        }
+    };
+
+    if opts.backtest {
+        let bt_reply =
+            send_unix_line(&paths.rustd_sock, &format!("backtest {}", opts.faults))?;
+        ensure!(!bt_reply.starts_with("error:"), "rustd backtest: {bt_reply}");
+        let bt_txt = paths.base_o.with_extension("backtest.txt");
+        if let Ok(report) = fs::read_to_string(&bt_txt) {
+            print!("{report}");
+        }
+        cleanup_oneshot();
+        let mut caught = 0usize;
+        let mut total = 0usize;
+        for w in bt_reply.split_whitespace() {
+            if let Some(v) = w.strip_prefix("caught=") {
+                caught = v.parse().unwrap_or(0);
+            } else if let Some(v) = w.strip_prefix("total=") {
+                total = v.parse().unwrap_or(0);
+            }
+        }
+        if total > 0 && caught * 100 < total * 99 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if let Some(query) = &opts.explain {
+        let explain_txt = paths.base_o.with_extension("explain.txt");
+        let mut matched = false;
+        if let Ok(txt) = fs::read_to_string(&explain_txt) {
+            for line in txt.lines() {
+                if let Some((test_name, why)) = line.split_once('\t')
+                    && (test_name == query || test_name.contains(query.as_str()))
+                {
+                    println!("explain `{test_name}`:");
+                    for (idx, step) in why.split(" <- ").enumerate() {
+                        if idx == 0 {
+                            println!("  {test_name}");
+                            println!("  <- {step}");
+                        } else {
+                            println!("  <- {step}");
+                        }
+                    }
+                    matched = true;
+                }
+            }
+        }
+        cleanup_oneshot();
+        if !matched {
+            println!("explain `{query}`: not selected (no path from modified items to `{query}`)");
+        }
+        return Ok(());
+    }
+
+    if opts.list_changed {
+        let tests_txt = paths.base_o.with_extension("tests.txt");
+        if let Ok(txt) = fs::read_to_string(tests_txt) {
+            for line in txt.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                println!("{line}");
+            }
+        }
+        cleanup_oneshot();
+        return Ok(());
+    }
+
+    let is_ci_runner = opts.since.is_some()
+        || opts.junit.is_some()
+        || opts.json
+        || opts.also_run.is_some()
+        || opts.retries.is_some();
+
+    if is_ci_runner && !opts.watch {
+        if check_compile_error(&opts, &paths, reply.as_deref()) {
+            cleanup_oneshot();
+            std::process::exit(101);
+        }
+        let tests_txt = paths.base_o.with_extension("tests.txt");
+        let mut wanted: Vec<String> = fs::read_to_string(&tests_txt)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if let Some(also_path) = &opts.also_run
+            && let Ok(also_txt) = fs::read_to_string(also_path)
+        {
+            for line in also_txt.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                if !wanted.iter().any(|w| w == line) {
+                    wanted.push(line.to_owned());
+                }
+            }
+        }
+        let explain_txt = paths.base_o.with_extension("explain.txt");
+        let mut reasons = std::collections::HashMap::new();
+        if let Ok(txt) = fs::read_to_string(&explain_txt) {
+            for line in txt.lines() {
+                if let Some((t, r)) = line.split_once('\t') {
+                    reasons.insert(t.to_owned(), r.to_owned());
+                }
+            }
+        }
+        let exact_tests = crate::ci::expand_exact_tests(&paths.out_bin, &wanted);
+        let cfg = crate::ci::NextestConfig::load(&opts.workspace_root, opts.retries);
+        let raw_pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
+        let pkg = raw_pkg.strip_prefix("test-").unwrap_or(raw_pkg);
+        let t0 = Instant::now();
+        if !opts.json {
+            eprintln!(
+                "    \x1b[1;32mStarting\x1b[0m {} impacted test(s) across 1 binary (isolated processes)",
+                exact_tests.len()
+            );
+        }
+        let outcomes = crate::ci::run_isolated_test_suite(
+            pkg,
+            &paths.out_bin,
+            &exact_tests,
+            &reasons,
+            &cfg,
+            &opts.run_args,
+            opts.json,
+        );
+        let total_dur = t0.elapsed();
+        let passed = outcomes.iter().filter(|o| o.passed).count();
+        let failed = outcomes.len() - passed;
+        if let Some(junit_path) = &opts.junit {
+            crate::ci::write_junit_xml(junit_path, &outcomes, total_dur)?;
+        }
+        if opts.json {
+            crate::ci::print_json_summary(&outcomes, total_dur);
+        } else {
+            eprintln!(
+                "------------\n     \x1b[1;32mSummary\x1b[0m [{:>7.3}s] {} tests run: {} passed, {} failed",
+                total_dur.as_secs_f64(),
+                outcomes.len(),
+                passed,
+                failed
+            );
+        }
+        cleanup_oneshot();
+        if failed > 0 {
+            std::process::exit(101);
+        }
+        return Ok(());
+    }
+
     if !opts.watch {
+        if check_compile_error(&opts, &paths, reply.as_deref()) {
+            std::process::exit(101);
+        }
         let test_args = resolve_test_args(&opts, &paths);
         let mut cmd = Command::new(&paths.out_bin);
         cmd.args(&test_args);
@@ -883,25 +1158,42 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
     let mut runs = 0usize;
-    let t0 = Instant::now();
-    let initial_args = resolve_test_args(&opts, &paths);
-    let status = Command::new(&paths.out_bin).args(&initial_args).status()?;
-    eprintln!("[rustd] initial test run finished in {:.1?} ({status})", t0.elapsed());
+    let check_txt = paths.base_o.with_extension("check.txt");
+    if !check_compile_error(&opts, &paths, reply.as_deref()) {
+        let t0 = Instant::now();
+        let initial_args = resolve_test_args(&opts, &paths);
+        let status = Command::new(&paths.out_bin).args(&initial_args).status()?;
+        eprintln!("[rustd] initial test run finished in {:.1?} ({status})", t0.elapsed());
+    }
     runs += 1;
     if max_runs.is_some_and(|m| runs >= m) {
         return Ok(());
     }
-    let mut last_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
+    let mut last_patch_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
+    let mut last_check_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
     eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
     loop {
         thread::sleep(Duration::from_millis(20));
-        let cur_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
-        if cur_mtime.is_some() && cur_mtime != last_mtime {
-            last_mtime = cur_mtime;
-            let t0 = Instant::now();
-            let next_args = resolve_test_args(&opts, &paths);
-            let status = Command::new(&paths.out_bin).args(&next_args).status()?;
-            eprintln!("[rustd] re-ran tests in {:.1?} ({status})", t0.elapsed());
+        let cur_patch_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
+        let cur_check_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
+        if (cur_patch_mtime.is_some() && cur_patch_mtime != last_patch_mtime)
+            || (cur_check_mtime.is_some() && cur_check_mtime != last_check_mtime)
+        {
+            last_patch_mtime = cur_patch_mtime;
+            last_check_mtime = cur_check_mtime;
+            let has_compile_errors = fs::read_to_string(&check_txt).is_ok_and(|content| {
+                content
+                    .split_once('\n')
+                    .is_some_and(|(h, _)| h.contains("errors=") && !h.starts_with("errors=0 "))
+            });
+            if has_compile_errors {
+                print_check_file(&opts, &check_txt, None);
+            } else {
+                let t0 = Instant::now();
+                let next_args = resolve_test_args(&opts, &paths);
+                let status = Command::new(&paths.out_bin).args(&next_args).status()?;
+                eprintln!("[rustd] re-ran tests in {:.1?} ({status})", t0.elapsed());
+            }
             runs += 1;
             if max_runs.is_some_and(|m| runs >= m) {
                 return Ok(());

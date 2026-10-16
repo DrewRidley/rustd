@@ -916,6 +916,7 @@ pub fn function_tree_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
 pub struct FunctionDeps {
     pub adts: FxHashSet<hir_def::AdtId>,
     pub callees: FxHashSet<FunctionId>,
+    pub traits: FxHashSet<hir_def::TraitId>,
 }
 
 #[salsa::tracked(returns(ref))]
@@ -934,6 +935,13 @@ pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
                         self.0.callees.insert(f);
                     }
                 }
+                TyKind::Dynamic(preds, _) => {
+                    for pred in preds.iter() {
+                        if let rustc_type_ir::ExistentialPredicate::Trait(t) = pred.skip_binder() {
+                            self.0.traits.insert(t.def_id.0);
+                        }
+                    }
+                }
                 _ => {}
             }
             rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self);
@@ -942,13 +950,15 @@ pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
     let mut deps = FunctionDeps::default();
     for (expr_id, ty) in infer.type_of_expr.iter() {
         rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps));
-        if let Some((f, _)) = infer.method_resolution(expr_id) {
+        if let Some((f, substs)) = infer.method_resolution(expr_id) {
             deps.callees.insert(f);
+            rustc_type_ir::TypeVisitable::visit_with(&substs.as_ref(), &mut Collector(&mut deps));
         }
-        if let Some((crate::method_resolution::CandidateId::FunctionId(f), _)) =
-            infer.assoc_resolutions_for_expr(expr_id)
-        {
-            deps.callees.insert(f);
+        if let Some((cand, substs)) = infer.assoc_resolutions_for_expr(expr_id) {
+            if let crate::method_resolution::CandidateId::FunctionId(f) = cand {
+                deps.callees.insert(f);
+            }
+            rustc_type_ir::TypeVisitable::visit_with(&substs.as_ref(), &mut Collector(&mut deps));
         }
     }
     for (_, ty) in infer.type_of_binding.iter() {
@@ -990,6 +1000,18 @@ pub fn function_mentions_adts(
     }
     let f_adts = &function_deps(db, func).adts;
     adts.iter().any(|adt| f_adts.contains(adt))
+}
+
+pub fn function_mentions_traits(
+    db: &dyn HirDatabase,
+    func: FunctionId,
+    traits: &FxHashSet<hir_def::TraitId>,
+) -> bool {
+    if traits.is_empty() {
+        return false;
+    }
+    let f_traits = &function_deps(db, func).traits;
+    traits.iter().any(|t| f_traits.contains(t))
 }
 
 pub fn function_calls_any(

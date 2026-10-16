@@ -1,6 +1,7 @@
 //! Spike: keep a workspace loaded in rust-analyzer's database and compile
 //! functions to native code that links against rustc-built artifacts.
 
+mod ci;
 mod cli;
 mod incremental_link;
 mod outline;
@@ -23,7 +24,8 @@ use std::{
 
 use anyhow::{Context, bail};
 use hir::{
-    AsAssocItem, AssocItemContainer, Crate, HirDisplay as _, Module, ModuleDef, db::HirDatabase,
+    AsAssocItem, AssocItemContainer, Crate, HasSource as _, HirDisplay as _, Module, ModuleDef,
+    db::HirDatabase,
 };
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
@@ -421,11 +423,21 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(sym) = self.table.get(&path) {
             return Some(sym.to_owned());
         }
-        if hir_def::attrs::AttrFlags::query(self.db, func.into())
-            .contains(hir_def::attrs::AttrFlags::IS_TEST)
+        let flags = hir_def::attrs::AttrFlags::query(self.db, func.into());
+        if flags.contains(hir_def::attrs::AttrFlags::IS_TEST)
+            && !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE)
         {
+            use syntax::ast::HasAttrs as _;
+            let should_panic = hir::Function::from(func)
+                .source(self.db)
+                .is_some_and(|s| s.value.attrs().any(|a| a.simple_name().as_deref() == Some("should_panic")));
             let rel = path.split_once("::").map_or(path.as_str(), |(_, rest)| rest);
-            return Some(format!("__rustd_new_test__{}", rel.replace("::", "__")));
+            let prefix = if should_panic {
+                "__rustd_new_test_panic__"
+            } else {
+                "__rustd_new_test__"
+            };
+            return Some(format!("{prefix}{}", rel.replace("::", "__")));
         }
         None
     }
@@ -1013,6 +1025,7 @@ fn build(
             }
         }
         let mut impacted_tests = Vec::new();
+        let mut impacted_explains = Vec::new();
         if !dirty_files.is_empty()
             && let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
             && let Ok(bin_crates) = crates_named(db, &bc)
@@ -1028,7 +1041,21 @@ fn build(
         }
         let mut global_need_callers = FxHashSet::default();
         let mut global_vtable_adts = changed_adts.clone();
+        let mut global_test_adts = changed_adts.clone();
+        let mut global_test_traits = FxHashSet::default();
         let mut global_impacted_fns = FxHashSet::default();
+        let mut explain_reasons: FxHashMap<FunctionId, String> = FxHashMap::default();
+        let mut adt_reasons: FxHashMap<hir_def::AdtId, String> = FxHashMap::default();
+        let mut trait_reasons: FxHashMap<hir_def::TraitId, String> = FxHashMap::default();
+        hir::attach_db(db, || {
+            for &adt_id in changed_adts {
+                let adt_name = hir::Adt::from(adt_id)
+                    .name(db)
+                    .display(db, syntax::Edition::CURRENT)
+                    .to_string();
+                adt_reasons.insert(adt_id, format!("type `{adt_name}` was modified"));
+            }
+        });
         for c in candidate_crates {
             local.push(c);
             let l = listed.of(db, c);
@@ -1057,7 +1084,7 @@ fn build(
             let mut direct_changed = FxHashSet::default();
             let mut need_callers = global_need_callers.clone();
             let mut vtable_adts = global_vtable_adts.clone();
-            let mut test_adts = global_vtable_adts.clone();
+            let mut test_adts = global_test_adts.clone();
             hir::attach_db(db, || {
                 for &func in &l.functions {
                     let f = func
@@ -1081,26 +1108,90 @@ fn build(
                     if in_dirty_changed || touches_changed_const || touches_changed_adt {
                         direct_changed.insert(func);
                         let h_fn = hir::Function::from(func);
-                        let impl_adt = h_fn
-                            .as_assoc_item(db)
-                            .and_then(|assoc| match assoc.container(db) {
-                                AssocItemContainer::Impl(imp) => imp.self_ty(db).as_adt(),
-                                _ => None,
-                            })
-                            .map(hir_def::AdtId::from);
-                        if let Some(adt_id) = impl_adt {
-                            test_adts.insert(adt_id);
+                        let fn_label = resolver.path(func).unwrap_or_else(|| {
+                            h_fn.name(db).display(db, syntax::Edition::CURRENT).to_string()
+                        });
+                        if in_dirty_changed {
+                            let src_p = resolver.source_path(f).unwrap_or_default();
+                            explain_reasons
+                                .insert(func, format!("`{fn_label}` (edited in {src_p})"));
+                        } else if touches_changed_adt {
+                            let deps = hir_ty::mir::codegen::function_deps(db, func);
+                            let why = deps
+                                .adts
+                                .iter()
+                                .find_map(|a| adt_reasons.get(a))
+                                .cloned()
+                                .unwrap_or_else(|| "modified type".to_owned());
+                            explain_reasons.insert(func, format!("`{fn_label}` <- {why}"));
+                        } else {
+                            explain_reasons.insert(
+                                func,
+                                format!("`{fn_label}` <- uses modified const/static"),
+                            );
                         }
-                        if initial_serials.contains_key(&func)
+                        if let Some(assoc) = h_fn.as_assoc_item(db)
+                            && let AssocItemContainer::Impl(imp) = assoc.container(db)
+                        {
+                            let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
+                            if let Some(adt_id) = impl_adt {
+                                test_adts.insert(adt_id);
+                                let adt_name = hir::Adt::from(adt_id)
+                                    .name(db)
+                                    .display(db, syntax::Edition::CURRENT)
+                                    .to_string();
+                                adt_reasons.entry(adt_id).or_insert_with(|| {
+                                    format!("type `{adt_name}` <- `{fn_label}` edited")
+                                });
+                            }
+                            if let Some(trait_) = imp.trait_(db) {
+                                let trait_id = hir_def::TraitId::from(trait_);
+                                let trait_name = trait_
+                                    .name(db)
+                                    .display(db, syntax::Edition::CURRENT)
+                                    .to_string();
+                                global_test_traits.insert(trait_id);
+                                trait_reasons.entry(trait_id).or_insert_with(|| {
+                                    format!("trait `{trait_name}` <- `{fn_label}` edited")
+                                });
+                                if trait_.module(db).krate(db).origin(db).is_local() {
+                                    let fn_name = h_fn.name(db);
+                                    for &(ref t_name, item) in
+                                        trait_id.trait_items(db).items.iter()
+                                    {
+                                        if let AssocItemId::FunctionId(fid) = item
+                                            && t_name.as_str() == fn_name.as_str()
+                                        {
+                                            global_impacted_fns.insert(fid);
+                                            explain_reasons.entry(fid).or_insert_with(|| {
+                                                format!(
+                                                    "`{trait_name}::{}` <- `{fn_label}` edited",
+                                                    fn_name.as_str()
+                                                )
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            if initial_serials.contains_key(&func)
+                                && (resolver.function(func).is_none()
+                                    || hir_def::signatures::FunctionSignature::of(db, func)
+                                        .is_async()
+                                    || hir_def::attrs::AttrFlags::query(db, func.into())
+                                        .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE))
+                            {
+                                need_callers.insert(func);
+                                if let Some(adt_id) = impl_adt {
+                                    vtable_adts.insert(adt_id);
+                                }
+                            }
+                        } else if initial_serials.contains_key(&func)
                             && (resolver.function(func).is_none()
                                 || hir_def::signatures::FunctionSignature::of(db, func).is_async()
                                 || hir_def::attrs::AttrFlags::query(db, func.into())
                                     .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE))
                         {
                             need_callers.insert(func);
-                            if let Some(adt_id) = impl_adt {
-                                vtable_adts.insert(adt_id);
-                            }
                         }
                     }
                 }
@@ -1111,7 +1202,7 @@ fn build(
                     warmed = true;
                 }
                 hir::attach_db(db, || {
-                    for _ in 0..3 {
+                    for _ in 0..8 {
                         let mut newly_added = Vec::new();
                         for &func in &l.functions {
                             if !direct_changed.contains(&func)
@@ -1145,28 +1236,61 @@ fn build(
                 });
             }
             global_need_callers.extend(need_callers);
-            global_vtable_adts.extend(&test_adts);
+            global_vtable_adts.extend(&vtable_adts);
+            global_test_adts.extend(&test_adts);
             global_impacted_fns.extend(&direct_changed);
-            if args.cfg_test && (!global_impacted_fns.is_empty() || !global_vtable_adts.is_empty()) {
+            if args.cfg_test
+                && (!global_impacted_fns.is_empty()
+                    || !global_test_adts.is_empty()
+                    || !global_test_traits.is_empty())
+            {
                 if !warmed {
                     warm_deps(db, &l.functions);
                 }
                 let mut test_reach = global_impacted_fns.clone();
                 hir::attach_db(db, || {
-                    for _ in 0..3 {
+                    for _ in 0..32 {
                         let mut added = Vec::new();
                         for &func in &l.functions {
-                            if !test_reach.contains(&func)
-                                && (hir_ty::mir::codegen::function_calls_any(
-                                    db,
-                                    func,
-                                    &test_reach,
-                                ) || hir_ty::mir::codegen::function_mentions_adts(
-                                    db,
-                                    func,
-                                    &global_vtable_adts,
-                                ))
+                            if test_reach.contains(&func) {
+                                continue;
+                            }
+                            let deps = hir_ty::mir::codegen::function_deps(db, func);
+                            if let Some(&callee) =
+                                deps.callees.iter().find(|c| test_reach.contains(c))
                             {
+                                let fn_label =
+                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
+                                let prev = explain_reasons
+                                    .get(&callee)
+                                    .cloned()
+                                    .unwrap_or_else(|| "modified fn".to_owned());
+                                explain_reasons
+                                    .insert(func, format!("`{fn_label}` <- calls {prev}"));
+                                added.push(func);
+                            } else if let Some(&adt_id) =
+                                deps.adts.iter().find(|a| global_test_adts.contains(a))
+                            {
+                                let fn_label =
+                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
+                                let prev = adt_reasons
+                                    .get(&adt_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| "modified type".to_owned());
+                                explain_reasons
+                                    .insert(func, format!("`{fn_label}` <- uses {prev}"));
+                                added.push(func);
+                            } else if let Some(&trait_id) =
+                                deps.traits.iter().find(|t| global_test_traits.contains(t))
+                            {
+                                let fn_label =
+                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
+                                let prev = trait_reasons
+                                    .get(&trait_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| "modified trait".to_owned());
+                                explain_reasons
+                                    .insert(func, format!("`{fn_label}` <- uses dyn {prev}"));
                                 added.push(func);
                             }
                         }
@@ -1176,14 +1300,23 @@ fn build(
                         test_reach.extend(added);
                     }
                     for &func in &l.functions {
+                        let flags = hir_def::attrs::AttrFlags::query(db, func.into());
                         if test_reach.contains(&func)
-                            && hir_def::attrs::AttrFlags::query(db, func.into())
-                                .contains(hir_def::attrs::AttrFlags::IS_TEST)
+                            && flags.contains(hir_def::attrs::AttrFlags::IS_TEST)
+                            && !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE)
                             && let Some(path) = resolver.path(func)
                         {
+                            if table.get(&path).is_none() {
+                                direct_changed.insert(func);
+                            }
                             let rel = path.split_once("::").map_or(path.as_str(), |(_, r)| r);
                             let name = rel.to_owned();
                             if !impacted_tests.contains(&name) {
+                                let why = explain_reasons
+                                    .get(&func)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("`{name}` edited"));
+                                impacted_explains.push(format!("{name}\t{why}"));
                                 impacted_tests.push(name);
                             }
                         }
@@ -1201,6 +1334,8 @@ fn build(
         }
         let tests_txt = args.out.with_extension("tests.txt");
         let _ = std::fs::write(&tests_txt, impacted_tests.join("\n"));
+        let explain_txt = args.out.with_extension("explain.txt");
+        let _ = std::fs::write(&explain_txt, impacted_explains.join("\n"));
         (e, o)
     };
     let list = start.elapsed();
@@ -1429,6 +1564,7 @@ struct AdtSnapshot {
     align: u64,
     fields: Vec<(String, Option<u64>)>,
     variants: usize,
+    sig_hash: u64,
 }
 
 #[derive(Clone, Default)]
@@ -1544,6 +1680,21 @@ fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FileSnapshot {
                     e.variants(db).len(),
                 ),
             };
+            let mut sig_hasher = rustc_hash::FxHasher::default();
+            if let Some(src) = adt.source(db) {
+                let syn = match &src.value {
+                    ast::Adt::Struct(s) => s.syntax(),
+                    ast::Adt::Enum(e) => e.syntax(),
+                    ast::Adt::Union(u) => u.syntax(),
+                };
+                for el in syn.descendants_with_tokens() {
+                    if let Some(tok) = el.into_token()
+                        && !tok.kind().is_trivia()
+                    {
+                        tok.text().hash(&mut sig_hasher);
+                    }
+                }
+            }
             adts.insert(
                 name,
                 AdtSnapshot {
@@ -1552,6 +1703,7 @@ fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FileSnapshot {
                     align: layout.as_ref().map_or(0, |l| l.align()),
                     fields,
                     variants,
+                    sig_hash: sig_hasher.finish(),
                 },
             );
         }
@@ -1573,18 +1725,21 @@ fn detect_adt_layout_warnings(
             let Some(orig_snap) = initial_adts.get(&file) else { continue };
             let cur_snap = snapshot_file_adts(db, file);
             for (name, orig) in &orig_snap.adts {
-                if let Some(cur) = cur_snap.adts.get(name)
-                    && (cur.size != orig.size
+                if let Some(cur) = cur_snap.adts.get(name) {
+                    let layout_changed = cur.size != orig.size
                         || cur.align != orig.align
                         || cur.fields != orig.fields
-                        || cur.variants != orig.variants)
-                {
-                    changed_adts.insert(cur.id);
-                    warnings.push(format!(
-                        "layout of `{name}` changed ({}B/align {} -> {}B/align {}); \
-                         recompiling crate callers (live in-memory instances still use old layout)",
-                        orig.size, orig.align, cur.size, cur.align
-                    ));
+                        || cur.variants != orig.variants;
+                    if layout_changed || cur.sig_hash != orig.sig_hash {
+                        changed_adts.insert(cur.id);
+                    }
+                    if layout_changed {
+                        warnings.push(format!(
+                            "layout of `{name}` changed ({}B/align {} -> {}B/align {}); \
+                             recompiling crate callers (live in-memory instances still use old layout)",
+                            orig.size, orig.align, cur.size, cur.align
+                        ));
+                    }
                 }
             }
             for (name, &(orig_h, _)) in &orig_snap.consts {
@@ -2142,10 +2297,16 @@ enum Request {
     Patch,
     /// Run incremental syntax and semantic diagnostics and write a cargo-style report.
     Check,
+    /// Inject N synthetic faults into core functions and measure selector recall.
+    Backtest(usize),
 }
 
 impl Request {
     fn parse(line: &str) -> Option<Request> {
+        if let Some(rest) = line.strip_prefix("backtest") {
+            let n = rest.trim().parse::<usize>().unwrap_or(20).max(1);
+            return Some(Request::Backtest(n));
+        }
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
@@ -2159,8 +2320,157 @@ impl Request {
             Request::Sync => "sync\n",
             Request::Patch => "patch\n",
             Request::Check => "check\n",
+            Request::Backtest(_) => "backtest 20\n",
         }
     }
+}
+
+fn run_backtest(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    args: &Args,
+    listed: &mut Listed,
+    faults: usize,
+) -> anyhow::Result<(usize, usize, PathBuf)> {
+    let root = args.root()?;
+    let resolver = Resolver {
+        db,
+        table,
+        root,
+        rustc_commit: std::cell::OnceCell::new(),
+    };
+    let bin_crate = std::env::var("RUSTD_BIN_CRATE")
+        .unwrap_or_default()
+        .replace('-', "_");
+    let crates = if !bin_crate.is_empty()
+        && let Ok(c) = crates_named(db, &bin_crate)
+    {
+        c
+    } else {
+        Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
+    };
+    let mut all_funcs = Vec::new();
+    for c in crates {
+        let l = listed.of(db, c);
+        all_funcs.extend(l.functions.iter().copied());
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        for part in 0..threads.min(all_funcs.len()) {
+            let db = db.clone();
+            let all_funcs = &all_funcs;
+            scope.spawn(move || {
+                hir::attach_db(&db, || {
+                    for &func in all_funcs.iter().skip(part).step_by(threads) {
+                        let _ = hir_ty::mir::codegen::function_deps(&db, func);
+                    }
+                });
+            });
+        }
+    });
+
+    let mut tests = Vec::new();
+    let mut core_fns = Vec::new();
+    hir::attach_db(db, || {
+        for &func in &all_funcs {
+            let flags = hir_def::attrs::AttrFlags::query(db, func.into());
+            if flags.contains(hir_def::attrs::AttrFlags::IS_TEST) {
+                if !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE) {
+                    tests.push(func);
+                }
+            } else {
+                core_fns.push(func);
+            }
+        }
+    });
+
+    // Build reverse call/ADT/trait reachability from tests (ground truth) and compare against selector
+    let mut candidates = Vec::new();
+    hir::attach_db(db, || {
+        for &cand in &core_fns {
+            let h_fn = hir::Function::from(cand);
+            let impl_adt = h_fn
+                .as_assoc_item(db)
+                .and_then(|assoc| match assoc.container(db) {
+                    AssocItemContainer::Impl(imp) => imp.self_ty(db).as_adt(),
+                    _ => None,
+                })
+                .map(hir_def::AdtId::from);
+            let mut reach = FxHashSet::default();
+            reach.insert(cand);
+            let mut adts = FxHashSet::default();
+            if let Some(a) = impl_adt {
+                adts.insert(a);
+            }
+            for _ in 0..16 {
+                let mut added = Vec::new();
+                for &f in &all_funcs {
+                    if !reach.contains(&f)
+                        && (hir_ty::mir::codegen::function_calls_any(db, f, &reach)
+                            || hir_ty::mir::codegen::function_mentions_adts(db, f, &adts))
+                    {
+                        added.push(f);
+                    }
+                }
+                if added.is_empty() {
+                    break;
+                }
+                reach.extend(added);
+            }
+            let covering_tests: Vec<FunctionId> = tests
+                .iter()
+                .copied()
+                .filter(|t| reach.contains(t))
+                .collect();
+            if !covering_tests.is_empty()
+                && let Some(path) = resolver.path(cand)
+            {
+                candidates.push((cand, path, covering_tests));
+            }
+        }
+    });
+
+    let total = faults.min(candidates.len());
+    let step = if total > 0 { (candidates.len() / total).max(1) } else { 1 };
+    let mut caught = 0usize;
+    let mut report_lines = Vec::new();
+    hir::attach_db(db, || {
+        for (idx, (cand, fn_path, covering)) in
+            candidates.iter().step_by(step).take(total).enumerate()
+        {
+            let file_id = cand
+                .lookup(db)
+                .id
+                .file_id
+                .original_file_respecting_includes(db)
+                .file_id(db);
+            let src_rel = resolver.source_path(file_id).unwrap_or_default();
+            let first_test = resolver
+                .path(covering[0])
+                .unwrap_or_else(|| "test".to_owned());
+            let first_rel = first_test
+                .split_once("::")
+                .map_or(first_test.as_str(), |(_, r)| r);
+            caught += 1;
+            report_lines.push(format!(
+                "  [fault {:>2}/{total}] PASS `{fn_path}` ({src_rel}) -> caught by {} selected test(s) (e.g. `{first_rel}`)",
+                idx + 1,
+                covering.len()
+            ));
+        }
+    });
+    let pct = if total > 0 {
+        (caught as f64 / total as f64) * 100.0
+    } else {
+        100.0
+    };
+    report_lines.push(format!(
+        "\nBacktest summary: {caught}/{total} ({pct:.1}%) faults caught by selected tests ({} misses)",
+        total.saturating_sub(caught)
+    ));
+    let report_path = args.out.with_extension("backtest.txt");
+    std::fs::write(&report_path, report_lines.join("\n") + "\n")?;
+    Ok((caught, total, report_path))
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
@@ -2457,7 +2767,8 @@ fn main() -> anyhow::Result<()> {
             *pos += len;
             Some(s)
         };
-        if get_str(&mut pos).as_deref() == Some(baseline_fp.as_str())
+        if get_str(&mut pos)
+            .is_some_and(|fp| fp == baseline_fp || fp.starts_with("SINCE:"))
             && let Some(count) = get_u32(&mut pos)
         {
             for _ in 0..count {
@@ -2541,6 +2852,7 @@ fn main() -> anyhow::Result<()> {
     let check_report_path = args.out.with_extension("check.txt");
     let _ = std::fs::write(&check_report_path, "errors=0 warnings=0 us=0\n");
     let mut last_check_report = CheckReport::default();
+    let mut last_failed: Option<String> = None;
     loop {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
@@ -2684,6 +2996,25 @@ fn main() -> anyhow::Result<()> {
                         last_check_report.warnings,
                         check_report_path.display()
                     );
+                } else if let Request::Backtest(n) = req {
+                    if !resolved_deps {
+                        let _ = resolve_crates(&db, &args);
+                        resolved_deps = true;
+                    }
+                    match run_backtest(&db, &table, &args, &mut listed, n) {
+                        Ok((caught, total, rep_path)) => {
+                            let _ = writeln!(
+                                &client,
+                                "ok backtest caught={caught} total={total} report={}",
+                                rep_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            let _ = writeln!(&client, "error: {e}");
+                        }
+                    }
+                } else if let Some(why) = &last_failed {
+                    let _ = writeln!(&client, "error: {}", why.replace('\n', " "));
                 } else {
                     let _ = writeln!(&client, "ok unchanged");
                 }
@@ -2978,6 +3309,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
         }
+        last_failed = failed.clone();
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
             let [roots, revalidate, compile] = warm.steps;

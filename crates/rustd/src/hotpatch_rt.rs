@@ -19,7 +19,7 @@ use std::{
     ptr,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -545,19 +545,32 @@ fn build_sym_cache() -> HashMap<&'static str, usize> {
 }
 
 static DLSYM_CACHE: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
-static NEW_TEST_FNS: [AtomicPtr<c_void>; 16] = [const { AtomicPtr::new(ptr::null_mut()) }; 16];
+static NEW_TEST_FNS: [AtomicPtr<c_void>; 32] = [const { AtomicPtr::new(ptr::null_mut()) }; 32];
+static NEW_TEST_PANIC: [AtomicBool; 32] = [const { AtomicBool::new(false) }; 32];
 static NEW_TESTS: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
 static ORIG_TEST_MAIN_STATIC: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+
+fn run_new_test_slot(idx: usize) -> Result<(), String> {
+    let p = NEW_TEST_FNS[idx].load(Ordering::Acquire);
+    let should_panic = NEW_TEST_PANIC[idx].load(Ordering::Acquire);
+    if !p.is_null() {
+        let f: fn() = unsafe { std::mem::transmute(p) };
+        if should_panic {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f()));
+            if res.is_ok() {
+                return Err("note: test did not panic as expected".to_owned());
+            }
+        } else {
+            f();
+        }
+    }
+    Ok(())
+}
 
 macro_rules! def_test_runner {
     ($name:ident, $idx:expr) => {
         fn $name() -> Result<(), String> {
-            let p = NEW_TEST_FNS[$idx].load(Ordering::Acquire);
-            if !p.is_null() {
-                let f: extern "C" fn() = unsafe { std::mem::transmute(p) };
-                f();
-            }
-            Ok(())
+            run_new_test_slot($idx)
         }
     };
 }
@@ -577,6 +590,22 @@ def_test_runner!(rustd_new_test_12, 12);
 def_test_runner!(rustd_new_test_13, 13);
 def_test_runner!(rustd_new_test_14, 14);
 def_test_runner!(rustd_new_test_15, 15);
+def_test_runner!(rustd_new_test_16, 16);
+def_test_runner!(rustd_new_test_17, 17);
+def_test_runner!(rustd_new_test_18, 18);
+def_test_runner!(rustd_new_test_19, 19);
+def_test_runner!(rustd_new_test_20, 20);
+def_test_runner!(rustd_new_test_21, 21);
+def_test_runner!(rustd_new_test_22, 22);
+def_test_runner!(rustd_new_test_23, 23);
+def_test_runner!(rustd_new_test_24, 24);
+def_test_runner!(rustd_new_test_25, 25);
+def_test_runner!(rustd_new_test_26, 26);
+def_test_runner!(rustd_new_test_27, 27);
+def_test_runner!(rustd_new_test_28, 28);
+def_test_runner!(rustd_new_test_29, 29);
+def_test_runner!(rustd_new_test_30, 30);
+def_test_runner!(rustd_new_test_31, 31);
 
 fn get_test_runner(idx: usize) -> Option<fn() -> Result<(), String>> {
     match idx {
@@ -596,6 +625,22 @@ fn get_test_runner(idx: usize) -> Option<fn() -> Result<(), String>> {
         13 => Some(rustd_new_test_13),
         14 => Some(rustd_new_test_14),
         15 => Some(rustd_new_test_15),
+        16 => Some(rustd_new_test_16),
+        17 => Some(rustd_new_test_17),
+        18 => Some(rustd_new_test_18),
+        19 => Some(rustd_new_test_19),
+        20 => Some(rustd_new_test_20),
+        21 => Some(rustd_new_test_21),
+        22 => Some(rustd_new_test_22),
+        23 => Some(rustd_new_test_23),
+        24 => Some(rustd_new_test_24),
+        25 => Some(rustd_new_test_25),
+        26 => Some(rustd_new_test_26),
+        27 => Some(rustd_new_test_27),
+        28 => Some(rustd_new_test_28),
+        29 => Some(rustd_new_test_29),
+        30 => Some(rustd_new_test_30),
+        31 => Some(rustd_new_test_31),
         _ => None,
     }
 }
@@ -648,17 +693,24 @@ extern "C" fn rustd_test_main_static(tests_ptr: *const *const u64, tests_len: us
     real_fn(extended.as_ptr(), extended.len());
 }
 
-fn register_new_test(encoded_name: &str, new_fn: *mut c_void, veneer_idx: &mut usize) -> bool {
+fn register_new_test(
+    encoded_name: &str,
+    should_panic: bool,
+    new_fn: *mut c_void,
+    veneer_idx: &mut usize,
+) -> bool {
     let Ok(mut list) = NEW_TESTS.lock() else { return false };
     let decoded = encoded_name.replace("__", "::");
     if let Some(&(_, existing_idx)) = list.iter().find(|&&(n, _)| n == decoded) {
+        NEW_TEST_PANIC[existing_idx].store(should_panic, Ordering::Release);
         NEW_TEST_FNS[existing_idx].store(new_fn, Ordering::Release);
         return true;
     }
     let idx = list.len();
-    if idx >= 16 {
+    if idx >= 32 {
         return false;
     }
+    NEW_TEST_PANIC[idx].store(should_panic, Ordering::Release);
     NEW_TEST_FNS[idx].store(new_fn, Ordering::Release);
     let leaked_name: &'static str = Box::leak(decoded.into_boxed_str());
     list.push((leaked_name, idx));
@@ -992,8 +1044,14 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                 continue;
             }
             let new_fn = unsafe { *got_base.add(i) as *mut c_void };
+            if let Some(encoded_name) = sym_name.strip_prefix("__rustd_new_test_panic__") {
+                if register_new_test(encoded_name, true, new_fn, &mut veneer_idx) {
+                    patched += 1;
+                }
+                continue;
+            }
             if let Some(encoded_name) = sym_name.strip_prefix("__rustd_new_test__") {
-                if register_new_test(encoded_name, new_fn, &mut veneer_idx) {
+                if register_new_test(encoded_name, false, new_fn, &mut veneer_idx) {
                     patched += 1;
                 }
                 continue;
@@ -1222,8 +1280,14 @@ fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
                 continue;
             }
             let new_fn = unsafe { *got_base.add(i) as *mut c_void };
+            if let Some(encoded_name) = sym_name.strip_prefix("__rustd_new_test_panic__") {
+                if register_new_test(encoded_name, true, new_fn, &mut veneer_idx) {
+                    patched += 1;
+                }
+                continue;
+            }
             if let Some(encoded_name) = sym_name.strip_prefix("__rustd_new_test__") {
-                if register_new_test(encoded_name, new_fn, &mut veneer_idx) {
+                if register_new_test(encoded_name, false, new_fn, &mut veneer_idx) {
                     patched += 1;
                 }
                 continue;
