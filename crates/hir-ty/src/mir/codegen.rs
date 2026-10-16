@@ -875,7 +875,8 @@ fn target_with(regalloc: &str) -> std::result::Result<isa::OwnedTargetIsa, Strin
         ("x86_64-unknown-linux-gnu", "elf_gd")
     };
     flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
-    flags.set("opt_level", "none").map_err(|e| e.to_string())?;
+    let opt = if regalloc == "backtracking" { "speed" } else { "none" };
+    flags.set("opt_level", opt).map_err(|e| e.to_string())?;
     flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
     flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
     isa::lookup_by_name(triple)

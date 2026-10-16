@@ -23,6 +23,8 @@ pub(crate) fn is_subcommand(arg: &str) -> bool {
         arg,
         "build"
             | "check"
+            | "clippy"
+            | "rebase"
             | "run"
             | "test"
             | "patch"
@@ -38,7 +40,9 @@ pub(crate) fn is_subcommand(arg: &str) -> bool {
 pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
     match sub {
         "build" => cmd_build(&args),
-        "check" => cmd_check(&args),
+        "check" => cmd_check(&args, "check"),
+        "clippy" => cmd_check(&args, "clippy"),
+        "rebase" => cmd_rebase(&args),
         "run" => cmd_run(&args),
         "test" => cmd_test(&args),
         "patch" => cmd_request("patch", &args),
@@ -48,12 +52,14 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
         _ => {
             eprintln!(
                 "Usage:\n  \
-                 rustd check [-p PACKAGE] [--bin NAME] [--test NAME] [--watch]\n  \
-                 rustd build [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
-                 rustd run   [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
-                 rustd test  [FILTER] [-p PACKAGE] [--since SHA] [--junit PATH] [--json] [--also-run FILE] [--retries N] [--explain TEST] [--backtest] [--faults N] [--watch] [-- ARGS...]\n  \
-                 rustd patch [--manifest-path PATH] [--bin NAME]\n  \
-                 rustd sync  [--manifest-path PATH] [--bin NAME]\n  \
+                 rustd check  [-p PACKAGE] [--bin NAME] [--test NAME] [--watch]\n  \
+                 rustd clippy [-p PACKAGE] [--bin NAME] [--test NAME] [--since SHA] [--watch]\n  \
+                 rustd rebase [-p PACKAGE] [--bin NAME] [--test NAME]\n  \
+                 rustd build  [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
+                 rustd run    [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
+                 rustd test   [FILTER] [-p PACKAGE] [--since SHA] [--junit PATH] [--json] [--also-run FILE] [--retries N] [--explain TEST] [--backtest] [--faults N] [--watch] [-- ARGS...]\n  \
+                 rustd patch  [--manifest-path PATH] [--bin NAME]\n  \
+                 rustd sync   [--manifest-path PATH] [--bin NAME]\n  \
                  rustd status [--manifest-path PATH] [--bin NAME]\n  \
                  rustd stop   [--manifest-path PATH] [--bin NAME]\n\n\
                  Low-level daemon invocation:\n  \
@@ -802,12 +808,15 @@ fn check_compile_error(opts: &CliOpts, paths: &TargetPaths, reply: Option<&str>)
 
 fn print_check_file(opts: &CliOpts, check_txt: &Path, fallback_elapsed: Option<Duration>) -> usize {
     let mut errors = 0usize;
+    let mut warnings = 0usize;
     let mut us = 0u64;
     if let Ok(content) = fs::read_to_string(check_txt) {
         let (header, body) = content.split_once('\n').unwrap_or((&content, ""));
         for word in header.split_whitespace() {
             if let Some(val) = word.strip_prefix("errors=") {
                 errors = val.parse().unwrap_or(0);
+            } else if let Some(val) = word.strip_prefix("warnings=") {
+                warnings = val.parse().unwrap_or(0);
             } else if let Some(val) = word.strip_prefix("us=") {
                 us = val.parse().unwrap_or(0);
             }
@@ -819,6 +828,12 @@ fn print_check_file(opts: &CliOpts, check_txt: &Path, fallback_elapsed: Option<D
     let elapsed = fallback_elapsed.unwrap_or_else(|| Duration::from_micros(us));
     let raw_label = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
     let target_label = raw_label.strip_prefix("test-").unwrap_or(raw_label);
+    if warnings > 0 {
+        let w_plural = if warnings == 1 { "" } else { "s" };
+        eprintln!(
+            "\x1b[1;33mwarning\x1b[0m\x1b[1m: `{target_label}` generated {warnings} warning{w_plural}\x1b[0m"
+        );
+    }
     if errors > 0 {
         let plural = if errors == 1 { "" } else { "s" };
         eprintln!(
@@ -834,23 +849,35 @@ fn print_check_file(opts: &CliOpts, check_txt: &Path, fallback_elapsed: Option<D
     errors
 }
 
-fn run_one_check(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<usize> {
+fn run_one_check(opts: &CliOpts, paths: &TargetPaths, req_cmd: &str) -> anyhow::Result<usize> {
     let t0 = Instant::now();
-    let _reply = send_unix_line(&paths.rustd_sock, "check")?;
+    let _reply = send_unix_line(&paths.rustd_sock, req_cmd)?;
     let elapsed = t0.elapsed();
     let check_txt = paths.base_o.with_extension("check.txt");
     Ok(print_check_file(opts, &check_txt, Some(elapsed)))
 }
 
-fn cmd_check(args: &[String]) -> anyhow::Result<()> {
-    let has_test_flag = args.iter().any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests");
+fn cmd_check(args: &[String], req_cmd: &str) -> anyhow::Result<()> {
+    let has_test_flag = args
+        .iter()
+        .any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests" || a == "--since");
     let mut opts = parse_opts_with_mode(args, has_test_flag)?;
     if opts.bin_name.starts_with("test-") {
         opts.cfg_test = true;
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    if let Some(sha) = &opts.since {
+        let diff_files = crate::ci::analyze_git_diff_since(&opts.workspace_root, sha)?;
+        fs::create_dir_all(&paths.dir)?;
+        let baseline_cache = paths.base_o.with_extension("baseline.cache");
+        crate::ci::write_since_baseline_cache(
+            &baseline_cache,
+            &format!("SINCE:{sha}"),
+            &diff_files,
+        )?;
+    }
     ensure_daemon(&opts, &paths)?;
-    let errors = run_one_check(&opts, &paths)?;
+    let errors = run_one_check(&opts, &paths, req_cmd)?;
     if !opts.watch {
         if errors > 0 {
             std::process::exit(101);
@@ -879,6 +906,33 @@ fn cmd_check(args: &[String]) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn cmd_rebase(args: &[String]) -> anyhow::Result<()> {
+    let has_test_flag = args
+        .iter()
+        .any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests");
+    let mut opts = parse_opts_with_mode(args, has_test_flag)?;
+    if opts.bin_name.starts_with("test-") {
+        opts.cfg_test = true;
+    }
+    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    eprintln!(
+        "[rustd] rebasing `{}` with full LLVM/cargo optimization...",
+        opts.bin_name
+    );
+    stop_target_daemon(&paths);
+    let _ = fs::remove_file(&paths.link_args_txt);
+    let _ = fs::remove_file(paths.out_bin.with_extension("base"));
+    let _ = fs::remove_file(paths.base_o.with_extension("baseline.cache"));
+    let _ = fs::remove_file(paths.base_o.with_extension("symbols.cache"));
+    let _ = fs::remove_file(&paths.patch_o);
+    ensure_daemon(&opts, &paths)?;
+    eprintln!(
+        "[rustd] rebase complete for `{}` (dirty patches folded into LLVM base binary)",
+        opts.bin_name
+    );
+    Ok(())
 }
 
 fn cmd_build(args: &[String]) -> anyhow::Result<()> {

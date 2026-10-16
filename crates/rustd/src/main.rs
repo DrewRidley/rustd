@@ -43,7 +43,7 @@ use project_model::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     AstNode, SyntaxNode,
-    ast::{self, HasName},
+    ast::{self, HasArgList, HasName},
     match_ast,
 };
 use vfs::{AbsPathBuf, Vfs, VfsPath};
@@ -2175,7 +2175,7 @@ fn check_files_diagnostics(
                                 "unresolved import",
                             ))
                         }
-                        Diagnostic::UnresolvedMacroCall(d) => {
+                        Diagnostic::UnresolvedMacroCall(d) if d.is_bang => {
                             let name = d.path.display(db, edition).to_string();
                             let r = sema.diagnostics_display_range_for_range(d.range);
                             Some((
@@ -2226,6 +2226,334 @@ fn check_files_diagnostics(
             "\x1b[1mFor more information about this error, try `rustc --explain {first_code}`.\x1b[0m\n"
         ));
     }
+    rep
+}
+
+fn format_cargo_warning_snippet(
+    db: &RootDatabase,
+    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    root: &Path,
+    file_id: vfs::FileId,
+    range: syntax::TextRange,
+    lint_name: &str,
+    message: &str,
+    label: &str,
+) -> String {
+    let full_path = paths.get(&file_id).cloned().unwrap_or_default();
+    let rel_path = full_path
+        .strip_prefix(root)
+        .unwrap_or(&full_path)
+        .display()
+        .to_string();
+    let text = db.file_text(file_id).text(db);
+    let start_off = usize::from(range.start()).min(text.len());
+    let end_off = usize::from(range.end()).min(text.len()).max(start_off);
+    let before = &text[..start_off];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[start_off..].find('\n').map_or(text.len(), |i| start_off + i);
+    let line_no = before.bytes().filter(|&b| b == b'\n').count() + 1;
+    let raw_line = text[line_start..line_end].trim_end_matches('\r');
+    let span_start_in_line = start_off.saturating_sub(line_start).min(raw_line.len());
+    let span_end_in_line = end_off.min(line_end).saturating_sub(line_start).min(raw_line.len());
+    let mut display_line = String::with_capacity(raw_line.len() + 16);
+    let mut caret_col = 0usize;
+    let mut caret_len = 0usize;
+    for (byte_idx, ch) in raw_line.char_indices() {
+        let width = if ch == '\t' { 4 } else { 1 };
+        if byte_idx < span_start_in_line {
+            caret_col += width;
+        } else if byte_idx < span_end_in_line {
+            caret_len += width;
+        }
+        if ch == '\t' {
+            display_line.push_str("    ");
+        } else {
+            display_line.push(ch);
+        }
+    }
+    let col_no = raw_line[..span_start_in_line].chars().count() + 1;
+    let carets = "^".repeat(caret_len.max(1));
+    let pad_num = line_no.to_string();
+    let gutter_pad = " ".repeat(pad_num.len());
+    let caret_pad = " ".repeat(caret_col);
+    format!(
+        "\x1b[1;33mwarning\x1b[0m\x1b[1m: {message}\x1b[0m\n\
+         {gutter_pad}\x1b[1;34m-->\x1b[0m {rel_path}:{line_no}:{col_no}\n\
+         {gutter_pad} \x1b[1;34m|\x1b[0m\n\
+         \x1b[1;34m{pad_num} |\x1b[0m {display_line}\n\
+         {gutter_pad} \x1b[1;34m|\x1b[0m {caret_pad}\x1b[1;33m{carets} {label}\x1b[0m\n\
+         {gutter_pad} \x1b[1;34m|\x1b[0m\n\
+         {gutter_pad} \x1b[1;34m=\x1b[0m \x1b[1mnote\x1b[0m: `#[warn({lint_name})]` on by default\n\n"
+    )
+}
+
+fn clippy_files_diagnostics(
+    db: &RootDatabase,
+    files_to_check: &[vfs::FileId],
+    layout_warnings: &[String],
+    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    root: &Path,
+) -> CheckReport {
+    use hir::AnyDiagnostic as Diagnostic;
+    let mut rep = check_files_diagnostics(db, files_to_check, layout_warnings, paths, root);
+    let mut seen_warns = FxHashSet::default();
+    hir::attach_db(db, || {
+        let sema = hir::Semantics::new(db);
+        for &file in files_to_check {
+            let crates = ide_db::base_db::relevant_crates(db, file);
+            let edition = crates
+                .first()
+                .map_or(syntax::Edition::CURRENT, |&krate| Crate::from(krate).edition(db));
+            for module in modules_in_file(db, file) {
+                let mut found = Vec::new();
+                module.diagnostics(db, &mut found, true);
+                for diag in &found {
+                    let info: Option<(&'static str, String, hir::FileRangeWrapper<vfs::FileId>, String)> =
+                        match diag {
+                            Diagnostic::UnusedMustUse(d) => {
+                                let r = sema.diagnostics_display_range(d.expr.map(|it| it.into()));
+                                let msg = match d.message {
+                                    Some(m) => format!("unused result that must be used: {m}"),
+                                    None => "unused result that must be used".to_owned(),
+                                };
+                                Some(("unused_must_use", msg, r, "must be used".to_owned()))
+                            }
+                            Diagnostic::RemoveTrailingReturn(d)
+                                if !d.return_expr.file_id.is_macro() =>
+                            {
+                                let r = sema.diagnostics_display_range(
+                                    d.return_expr.map(|it| it.into()),
+                                );
+                                Some((
+                                    "clippy::needless_return",
+                                    "unneeded `return` statement".to_owned(),
+                                    r,
+                                    "help: remove `return`".to_owned(),
+                                ))
+                            }
+                            Diagnostic::RemoveUnnecessaryElse(d)
+                                if !d.if_expr.file_id.is_macro() =>
+                            {
+                                let r =
+                                    sema.diagnostics_display_range(d.if_expr.map(|it| it.into()));
+                                Some((
+                                    "clippy::needless_else",
+                                    "this `else` block is empty and unnecessary".to_owned(),
+                                    r,
+                                    "help: remove the empty `else` block".to_owned(),
+                                ))
+                            }
+                            Diagnostic::ReplaceFilterMapNextWithFindMap(d)
+                                if !d.file.is_macro() =>
+                            {
+                                let r = sema.diagnostics_display_range(hir::InFile::new(
+                                    d.file,
+                                    d.next_expr.into(),
+                                ));
+                                Some((
+                                    "clippy::filter_map_next",
+                                    "called `filter_map(..).next()` on an `Iterator`".to_owned(),
+                                    r,
+                                    "help: use `.find_map(..)` instead".to_owned(),
+                                ))
+                            }
+                            Diagnostic::IncorrectCase(d) if !d.file.is_macro() => {
+                                let r = sema.diagnostics_display_range(hir::InFile::new(
+                                    d.file,
+                                    d.ident.into(),
+                                ));
+                                Some((
+                                    "non_snake_case",
+                                    format!(
+                                        "`{}` should have a {:?} case name: `{}`",
+                                        d.ident_text, d.expected_case, d.suggested_text
+                                    ),
+                                    r,
+                                    format!("help: convert the identifier to `{}`", d.suggested_text),
+                                ))
+                            }
+                            _ => None,
+                        };
+                    if let Some((lint, msg, range, label)) = info
+                        && seen_warns.insert((range.file_id, range.range, lint))
+                    {
+                        rep.warnings += 1;
+                        rep.rendered.push_str(&format_cargo_warning_snippet(
+                            db,
+                            paths,
+                            root,
+                            range.file_id,
+                            range.range,
+                            lint,
+                            &msg,
+                            &label,
+                        ));
+                    }
+                }
+            }
+
+            // Fast AST Clippy lint passes on the parsed syntax tree
+            let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
+            let tree = parse.tree();
+            for node in tree.syntax().descendants() {
+                if let Some(bin) = ast::BinExpr::cast(node.clone())
+                    && let (Some(lhs), Some(rhs), Some(op)) =
+                        (bin.lhs(), bin.rhs(), bin.op_kind())
+                {
+                    let lhs_txt = lhs.syntax().text().to_string();
+                    let rhs_txt = rhs.syntax().text().to_string();
+                    // 1. clippy::len_zero (`x.len() == 0`, `x.len() != 0`, `x.len() > 0`)
+                    let is_len_zero = (lhs_txt.ends_with(".len()")
+                        && rhs_txt == "0"
+                        && matches!(
+                            op,
+                            ast::BinaryOp::CmpOp(
+                                ast::CmpOp::Eq { .. }
+                                    | ast::CmpOp::Ord {
+                                        ordering: ast::Ordering::Greater,
+                                        strict: true
+                                    }
+                            )
+                        ))
+                        || (rhs_txt.ends_with(".len()")
+                            && lhs_txt == "0"
+                            && matches!(
+                                op,
+                                ast::BinaryOp::CmpOp(
+                                    ast::CmpOp::Eq { .. }
+                                        | ast::CmpOp::Ord {
+                                            ordering: ast::Ordering::Less,
+                                            strict: true
+                                        }
+                                )
+                            ));
+                    if is_len_zero
+                        && seen_warns.insert((file, bin.syntax().text_range(), "clippy::len_zero"))
+                    {
+                        rep.warnings += 1;
+                        rep.rendered.push_str(&format_cargo_warning_snippet(
+                            db,
+                            paths,
+                            root,
+                            file,
+                            bin.syntax().text_range(),
+                            "clippy::len_zero",
+                            "length comparison to zero",
+                            "help: using `is_empty` is clearer and more explicit",
+                        ));
+                    }
+                    // 2. clippy::bool_comparison (`x == true`, `x == false`, `x != true`, `x != false`)
+                    let is_bool_cmp = matches!(op, ast::BinaryOp::CmpOp(ast::CmpOp::Eq { .. }))
+                        && (matches!(rhs_txt.as_str(), "true" | "false")
+                            || matches!(lhs_txt.as_str(), "true" | "false"));
+                    if is_bool_cmp
+                        && seen_warns.insert((
+                            file,
+                            bin.syntax().text_range(),
+                            "clippy::bool_comparison",
+                        ))
+                    {
+                        rep.warnings += 1;
+                        rep.rendered.push_str(&format_cargo_warning_snippet(
+                            db,
+                            paths,
+                            root,
+                            file,
+                            bin.syntax().text_range(),
+                            "clippy::bool_comparison",
+                            "equality checks against true or false are unnecessary",
+                            "help: simplify the boolean expression",
+                        ));
+                    }
+                }
+                // 3. clippy::collapsible_if (`if a { if b { ... } }` with no else)
+                if let Some(if_expr) = ast::IfExpr::cast(node.clone())
+                    && if_expr.else_branch().is_none()
+                    && if_expr
+                        .syntax()
+                        .parent()
+                        .and_then(ast::ElseBranch::cast)
+                        .is_none()
+                    && let Some(then_blk) = if_expr.then_branch()
+                    && let Some(stmt_list) = then_blk.stmt_list()
+                    && stmt_list.statements().next().is_none()
+                    && let Some(ast::Expr::IfExpr(inner_if)) = stmt_list.tail_expr()
+                    && inner_if.else_branch().is_none()
+                    && seen_warns.insert((
+                        file,
+                        if_expr.syntax().text_range(),
+                        "clippy::collapsible_if",
+                    ))
+                {
+                    rep.warnings += 1;
+                    rep.rendered.push_str(&format_cargo_warning_snippet(
+                        db,
+                        paths,
+                        root,
+                        file,
+                        if_expr.syntax().text_range(),
+                        "clippy::collapsible_if",
+                        "this `if` statement can be collapsed",
+                        "help: collapse nested `if` block with `&&`",
+                    ));
+                }
+                // 4. clippy::dbg_macro (`dbg!(...)`)
+                if let Some(mc) = ast::MacroCall::cast(node.clone())
+                    && mc
+                        .path()
+                        .and_then(|p| p.segment())
+                        .and_then(|s| s.name_ref())
+                        .is_some_and(|n| n.text() == "dbg")
+                    && seen_warns.insert((file, mc.syntax().text_range(), "clippy::dbg_macro"))
+                {
+                    rep.warnings += 1;
+                    rep.rendered.push_str(&format_cargo_warning_snippet(
+                        db,
+                        paths,
+                        root,
+                        file,
+                        mc.syntax().text_range(),
+                        "clippy::dbg_macro",
+                        "the `dbg!` macro is intended as a debugging tool",
+                        "help: remove the `dbg!` macro before committing",
+                    ));
+                }
+                // 5. clippy::redundant_closure (`|x| f(x)`)
+                if let Some(clos) = ast::ClosureExpr::cast(node)
+                    && let Some(pl) = clos.param_list()
+                    && pl.params().count() == 1
+                    && let Some(param) = pl.params().next()
+                    && param.ty().is_none()
+                    && let Some(ast::Pat::IdentPat(ip)) = param.pat()
+                    && let Some(pname) = ip.name()
+                    && let Some(ast::Expr::CallExpr(call)) = clos.body()
+                    && let Some(ast::Expr::PathExpr(callee_path)) = call.expr()
+                    && let Some(al) = call.arg_list()
+                    && al.args().count() == 1
+                    && let Some(arg0) = al.args().next()
+                    && arg0.syntax().text() == pname.syntax().text()
+                    && seen_warns.insert((
+                        file,
+                        clos.syntax().text_range(),
+                        "clippy::redundant_closure",
+                    ))
+                {
+                    let fn_txt = callee_path.syntax().text().to_string();
+                    rep.warnings += 1;
+                    rep.rendered.push_str(&format_cargo_warning_snippet(
+                        db,
+                        paths,
+                        root,
+                        file,
+                        clos.syntax().text_range(),
+                        "clippy::redundant_closure",
+                        "redundant closure",
+                        &format!("help: replace the closure with the function itself: `{fn_txt}`"),
+                    ));
+                }
+            }
+        }
+    });
     rep
 }
 
@@ -2364,6 +2692,8 @@ enum Request {
     Patch,
     /// Run incremental syntax and semantic diagnostics and write a cargo-style report.
     Check,
+    /// Run incremental syntax, semantic, and Clippy lint diagnostics.
+    Clippy,
     /// Inject N synthetic faults into core functions and measure selector recall.
     Backtest(usize),
 }
@@ -2378,6 +2708,7 @@ impl Request {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
             "check" => Some(Request::Check),
+            "clippy" => Some(Request::Clippy),
             _ => None,
         }
     }
@@ -2387,6 +2718,7 @@ impl Request {
             Request::Sync => "sync\n",
             Request::Patch => "patch\n",
             Request::Check => "check\n",
+            Request::Clippy => "clippy\n",
             Request::Backtest(_) => "backtest 20\n",
         }
     }
@@ -3055,14 +3387,68 @@ fn main() -> anyhow::Result<()> {
                             t0.elapsed().as_millis()
                         );
                     }
-                } else if matches!(req, Request::Check) {
-                    let _ = writeln!(
-                        &client,
-                        "ok check errors={} warnings={} ms=0 report={}",
-                        last_check_report.errors,
-                        last_check_report.warnings,
-                        check_report_path.display()
-                    );
+                } else if matches!(req, Request::Check | Request::Clippy) {
+                    if matches!(req, Request::Clippy) && dirty_files.is_empty() {
+                        let t0 = Instant::now();
+                        let paths: FxHashMap<vfs::FileId, PathBuf> = files
+                            .iter()
+                            .filter_map(|it| match it.file {
+                                Watched::Source(id) => Some((id, it.path.clone())),
+                                Watched::Included(_) => None,
+                            })
+                            .collect();
+                        let mut target_files = Vec::new();
+                        if let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
+                            && let Ok(bin_crates) = crates_named(&db, &bc.replace('-', "_"))
+                        {
+                            let mut seen_f = FxHashSet::default();
+                            for c in bin_crates {
+                                let l = listed.of(&db, c);
+                                hir::attach_db(&db, || {
+                                    for &func in &l.functions {
+                                        let fid = func
+                                            .lookup(&db)
+                                            .id
+                                            .file_id
+                                            .original_file_respecting_includes(&db)
+                                            .file_id(&db);
+                                        if seen_f.insert(fid) {
+                                            target_files.push(fid);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        let rep = clippy_files_diagnostics(
+                            &db,
+                            &target_files,
+                            &[],
+                            &paths,
+                            &check_root,
+                        );
+                        let check_us = t0.elapsed().as_micros();
+                        let file_body = format!(
+                            "errors={} warnings={} us={}\n{}",
+                            rep.errors, rep.warnings, check_us, rep.rendered
+                        );
+                        let _ = std::fs::write(&check_report_path, &file_body);
+                        let _ = writeln!(
+                            &client,
+                            "ok check errors={} warnings={} ms={} report={}",
+                            rep.errors,
+                            rep.warnings,
+                            t0.elapsed().as_millis(),
+                            check_report_path.display()
+                        );
+                    } else {
+                        let _ = writeln!(
+                            &client,
+                            "ok check errors={} warnings={} ms=0 report={}",
+                            last_check_report.errors,
+                            last_check_report.warnings,
+                            check_report_path.display()
+                        );
+                    }
                 } else if let Request::Backtest(n) = req {
                     if !resolved_deps {
                         let _ = resolve_crates(&db, &args);
@@ -3278,7 +3664,7 @@ fn main() -> anyhow::Result<()> {
                 check_files.push(df);
             }
         }
-        let check_client = if matches!(client, Some((Request::Check, _))) {
+        let check_client = if matches!(client, Some((Request::Check | Request::Clippy, _))) {
             client.take().map(|(_, s)| s)
         } else {
             None
@@ -3296,7 +3682,7 @@ fn main() -> anyhow::Result<()> {
                 );
                 scope.spawn(move || {
                     let t_check = Instant::now();
-                    let rep = check_files_diagnostics(
+                    let rep = clippy_files_diagnostics(
                         &db,
                         check_files,
                         layout_warnings,
