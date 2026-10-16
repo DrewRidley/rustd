@@ -694,28 +694,44 @@ fn built_features(
     manifest: &Path,
     cargo_config: &CargoConfig,
 ) -> anyhow::Result<FxHashMap<(String, String), std::collections::BTreeSet<String>>> {
-    let mut command = Command::new("cargo");
-    let edges = if cargo_config.set_test { "normal,dev" } else { "normal" };
-    command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
-    command.arg("--manifest-path").arg(manifest);
-    if let Ok(pkg) = std::env::var("RUSTD_PKG")
-        && !pkg.is_empty()
+    let stdout_text = if let Ok(cache_path) = std::env::var("RUSTD_CACHE_TREE")
+        && let Ok(expected_fp) = std::env::var("RUSTD_CACHE_FP")
+        && let Ok(text) = std::fs::read_to_string(&cache_path)
+        && let Some((fp_line, body)) = text.split_once('\n')
+        && fp_line == expected_fp
     {
-        command.args(["-p", &pkg]);
-    }
-    if let CargoFeatures::Selected { features, .. } = &cargo_config.features
-        && !features.is_empty()
-    {
-        command.arg("--features").arg(features.join(","));
-    }
-    let output = command.output().context("running `cargo tree`")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "`cargo tree` failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        body.to_owned()
+    } else {
+        let mut command = Command::new("cargo");
+        let edges = if cargo_config.set_test { "normal,dev" } else { "normal" };
+        command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
+        command.arg("--manifest-path").arg(manifest);
+        if let Ok(pkg) = std::env::var("RUSTD_PKG")
+            && !pkg.is_empty()
+        {
+            command.args(["-p", &pkg]);
+        }
+        if let CargoFeatures::Selected { features, .. } = &cargo_config.features
+            && !features.is_empty()
+        {
+            command.arg("--features").arg(features.join(","));
+        }
+        let output = command.output().context("running `cargo tree`")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "`cargo tree` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        if let Ok(cache_path) = std::env::var("RUSTD_CACHE_TREE")
+            && let Ok(fp) = std::env::var("RUSTD_CACHE_FP")
+        {
+            let _ = std::fs::write(&cache_path, format!("{fp}\n{text}"));
+        }
+        text
+    };
     let mut built = FxHashMap::default();
-    for line in String::from_utf8(output.stdout)?.lines() {
+    for line in stdout_text.lines() {
         // `name v1.2.3 (/path/of/a/member)|feature,feature (*)`
         let Some((package, features)) = line.split_once('|') else { continue };
         let mut package = package.split(' ');
@@ -1844,6 +1860,36 @@ fn main() -> anyhow::Result<()> {
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
     let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
+    let cache_fp = {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        SymbolTable::files_fingerprint(&symbol_files).hash(&mut h);
+        for mf in [&args.project, &root.join("Cargo.lock")] {
+            if let Ok(m) = std::fs::metadata(mf) {
+                m.len().hash(&mut h);
+                if let Ok(t) = m.modified()
+                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+                {
+                    d.as_nanos().hash(&mut h);
+                }
+            }
+        }
+        args.cfg_test.hash(&mut h);
+        args.target.hash(&mut h);
+        args.features.hash(&mut h);
+        std::env::var("RUSTD_PKG").ok().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    if !args.out.is_dir() {
+        unsafe {
+            std::env::set_var("RUSTD_CACHE_FP", &cache_fp);
+            std::env::set_var("RUSTD_CACHE_META", args.out.with_extension("meta.cache"));
+            std::env::set_var("RUSTD_CACHE_TREE", args.out.with_extension("tree.cache"));
+            std::env::set_var("RUSTD_CACHE_BS", args.out.with_extension("bs.cache"));
+        }
+    }
+    let baseline_cache_path =
+        (!args.out.is_dir()).then(|| args.out.with_extension("baseline.cache"));
     let sym_cache_path = (!args.out.is_dir()).then(|| args.out.with_extension("symbols.cache"));
     let table = std::thread::spawn(move || {
         let start = Instant::now();
@@ -1879,9 +1925,13 @@ fn main() -> anyhow::Result<()> {
         return build_batch(&db, args);
     }
 
-    let start = Instant::now();
-    let resolved = resolve_crates(&db, &args)?;
-    eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+    let mut resolved_deps = false;
+    if args.krate.is_some() || (args.socket.is_none() && !args.watch) {
+        let start = Instant::now();
+        let resolved = resolve_crates(&db, &args)?;
+        eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+        resolved_deps = true;
+    }
 
     anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
     let report_panic = std::panic::take_hook();
@@ -1950,6 +2000,64 @@ fn main() -> anyhow::Result<()> {
     }
     let mut files = WatchedFile::sources(&vfs);
     eprintln!("watching {} files", files.len());
+    let mut baseline_by_path: FxHashMap<PathBuf, String> = FxHashMap::default();
+    if let Some(bp) = &baseline_cache_path
+        && let Ok(bytes) = std::fs::read(bp)
+        && bytes.starts_with(b"RUSTDBAS")
+    {
+        let mut pos = 8usize;
+        let get_u32 = |pos: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?);
+            *pos += 4;
+            Some(v)
+        };
+        let get_str = |pos: &mut usize| -> Option<String> {
+            let len = get_u32(pos)? as usize;
+            let s = std::str::from_utf8(bytes.get(*pos..*pos + len)?).ok()?.to_owned();
+            *pos += len;
+            Some(s)
+        };
+        if get_str(&mut pos).as_deref() == Some(cache_fp.as_str())
+            && let Some(count) = get_u32(&mut pos)
+        {
+            for _ in 0..count {
+                if let (Some(p), Some(txt)) = (get_str(&mut pos), get_str(&mut pos)) {
+                    baseline_by_path.insert(PathBuf::from(p), txt);
+                }
+            }
+        }
+    }
+    let save_baseline = |bp: Option<&Path>, fp: &str, map: &FxHashMap<PathBuf, String>| {
+        let Some(bp) = bp else { return };
+        let mut out = Vec::with_capacity(64 * 1024);
+        let put_str = |out: &mut Vec<u8>, s: &str| {
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        };
+        out.extend_from_slice(b"RUSTDBAS");
+        put_str(&mut out, fp);
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (k, v) in map {
+            put_str(&mut out, &k.to_string_lossy());
+            put_str(&mut out, v);
+        }
+        let _ = std::fs::write(bp, out);
+    };
+    let mut offline_restore = ChangeWithProcMacros::default();
+    let mut has_offline_restore = false;
+    for wf in &mut files {
+        if let Watched::Source(id) = wf.file
+            && let Some(orig_text) = baseline_by_path.get(&wf.path)
+            && db.file_text(id).text(&db).as_ref() != orig_text.as_str()
+        {
+            offline_restore.change_file(id, Some(orig_text.clone()));
+            wf.mtime = SystemTime::UNIX_EPOCH;
+            has_offline_restore = true;
+        }
+    }
+    if has_offline_restore {
+        db.apply_change(offline_restore);
+    }
     ide_db::executions::take(&db);
     let sources: Vec<_> = files
         .iter()
@@ -2019,19 +2127,67 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             let before = touched.len() + gone.len();
-            for (index, file) in files.iter_mut().enumerate() {
-                let Ok(now) = std::fs::metadata(&file.path).and_then(|m| m.modified()) else {
-                    if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
-                        touched.remove(&index);
-                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
+            if client.is_some() && files.len() > 256 {
+                let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(8);
+                let chunk_size = files.len().div_ceil(threads).max(1);
+                let results: Vec<Vec<(usize, Option<SystemTime>)>> = std::thread::scope(|scope| {
+                    files
+                        .chunks(chunk_size)
+                        .enumerate()
+                        .map(|(c_idx, chunk)| {
+                            let base = c_idx * chunk_size;
+                            scope.spawn(move || {
+                                let mut changes = Vec::new();
+                                for (off, file) in chunk.iter().enumerate() {
+                                    match std::fs::metadata(&file.path).and_then(|m| m.modified()) {
+                                        Ok(now) if now != file.mtime => {
+                                            changes.push((base + off, Some(now)));
+                                        }
+                                        Err(_) => {
+                                            changes.push((base + off, None));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                changes
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_default())
+                        .collect()
+                });
+                for (index, opt_now) in results.into_iter().flatten() {
+                    match opt_now {
+                        Some(now) => {
+                            gone.remove(&index);
+                            files[index].mtime = now;
+                            touched.insert(index);
+                            noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
+                        }
+                        None => {
+                            if matches!(files[index].file, Watched::Source(_)) && gone.insert(index) {
+                                touched.remove(&index);
+                                noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                            }
+                        }
                     }
-                    continue;
-                };
-                gone.remove(&index);
-                if now != file.mtime {
-                    file.mtime = now;
-                    touched.insert(index);
-                    noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
+                }
+            } else {
+                for (index, file) in files.iter_mut().enumerate() {
+                    let Ok(now) = std::fs::metadata(&file.path).and_then(|m| m.modified()) else {
+                        if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
+                            touched.remove(&index);
+                            noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                        }
+                        continue;
+                    };
+                    gone.remove(&index);
+                    if now != file.mtime {
+                        file.mtime = now;
+                        touched.insert(index);
+                        noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
+                    }
                 }
             }
             if client.is_none()
@@ -2079,8 +2235,14 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     let _ = writeln!(&client, "ok unchanged");
                 }
+            } else if !resolved_deps {
+                let start = Instant::now();
+                let resolved = resolve_crates(&db, &args)?;
+                eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+                resolved_deps = true;
             } else if let Some(krate) = unprimed_crates.pop() {
                 let l = listed.of(&db, krate);
+                let mut baseline_dirty = false;
                 hir::attach_db(&db, || {
                     let _ = hir::TraitImpls::for_crate(&db, krate.into());
                     let bin_crate = std::env::var("RUSTD_BIN_CRATE").ok();
@@ -2097,7 +2259,16 @@ fn main() -> anyhow::Result<()> {
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 initial_texts.entry(f)
                             {
-                                e.insert(db.file_text(f).text(&db).clone());
+                                let txt = db.file_text(f).text(&db).clone();
+                                if let Some(wf) = files
+                                    .iter()
+                                    .find(|w| matches!(w.file, Watched::Source(wid) if wid == f))
+                                    && !baseline_by_path.contains_key(&wf.path)
+                                {
+                                    baseline_by_path.insert(wf.path.clone(), txt.to_string());
+                                    baseline_dirty = true;
+                                }
+                                e.insert(txt);
                                 initial_adts.insert(f, snapshot_file_adts(&db, f));
                             }
                             initial_serials.entry(func).or_insert_with(|| {
@@ -2106,12 +2277,21 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 });
+                if baseline_dirty {
+                    save_baseline(baseline_cache_path.as_deref(), &cache_fp, &baseline_by_path);
+                }
                 if std::env::var_os("RUSTD_STATS").is_some() && unprimed_crates.is_empty() {
                     eprintln!("primed workspace caches");
                 }
             }
             continue;
         };
+        if !resolved_deps {
+            let start = Instant::now();
+            let resolved = resolve_crates(&db, &args)?;
+            eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+            resolved_deps = true;
+        }
         let settled = noticed.elapsed();
         let read = Instant::now();
         let mut change = ChangeWithProcMacros::default();
@@ -2128,12 +2308,18 @@ fn main() -> anyhow::Result<()> {
                 removed.push(id);
             }
         }
+        let mut baseline_dirty = false;
         for index in touched {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
                     if !initial_texts.contains_key(id) {
-                        initial_texts.insert(*id, db.file_text(*id).text(&db).clone());
+                        let orig_arc = db.file_text(*id).text(&db).clone();
+                        if !baseline_by_path.contains_key(path) {
+                            baseline_by_path.insert(path.clone(), orig_arc.to_string());
+                            baseline_dirty = true;
+                        }
+                        initial_texts.insert(*id, orig_arc);
                         initial_adts
                             .insert(*id, hir::attach_db(&db, || snapshot_file_adts(&db, *id)));
                         if args.krate.is_none() {
@@ -2172,6 +2358,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 Watched::Included(path) => included.push(path.clone()),
             }
+        }
+        if baseline_dirty {
+            save_baseline(baseline_cache_path.as_deref(), &cache_fp, &baseline_by_path);
         }
         let read = read.elapsed();
         eprintln!("change: {changed} files");

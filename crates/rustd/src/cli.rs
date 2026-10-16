@@ -356,8 +356,33 @@ fn sysroot_rlibs(workspace_root: &Path, target: Option<&str>) -> anyhow::Result<
 }
 
 fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<String> {
-    if paths.link_args_txt.exists() {
-        return Ok(fs::read_to_string(&paths.link_args_txt)?);
+    if let Ok(la_meta) = fs::metadata(&paths.link_args_txt)
+        && let Ok(la_mtime) = la_meta.modified()
+    {
+        let manifest_newer = fs::metadata(&opts.manifest_path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t > la_mtime);
+        let lock_newer = fs::metadata(opts.workspace_root.join("Cargo.lock"))
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t > la_mtime);
+        if !manifest_newer
+            && !lock_newer
+            && let Ok(txt) = fs::read_to_string(&paths.link_args_txt)
+        {
+            let objs_exist = txt
+                .lines()
+                .rfind(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang")))
+                .is_some_and(|line| {
+                    shell_words(line)
+                        .into_iter()
+                        .filter(|a| (a.ends_with(".rlib") || a.ends_with(".o")) && !a.contains("symbols.o"))
+                        .all(|a| Path::new(&a).exists())
+                });
+            if objs_exist {
+                return Ok(txt);
+            }
+        }
+        let _ = fs::remove_file(paths.out_bin.with_extension("base"));
     }
     let debug_dir = opts.workspace_root.join("target").join("debug");
     if opts.cfg_test {
@@ -554,6 +579,14 @@ fn prepare_link_script_and_symbols(
                 rlibs.push(PathBuf::from(a));
             }
         }
+        let base_bin = paths.out_bin.with_extension("base");
+        if let Ok(bm) = fs::metadata(&base_bin).and_then(|m| m.modified())
+            && rlibs.iter().any(|r| {
+                fs::metadata(r).and_then(|m| m.modified()).is_ok_and(|rm| rm > bm)
+            })
+        {
+            let _ = fs::remove_file(&base_bin);
+        }
     }
     rlibs.extend(sysroot_rlibs(&opts.workspace_root, opts.target.as_deref())?);
     Ok(rlibs)
@@ -643,7 +676,7 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
             let tail = fs::read_to_string(&paths.rustd_log).unwrap_or_default();
             bail!("rustd daemon exited early ({status}):\n{tail}");
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(10));
     }
     fs::write(&paths.pid_file, format!("{}\n", child.id()))?;
     eprintln!(
@@ -652,6 +685,7 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
         child.id(),
         paths.out_bin.display()
     );
+    let _ = send_unix_line(&paths.rustd_sock, "patch");
     Ok(())
 }
 

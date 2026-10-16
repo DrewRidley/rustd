@@ -340,83 +340,115 @@ impl WorkspaceBuildScripts {
             e.push('\n');
         };
 
+        let mut handle_line = |line: &str, cached_lines: Option<&mut Vec<String>>| -> bool {
+            let mut deserializer = serde_json::Deserializer::from_str(line);
+            deserializer.disable_recursion_limit();
+            let message = Message::deserialize(&mut deserializer)
+                .unwrap_or_else(|_| Message::TextLine(line.to_owned()));
+
+            let mut valid = true;
+            match message {
+                Message::BuildScriptExecuted(mut message) => {
+                    if let Some(cl) = cached_lines {
+                        cl.push(line.to_owned());
+                    }
+                    with_output_for(&message.package_id, &mut |name, data| {
+                        progress(format!("build script {name} run"));
+                        let cfgs = {
+                            let mut acc = Vec::new();
+                            for cfg in &message.cfgs {
+                                match crate::parse_cfg(cfg) {
+                                    Ok(it) => acc.push(it),
+                                    Err(err) => {
+                                        push_err(&format!(
+                                            "invalid cfg from cargo-metadata: {err}"
+                                        ));
+                                        return;
+                                    }
+                                };
+                            }
+                            acc
+                        };
+                        data.envs.extend(message.env.drain(..));
+                        let out_dir = mem::take(&mut message.out_dir);
+                        if !out_dir.as_str().is_empty() {
+                            if !std::path::Path::new(out_dir.as_str()).exists() {
+                                valid = false;
+                            }
+                            let out_dir = AbsPathBuf::assert(out_dir);
+                            data.envs.insert("OUT_DIR", out_dir.as_str());
+                            data.out_dir = Some(out_dir);
+                            data.cfgs = cfgs;
+                        }
+                    });
+                }
+                Message::CompilerArtifact(message) => {
+                    if let Some(cl) = cached_lines {
+                        cl.push(line.to_owned());
+                    }
+                    with_output_for(&message.package_id, &mut |name, data| {
+                        if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
+                            data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
+                        }
+                        if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
+                            && message
+                                .target
+                                .kind
+                                .contains(&cargo_metadata::TargetKind::ProcMacro)
+                        {
+                            progress(format!("proc-macro {name} built"));
+                            data.proc_macro_dylib_path =
+                                match message.filenames.iter().find(|file| is_dylib(file)) {
+                                    Some(filename) => {
+                                        if !std::path::Path::new(filename.as_str()).exists() {
+                                            valid = false;
+                                        }
+                                        let filename = AbsPath::assert(filename);
+                                        ProcMacroDylibPath::Path(filename.to_owned())
+                                    }
+                                    None => ProcMacroDylibPath::DylibNotFound,
+                                };
+                        }
+                    });
+                }
+                Message::CompilerMessage(message) => {
+                    progress(format!("received compiler message for: {}", message.target.name));
+
+                    if let Some(diag) = message.message.rendered.as_deref() {
+                        push_err(diag);
+                    }
+                }
+                Message::BuildFinished(_) => {}
+                Message::TextLine(_) => {}
+                _ => {}
+            }
+            valid
+        };
+
+        if let Ok(cache_path) = std::env::var("RUSTD_CACHE_BS")
+            && let Ok(expected_fp) = std::env::var("RUSTD_CACHE_FP")
+            && let Ok(text) = std::fs::read_to_string(&cache_path)
+            && let Some((fp_line, rest)) = text.split_once('\n')
+            && fp_line == expected_fp
+        {
+            let mut all_valid = true;
+            for line in rest.lines().filter(|l| !l.is_empty()) {
+                if !handle_line(line, None) {
+                    all_valid = false;
+                    break;
+                }
+            }
+            if all_valid {
+                return Ok(None);
+            }
+        }
+
         tracing::info!("Running build scripts: {:?}", cmd);
+        let mut recorded_lines = Vec::new();
         let output = stdx::process::spawn_with_streaming_output(
             cmd,
             &mut |line| {
-                // Copy-pasted from existing cargo_metadata. It seems like we
-                // should be using serde_stacker here?
-                let mut deserializer = serde_json::Deserializer::from_str(line);
-                deserializer.disable_recursion_limit();
-                let message = Message::deserialize(&mut deserializer)
-                    .unwrap_or_else(|_| Message::TextLine(line.to_owned()));
-
-                match message {
-                    Message::BuildScriptExecuted(mut message) => {
-                        with_output_for(&message.package_id, &mut |name, data| {
-                            progress(format!("build script {name} run"));
-                            let cfgs = {
-                                let mut acc = Vec::new();
-                                for cfg in &message.cfgs {
-                                    match crate::parse_cfg(cfg) {
-                                        Ok(it) => acc.push(it),
-                                        Err(err) => {
-                                            push_err(&format!(
-                                                "invalid cfg from cargo-metadata: {err}"
-                                            ));
-                                            return;
-                                        }
-                                    };
-                                }
-                                acc
-                            };
-                            data.envs.extend(message.env.drain(..));
-                            // cargo_metadata crate returns default (empty) path for
-                            // older cargos, which is not absolute, so work around that.
-                            let out_dir = mem::take(&mut message.out_dir);
-                            if !out_dir.as_str().is_empty() {
-                                let out_dir = AbsPathBuf::assert(out_dir);
-                                // inject_cargo_env(package, package_build_data);
-                                data.envs.insert("OUT_DIR", out_dir.as_str());
-                                data.out_dir = Some(out_dir);
-                                data.cfgs = cfgs;
-                            }
-                        });
-                    }
-                    Message::CompilerArtifact(message) => {
-                        with_output_for(&message.package_id, &mut |name, data| {
-                            if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
-                                data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
-                            }
-                            if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
-                                && message
-                                    .target
-                                    .kind
-                                    .contains(&cargo_metadata::TargetKind::ProcMacro)
-                            {
-                                progress(format!("proc-macro {name} built"));
-                                data.proc_macro_dylib_path =
-                                    match message.filenames.iter().find(|file| is_dylib(file)) {
-                                        Some(filename) => {
-                                            let filename = AbsPath::assert(filename);
-                                            ProcMacroDylibPath::Path(filename.to_owned())
-                                        }
-                                        None => ProcMacroDylibPath::DylibNotFound,
-                                    };
-                            }
-                        });
-                    }
-                    Message::CompilerMessage(message) => {
-                        progress(format!("received compiler message for: {}", message.target.name));
-
-                        if let Some(diag) = message.message.rendered.as_deref() {
-                            push_err(diag);
-                        }
-                    }
-                    Message::BuildFinished(_) => {}
-                    Message::TextLine(_) => {}
-                    _ => {}
-                }
+                let _ = handle_line(line, Some(&mut recorded_lines));
             },
             &mut |line| {
                 push_err(line);
@@ -427,6 +459,16 @@ impl WorkspaceBuildScripts {
             let errors = errors.into_inner();
             Some(if errors.is_empty() { "cargo check failed".to_owned() } else { errors })
         } else {
+            if let Ok(cache_path) = std::env::var("RUSTD_CACHE_BS")
+                && let Ok(fp) = std::env::var("RUSTD_CACHE_FP")
+            {
+                let mut buf = format!("{fp}\n");
+                for l in &recorded_lines {
+                    buf.push_str(l);
+                    buf.push('\n');
+                }
+                let _ = std::fs::write(&cache_path, buf);
+            }
             None
         };
         Ok(errors)
