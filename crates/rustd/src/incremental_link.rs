@@ -537,6 +537,7 @@ impl BinaryIndex {
         if buf.len() < 64 || &buf[0..4] != b"\x7fELF" {
             return None;
         }
+        let e_machine = read_u16_le(buf, 18)?;
         let e_shoff = read_u64_le(buf, 40)? as usize;
         let e_shentsize = read_u16_le(buf, 58)? as usize;
         let e_shnum = read_u16_le(buf, 60)? as usize;
@@ -601,10 +602,21 @@ impl BinaryIndex {
             } else if st_shndx == 0 {
                 let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
                 let sym_name = cstr.to_str().ok()?;
-                *got_slot = *self.symbols.get(sym_name)?;
+                *got_slot = self
+                    .symbols
+                    .get(sym_name)
+                    .copied()
+                    .or_else(|| {
+                        if sym_name.ends_with("STATIC_INNER_SLICE") {
+                            self.symbols.get("__rustd_sym_STATIC_INNER_SLICE").copied()
+                        } else {
+                            None
+                        }
+                    })?;
             }
         }
 
+        let mut abs_reloc_offs: Vec<u64> = Vec::new();
         for i in 0..e_shnum {
             let sh = e_shoff + i * e_shentsize;
             let sh_type = read_u32_le(buf, sh + 4)?;
@@ -627,24 +639,73 @@ impl BinaryIndex {
                 let loc_vm = code_base_vm + (loc_off as u64);
                 let sym_val = *got_table.get(r_sym)?;
                 match r_type {
-                    1 => {
+                    1 | 257 => {
                         let val = sym_val.wrapping_add(r_addend as u64);
                         code_buf
                             .get_mut(loc_off..loc_off + 8)?
                             .copy_from_slice(&val.to_le_bytes());
+                        abs_reloc_offs.push(loc_off as u64);
                     }
-                    2 | 4 => {
+                    2 | 4 | 261 => {
                         let val = (sym_val as i64).wrapping_add(r_addend).wrapping_sub(loc_vm as i64);
                         code_buf
                             .get_mut(loc_off..loc_off + 4)?
                             .copy_from_slice(&(val as i32).to_le_bytes());
                     }
                     9 | 41 | 42 => {
-                        let got_slot = (got_base_vm + (r_sym as u64) * 8) as i64;
-                        let val = got_slot.wrapping_add(r_addend).wrapping_sub(loc_vm as i64);
+                        // Relax x86_64 GOTPCREL `movq sym@GOTPCREL(%rip), %reg` (0x8b) to `leaq sym(%rip), %reg` (0x8d) when possible
+                        if loc_off >= 2 && code_buf.get(loc_off - 2) == Some(&0x8b) {
+                            code_buf[loc_off - 2] = 0x8d;
+                            let val =
+                                (sym_val as i64).wrapping_add(r_addend).wrapping_sub(loc_vm as i64);
+                            code_buf
+                                .get_mut(loc_off..loc_off + 4)?
+                                .copy_from_slice(&(val as i32).to_le_bytes());
+                        } else {
+                            return None;
+                        }
+                    }
+                    282 | 283 => {
+                        let t = sym_val.wrapping_add(r_addend as u64);
+                        let diff = ((t as i64) - (loc_vm as i64)) >> 2;
+                        if !(-0x0200_0000..0x0200_0000).contains(&diff) {
+                            return None;
+                        }
+                        let mut insn = read_u32_le(&code_buf, loc_off)?;
+                        insn = (insn & 0xfc00_0000) | ((diff as u32) & 0x03ff_ffff);
                         code_buf
                             .get_mut(loc_off..loc_off + 4)?
-                            .copy_from_slice(&(val as i32).to_le_bytes());
+                            .copy_from_slice(&insn.to_le_bytes());
+                    }
+                    275 | 311 => {
+                        let t = sym_val.wrapping_add(r_addend as u64);
+                        let page_diff = (((t & !0xfff) as i64) - ((loc_vm & !0xfff) as i64)) >> 12;
+                        let mut insn = read_u32_le(&code_buf, loc_off)?;
+                        insn = (insn & 0x9f00_001f)
+                            | (((page_diff as u32) & 0x3) << 29)
+                            | ((((page_diff >> 2) as u32) & 0x7ffff) << 5);
+                        code_buf
+                            .get_mut(loc_off..loc_off + 4)?
+                            .copy_from_slice(&insn.to_le_bytes());
+                    }
+                    277 | 278 | 284 | 285 | 286 | 299 => {
+                        let t = sym_val.wrapping_add(r_addend as u64);
+                        let off = (t & 0xfff) as u32;
+                        let mut insn = read_u32_le(&code_buf, loc_off)?;
+                        let scale = if (insn & 0x3b00_0000) == 0x3900_0000 { insn >> 30 } else { 0 };
+                        insn = (insn & !(0xfff << 10)) | (((off >> scale) & 0xfff) << 10);
+                        code_buf
+                            .get_mut(loc_off..loc_off + 4)?
+                            .copy_from_slice(&insn.to_le_bytes());
+                    }
+                    312 => {
+                        let t = sym_val.wrapping_add(r_addend as u64);
+                        let off = (t & 0xfff) as u32;
+                        let insn = read_u32_le(&code_buf, loc_off)?;
+                        let add_insn = 0x9100_0000u32 | (off << 10) | (insn & 0x3ff);
+                        code_buf
+                            .get_mut(loc_off..loc_off + 4)?
+                            .copy_from_slice(&add_insn.to_le_bytes());
                     }
                     _ => return None,
                 }
@@ -655,9 +716,17 @@ impl BinaryIndex {
             let code_file_off = self.vmaddr_to_fileoff(code_base_vm, code_buf.len() as u64)?;
             self.write_tracked(file, code_file_off, &code_buf, touched_pages)?;
         }
-        let mut got_bytes = Vec::with_capacity(got_table.len() * 8);
-        for &g in &got_table {
-            got_bytes.extend_from_slice(&g.to_le_bytes());
+        let mut header_words = Vec::with_capacity(3 + abs_reloc_offs.len());
+        header_words.push(0x5255_5354_445f_494eu64);
+        header_words.push(self.veneer_cave_vmaddr);
+        header_words.push(abs_reloc_offs.len() as u64);
+        header_words.extend_from_slice(&abs_reloc_offs);
+        if header_words.len() * 8 > 64 * 1024 {
+            return None;
+        }
+        let mut got_bytes = Vec::with_capacity(header_words.len() * 8);
+        for &w in &header_words {
+            got_bytes.extend_from_slice(&w.to_le_bytes());
         }
         if !got_bytes.is_empty() {
             let got_file_off = self.vmaddr_to_fileoff(got_base_vm, got_bytes.len() as u64)?;
@@ -669,8 +738,9 @@ impl BinaryIndex {
             let sp = sym_off + i * 24;
             let st_name = read_u32_le(buf, sp)? as usize;
             let st_info = *buf.get(sp + 4)?;
+            let st_other = *buf.get(sp + 5)?;
             let st_shndx = read_u16_le(buf, sp + 6)? as usize;
-            if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < e_shnum {
+            if (st_info >> 4) != 0 && (st_other & 0x3) == 0 && st_shndx != 0 && st_shndx < e_shnum {
                 let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
                 let sym_name = cstr.to_str().ok()?;
                 if sym_name.starts_with("rustd::") || sym_name.starts_with("rustd.patch::") {
@@ -682,13 +752,23 @@ impl BinaryIndex {
                     self.write_tracked(file, slot_off, &new_fn_vm.to_le_bytes(), touched_pages)?;
                     patched += 1;
                 } else if let Some(&orig_vm) = self.symbols.get(sym_name) {
-                    let orig_off = self.vmaddr_to_fileoff(orig_vm, 5)?;
-                    let rel = (new_fn_vm as i64) - ((orig_vm + 5) as i64);
-                    if (i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
-                        let rb = (rel as i32).to_le_bytes();
-                        let jmp = [0xe9, rb[0], rb[1], rb[2], rb[3]];
-                        self.write_tracked(file, orig_off, &jmp, touched_pages)?;
-                        patched += 1;
+                    if e_machine == 183 {
+                        let orig_off = self.vmaddr_to_fileoff(orig_vm, 4)?;
+                        let diff = ((new_fn_vm as i64) - (orig_vm as i64)) >> 2;
+                        if (-0x0200_0000..0x0200_0000).contains(&diff) {
+                            let b_insn = 0x1400_0000u32 | ((diff as u32) & 0x03ff_ffff);
+                            self.write_tracked(file, orig_off, &b_insn.to_le_bytes(), touched_pages)?;
+                            patched += 1;
+                        }
+                    } else {
+                        let orig_off = self.vmaddr_to_fileoff(orig_vm, 5)?;
+                        let rel = (new_fn_vm as i64) - ((orig_vm + 5) as i64);
+                        if (i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+                            let rb = (rel as i32).to_le_bytes();
+                            let jmp = [0xe9, rb[0], rb[1], rb[2], rb[3]];
+                            self.write_tracked(file, orig_off, &jmp, touched_pages)?;
+                            patched += 1;
+                        }
                     }
                 }
             }

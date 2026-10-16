@@ -502,6 +502,9 @@ fn prepare_link_script_and_symbols(
             format!("-B{}", paths.dir.display()),
             "-Wl,--allow-multiple-definition".to_owned(),
         ];
+        if !cfg!(target_os = "macos") {
+            wild_cc.push("-Wl,--export-dynamic".to_owned());
+        }
         wild_cc.extend_from_slice(&link_args[1..first_obj]);
         wild_cc.push(paths.rt_o.display().to_string());
         wild_cc.push(paths.patch_o.display().to_string());

@@ -440,7 +440,81 @@ fn build_sym_cache() -> HashMap<&'static str, usize> {
     map
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn build_sym_cache() -> HashMap<&'static str, usize> {
+    let mut map = HashMap::new();
+    let Ok(buf) = fs::read("/proc/self/exe") else { return map };
+    if buf.len() < 64 || &buf[0..4] != b"\x7fELF" {
+        return map;
+    }
+    let Some(e_shoff) = read_u64(&buf, 40).map(|v| v as usize) else { return map };
+    let Some(e_shentsize) = read_u16(&buf, 58).map(|v| v as usize) else { return map };
+    let Some(e_shnum) = read_u16(&buf, 60).map(|v| v as usize) else { return map };
+    let mut symtab_idx = None;
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        if read_u32(&buf, sh + 4) == Some(2) {
+            symtab_idx = Some(i);
+            break;
+        }
+    }
+    let Some(sym_sec) = symtab_idx else { return map };
+    let sym_sh = e_shoff + sym_sec * e_shentsize;
+    let Some(sym_off) = read_u64(&buf, sym_sh + 24).map(|v| v as usize) else { return map };
+    let Some(sym_size) = read_u64(&buf, sym_sh + 32).map(|v| v as usize) else { return map };
+    let Some(str_sec) = read_u32(&buf, sym_sh + 40).map(|v| v as usize) else { return map };
+    let str_sh = e_shoff + str_sec * e_shentsize;
+    let Some(str_off) = read_u64(&buf, str_sh + 24).map(|v| v as usize) else { return map };
+    let nsyms = sym_size / 24;
+
+    let mut unslid_cave = None;
+    for i in 1..nsyms {
+        let sp = sym_off + i * 24;
+        let Some(st_name) = read_u32(&buf, sp).map(|v| v as usize) else { continue };
+        let Some(st_shndx) = read_u16(&buf, sp + 6) else { continue };
+        let Some(st_value) = read_u64(&buf, sp + 8).map(|v| v as usize) else { continue };
+        if st_shndx == 0 || st_shndx >= 0xff00 || st_value == 0 {
+            continue;
+        }
+        let Some(tail) = buf.get(str_off + st_name..) else { continue };
+        let Ok(cstr) = CStr::from_bytes_until_nul(tail) else { continue };
+        if cstr.to_bytes() == b"VENEER_CAVE_START" {
+            unslid_cave = Some(st_value);
+            break;
+        }
+    }
+    let Some(cave_vm) = unslid_cave else { return map };
+    let rt_cave = (&raw const VENEER_CAVE_START.0) as usize;
+    let slide = (rt_cave as isize) - (cave_vm as isize);
+
+    map.reserve(nsyms);
+    for i in 1..nsyms {
+        let sp = sym_off + i * 24;
+        let Some(st_name) = read_u32(&buf, sp).map(|v| v as usize) else { continue };
+        let Some(&st_info) = buf.get(sp + 4) else { continue };
+        let Some(st_shndx) = read_u16(&buf, sp + 6) else { continue };
+        let Some(st_value) = read_u64(&buf, sp + 8).map(|v| v as usize) else { continue };
+        if st_shndx == 0 || st_shndx >= 0xff00 || st_value == 0 {
+            continue;
+        }
+        let Some(tail) = buf.get(str_off + st_name..) else { continue };
+        let Ok(cstr) = CStr::from_bytes_until_nul(tail) else { continue };
+        let Ok(raw) = cstr.to_str() else { continue };
+        if raw.is_empty() {
+            continue;
+        }
+        let leaked: &'static str = Box::leak(raw.to_owned().into_boxed_str());
+        let addr = ((st_value as isize) + slide) as usize;
+        if (st_info >> 4) != 0 {
+            map.insert(leaked, addr);
+        } else {
+            map.entry(leaked).or_insert(addr);
+        }
+    }
+    map
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn build_sym_cache() -> HashMap<&'static str, usize> {
     HashMap::new()
 }
@@ -781,8 +855,9 @@ fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
     for i in 1..nsyms {
         let sp = sym_off + i * 24;
         let st_info = *buf.get(sp + 4)?;
+        let st_other = *buf.get(sp + 5)?;
         let st_shndx = read_u16(buf, sp + 6)?;
-        if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < 0xff00 {
+        if (st_info >> 4) != 0 && (st_other & 0x3) == 0 && st_shndx != 0 && st_shndx < 0xff00 {
             has_defined_ext = true;
             break;
         }
@@ -856,12 +931,12 @@ fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
             let loc = unsafe { sec_base.add(r_offset) };
             let sym_val = unsafe { *got_base.add(r_sym) };
             match r_type {
-                1 => {
+                1 | 257 => {
                     unsafe {
                         (loc as *mut u64).write_unaligned(sym_val.wrapping_add(r_addend as u64));
                     }
                 }
-                2 | 4 => {
+                2 | 4 | 261 => {
                     let val = (sym_val as i64)
                         .wrapping_add(r_addend)
                         .wrapping_sub(loc as u64 as i64);
@@ -874,6 +949,48 @@ fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
                     let val = got_slot.wrapping_add(r_addend).wrapping_sub(loc as u64 as i64);
                     unsafe {
                         (loc as *mut i32).write_unaligned(val as i32);
+                    }
+                }
+                282 | 283 => {
+                    let t = sym_val.wrapping_add(r_addend as u64);
+                    let diff = ((t as i64) - (loc as u64 as i64)) >> 2;
+                    unsafe {
+                        let p = loc as *mut u32;
+                        let mut insn = p.read_unaligned();
+                        insn = (insn & 0xfc00_0000) | ((diff as u32) & 0x03ff_ffff);
+                        p.write_unaligned(insn);
+                    }
+                }
+                275 | 311 => {
+                    let t = if r_type == 311 {
+                        unsafe { got_base.add(r_sym) as u64 }
+                    } else {
+                        sym_val.wrapping_add(r_addend as u64)
+                    };
+                    let page_diff =
+                        (((t & !0xfff) as i64) - (((loc as u64) & !0xfff) as i64)) >> 12;
+                    unsafe {
+                        let p = loc as *mut u32;
+                        let mut insn = p.read_unaligned();
+                        insn = (insn & 0x9f00_001f)
+                            | (((page_diff as u32) & 0x3) << 29)
+                            | ((((page_diff >> 2) as u32) & 0x7ffff) << 5);
+                        p.write_unaligned(insn);
+                    }
+                }
+                277 | 278 | 284 | 285 | 286 | 299 | 312 => {
+                    let t = if r_type == 312 {
+                        unsafe { got_base.add(r_sym) as u64 }
+                    } else {
+                        sym_val.wrapping_add(r_addend as u64)
+                    };
+                    let off = (t & 0xfff) as u32;
+                    unsafe {
+                        let p = loc as *mut u32;
+                        let mut insn = p.read_unaligned();
+                        let scale = if (insn & 0x3b00_0000) == 0x3900_0000 { insn >> 30 } else { 0 };
+                        insn = (insn & !(0xfff << 10)) | (((off >> scale) & 0xfff) << 10);
+                        p.write_unaligned(insn);
                     }
                 }
                 _ => {
@@ -894,8 +1011,9 @@ fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
         let sp = sym_off + i * 24;
         let st_name = read_u32(buf, sp)? as usize;
         let st_info = *buf.get(sp + 4)?;
+        let st_other = *buf.get(sp + 5)?;
         let st_shndx = read_u16(buf, sp + 6)? as usize;
-        if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < e_shnum {
+        if (st_info >> 4) != 0 && (st_other & 0x3) == 0 && st_shndx != 0 && st_shndx < e_shnum {
             let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
             let sym_name = cstr.to_str().ok()?;
             if sym_name.starts_with("rustd::") || sym_name.starts_with("rustd.patch::") {
@@ -964,6 +1082,7 @@ fn watch_loop(patch_path: PathBuf) {
 extern "C" fn rustd_hotpatch_init() {
     std::hint::black_box((
         &raw const PATCH_DATA_CAVE,
+        &raw const __rustd_veneer_cave_end,
         &raw const __rustd_sym_STATIC_INNER_SLICE,
         __rustd_sym_memcpy as *const (),
         __rustd_sym_memmove as *const (),
