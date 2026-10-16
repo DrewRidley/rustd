@@ -1194,7 +1194,7 @@ fn build(
                                                     format!("`{fn_label}` (edited)")
                                                 });
                                         }
-                                        if is_local_trait && trait_impl_count <= 8 {
+                                        if is_local_trait && trait_impl_count <= 16 {
                                             global_impacted_fns.insert(fid);
                                             explain_reasons.entry(fid).or_insert_with(|| {
                                                 format!(
@@ -1289,7 +1289,7 @@ fn build(
                                 continue;
                             }
                             let deps = hir_ty::mir::codegen::function_deps(db, func);
-                            if (deps.local_callee_count > 20 || deps.adts.len() > 20)
+                            if deps.local_callee_count > 64
                                 && !hir_def::attrs::AttrFlags::query(db, func.into())
                                     .contains(hir_def::attrs::AttrFlags::IS_TEST)
                             {
@@ -1369,7 +1369,7 @@ fn build(
                                                 .or_insert_with(|| fn_why.clone());
                                         }
                                         if is_local_trait
-                                            && trait_impl_count <= 8
+                                            && trait_impl_count <= 16
                                             && test_reach.insert(fid)
                                         {
                                             explain_reasons.insert(fid, fn_why.clone());
@@ -2809,7 +2809,7 @@ fn run_backtest(
     hir::attach_db(db, || {
         for &f in &all_funcs {
             let deps = hir_ty::mir::codegen::function_deps(db, f);
-            if (deps.local_callee_count > 20 || deps.adts.len() > 20) && !is_test_set.contains(&f) {
+            if deps.local_callee_count > 64 && !is_test_set.contains(&f) {
                 continue;
             }
             for &c in &deps.callees {
