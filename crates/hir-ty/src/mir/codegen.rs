@@ -496,6 +496,9 @@ struct OwnStatics {
     unknown: FxHashSet<Crate>,
 }
 
+pub static EDITED_STATICS: std::sync::Mutex<Option<FxHashSet<StaticId>>> =
+    std::sync::Mutex::new(None);
+
 impl OwnStatics {
     fn new(
         db: &dyn HirDatabase,
@@ -548,6 +551,12 @@ impl OwnStatics {
     // FIXME: `#[used]` and `#[link_section]` statics are found by the linker or a runtime
     // through rustc's copy and should stay rustc's too.
     fn replaces(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+        if let Ok(guard) = EDITED_STATICS.lock()
+            && let Some(set) = &*guard
+            && set.contains(&id)
+        {
+            return true;
+        }
         self.owns(db, id)
             && !self.shared.contains(&id.krate(db))
             && !AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE)
@@ -903,27 +912,72 @@ pub fn function_tree_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
     hasher.finish()
 }
 
+#[derive(Default, PartialEq, Eq)]
+pub struct FunctionDeps {
+    pub adts: FxHashSet<hir_def::AdtId>,
+    pub callees: FxHashSet<FunctionId>,
+}
+
 #[salsa::tracked(returns(ref))]
-fn function_adts(db: &dyn HirDatabase, func: FunctionId) -> FxHashSet<hir_def::AdtId> {
+pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
     let infer = InferenceResult::of(db, func);
-    struct Collector(FxHashSet<hir_def::AdtId>);
-    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector {
+    struct Collector<'a>(&'a mut FunctionDeps);
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'_> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Adt(def, _) = ty.kind() {
-                self.0.insert(def.def_id());
+            match ty.kind() {
+                TyKind::Adt(def, _) => {
+                    self.0.adts.insert(def.def_id());
+                }
+                TyKind::FnDef(callable, _) => {
+                    if let CallableDefId::FunctionId(f) = callable.0 {
+                        self.0.callees.insert(f);
+                    }
+                }
+                _ => {}
             }
             rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self);
         }
     }
-    let mut collector = Collector(FxHashSet::default());
-    for (_, ty) in infer.type_of_expr.iter() {
-        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut collector);
+    let mut deps = FunctionDeps::default();
+    for (expr_id, ty) in infer.type_of_expr.iter() {
+        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps));
+        if let Some((f, _)) = infer.method_resolution(expr_id) {
+            deps.callees.insert(f);
+        }
+        if let Some((crate::method_resolution::CandidateId::FunctionId(f), _)) =
+            infer.assoc_resolutions_for_expr(expr_id)
+        {
+            deps.callees.insert(f);
+        }
     }
     for (_, ty) in infer.type_of_binding.iter() {
-        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut collector);
+        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps));
     }
-    collector.0
+    deps
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn function_path_idents(db: &dyn HirDatabase, func: FunctionId) -> FxHashSet<String> {
+    let body = hir_def::expr_store::Body::of(db, func.into());
+    let mut names = FxHashSet::default();
+    for (_, expr) in body.exprs() {
+        if let hir_def::hir::Expr::Path(path) = expr
+            && let Some(mp) = path.mod_path()
+            && let Some(last) = mp.segments().last()
+        {
+            names.insert(last.as_str().to_owned());
+        }
+    }
+    for (_, pat) in body.pats() {
+        if let hir_def::hir::Pat::Path(path) = pat
+            && let Some(mp) = path.mod_path()
+            && let Some(last) = mp.segments().last()
+        {
+            names.insert(last.as_str().to_owned());
+        }
+    }
+    names
 }
 
 pub fn function_mentions_adts(
@@ -934,8 +988,20 @@ pub fn function_mentions_adts(
     if adts.is_empty() {
         return false;
     }
-    let f_adts = function_adts(db, func);
+    let f_adts = &function_deps(db, func).adts;
     adts.iter().any(|adt| f_adts.contains(adt))
+}
+
+pub fn function_calls_any(
+    db: &dyn HirDatabase,
+    func: FunctionId,
+    targets: &FxHashSet<FunctionId>,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    let callees = &function_deps(db, func).callees;
+    targets.iter().any(|t| callees.contains(t))
 }
 
 #[salsa::tracked(returns(copy))]
@@ -2152,7 +2218,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
-        if compiled.writable && !self.own_statics.owns(db, id) {
+        if compiled.writable && !self.own_statics.owns(db, id) && !self.patching {
             let name = hir_def::signatures::StaticSignature::of(db, id).name.as_str();
             if name != "__CALLSITE" {
                 unsupported!("writable static `{name}` without a rustc symbol");
@@ -2175,7 +2241,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.own_static_order.push(id);
         match self.resolve(&compiled.requests) {
             Ok(ids) => {
-                self.fill_data(data, ids.blob(&compiled.blob))?;
+                let mut blob = ids.blob(&compiled.blob);
+                if self.patching && compiled.writable && self.statics.len() <= 1 {
+                    blob.align = blob.align.max(16384);
+                }
+                self.fill_data(data, blob)?;
                 Ok(data)
             }
             Err(e) => {
@@ -2241,19 +2311,29 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: &StoredParamEnvAndCrate,
         sig: &Signature,
     ) -> Result<FuncId> {
+        if let Some(&id) = self.instances.get(instance) {
+            return Ok(id);
+        }
         let (def, args) = (instance.def, instance.args.as_ref());
         if let InstanceDef::Fn(func) = def
-            && (args.is_empty()
-                || (!self.own_statics.crates.contains(&func.krate(self.db))
-                    && args
-                        .iter()
-                        .all(|a| a.ty().is_some_and(|t| matches!(t.kind(), TyKind::Adt(..))))))
+            && args.is_empty()
             && let Some(symbol) = self.symbols.function(func)
-            // rustc's copy of a function of another crate would hand out rustc's future.
-            && (self.own_statics.crates.contains(&func.krate(self.db))
-                || !returns_async_block(self.db, func))
+            // rustc's copy of a function would hand out rustc's future.
+            && !returns_async_block(self.db, func)
         {
             self.want(func);
+            return self.import(&symbol, sig);
+        }
+        if matches!(def, InstanceDef::DropGlue)
+            && self.patching
+            && let Some(ty) = args.first().and_then(|a| a.ty())
+            && !matches!(ty.kind(), TyKind::Adt(adt, _) if self.own_statics.crates.contains(&adt.def_id().krate(self.db)))
+            && let Some(ty_str) = self.symbol_type(ty)
+            && let Some(symbol) = self
+                .symbols
+                .path(&format!("core::ptr::drop_in_place::<{ty_str}>"))
+                .or_else(|| self.symbols.path(&format!("core::ptr::drop_in_place<{ty_str}>")))
+        {
             return self.import(&symbol, sig);
         }
         let signature = match def {
@@ -2431,7 +2511,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let forwarded = self.forwarded.contains(caller)
                     || matches!(caller.def, InstanceDef::Fn(func) if self
                         .instance_path(func, caller.args.as_ref())
-                        .is_some_and(|path| self.symbols.path(&path).is_some()));
+                        .is_some_and(|path| self.symbols.path(&path).is_some())
+                        || (!returns_async_block(self.db, func) && self.symbols.function(func).is_some()));
                 if !forwarded && seen.insert(caller.clone()) {
                     failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
                 }
@@ -2443,7 +2524,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// instance we cannot compile is still one we can call.
     fn forward_to_rustc(&mut self, instance: &Instance, id: FuncId) -> Option<()> {
         let InstanceDef::Fn(func) = instance.def else { return None };
-        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
+        let symbol = self
+            .instance_path(func, instance.args.as_ref())
+            .and_then(|path| self.symbols.path(&path))
+            .or_else(|| {
+                (!returns_async_block(self.db, func)).then(|| self.symbols.function(func)).flatten()
+            })?;
         let sig = self.module.declarations().get_function_decl(id).signature.clone();
         let target = self.import(&symbol, &sig).ok()?;
         let mut ctx = self.module.make_context();

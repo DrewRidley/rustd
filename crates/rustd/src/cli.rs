@@ -57,6 +57,7 @@ struct CliOpts {
     workspace_root: PathBuf,
     bin_name: String,
     pkg_name: Option<String>,
+    test_target: Option<String>,
     crates: Vec<String>,
     target: Option<String>,
     watch: bool,
@@ -181,6 +182,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let mut manifest = None;
     let mut bin_name = None;
     let mut pkg_name = None;
+    let mut test_target = None;
     let mut crates = Vec::new();
     let mut target = None;
     let mut watch = false;
@@ -199,6 +201,9 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             }
             "--bin" => {
                 bin_name = Some(it.next().context("--bin requires a name")?.clone());
+            }
+            "--test" => {
+                test_target = Some(it.next().context("--test requires a test target name")?.clone());
             }
             "-p" | "--package" if cfg_test => {
                 pkg_name = Some(it.next().context("-p requires a package name")?.clone());
@@ -232,12 +237,19 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let bin_name = if cfg_test {
         let pkg = pkg_name
             .clone()
+            .or_else(|| bin_name.clone())
             .or_else(|| infer_default_bin(&workspace_root))
             .context("could not infer package for `rustd test`; pass `-p <PACKAGE>`")?;
         if pkg_name.is_none() {
             pkg_name = Some(pkg.clone());
         }
-        format!("test-{}", pkg.replace('-', "_"))
+        if let Some(tt) = &test_target {
+            format!("test-{}", tt.replace('-', "_"))
+        } else if let Some(b) = &bin_name {
+            format!("test-bin-{}", b.replace('-', "_"))
+        } else {
+            format!("test-{}", pkg.replace('-', "_"))
+        }
     } else {
         match bin_name.or_else(|| infer_default_bin(&workspace_root)) {
             Some(b) => b,
@@ -249,6 +261,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         workspace_root,
         bin_name,
         pkg_name,
+        test_target,
         crates,
         target,
         watch,
@@ -349,8 +362,8 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
     let debug_dir = opts.workspace_root.join("target").join("debug");
     if opts.cfg_test {
         let pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
-        let krate = pkg.replace('-', "_");
-        eprintln!("Capturing test linker arguments via `cargo test --no-run -p {pkg} --lib`...");
+        let krate = opts.test_target.as_deref().unwrap_or(pkg).replace('-', "_");
+        eprintln!("Capturing test linker arguments via `cargo rustc --profile test -p {pkg}`...");
         if let Ok(entries) = fs::read_dir(debug_dir.join("deps")) {
             let prefix = format!("{krate}-");
             for e in entries.flatten() {
@@ -364,8 +377,15 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
             }
         }
         let mut cmd = Command::new("cargo");
-        cmd.current_dir(&opts.workspace_root)
-            .args(["rustc", "-p", pkg, "--lib", "--profile", "test"])
+        cmd.current_dir(&opts.workspace_root).args(["rustc", "-p", pkg]);
+        if let Some(tt) = &opts.test_target {
+            cmd.args(["--test", tt]);
+        } else if let Some(b) = opts.bin_name.strip_prefix("test-bin-") {
+            cmd.args(["--bin", b]);
+        } else {
+            cmd.arg("--lib");
+        }
+        cmd.args(["--profile", "test"])
             .env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
         if let Some(t) = &opts.target {
             cmd.args(["--target", t]);
@@ -540,7 +560,11 @@ fn prepare_link_script_and_symbols(
 }
 
 fn send_unix_line(sock: &Path, line: &str) -> anyhow::Result<String> {
-    let mut stream = UnixStream::connect(sock)?;
+    let connect_path = env::current_dir()
+        .ok()
+        .and_then(|cwd| sock.strip_prefix(cwd).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| sock.to_path_buf());
+    let mut stream = UnixStream::connect(&connect_path)?;
     stream.write_all(format!("{line}\n").as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
@@ -565,12 +589,16 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
         cmd.args(["--crate", c]);
     }
     let bin_crate = opts
-        .pkg_name
+        .test_target
         .as_deref()
+        .or(opts.pkg_name.as_deref())
         .unwrap_or(&opts.bin_name)
         .replace('-', "_");
     if opts.cfg_test {
         cmd.arg("--cfg-test");
+    }
+    if let Some(pkg) = &opts.pkg_name {
+        cmd.env("RUSTD_PKG", pkg);
     }
     cmd.arg("--out")
         .arg(&paths.base_o)

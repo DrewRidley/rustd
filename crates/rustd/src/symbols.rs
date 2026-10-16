@@ -176,6 +176,186 @@ impl SymbolTable {
         Ok(table)
     }
 
+    pub(crate) fn load_cached(
+        files: &[PathBuf],
+        root: &Path,
+        cache_path: Option<&Path>,
+    ) -> anyhow::Result<SymbolTable> {
+        let fp = Self::files_fingerprint(files);
+        if let Some(cp) = cache_path
+            && let Ok(bytes) = std::fs::read(cp)
+            && let Some(table) = Self::from_cache_bytes(&bytes, fp)
+        {
+            return Ok(table);
+        }
+        let table = Self::load(files, root)?;
+        if let Some(cp) = cache_path {
+            let _ = std::fs::write(cp, table.to_cache_bytes(fp));
+        }
+        Ok(table)
+    }
+
+    fn files_fingerprint(files: &[PathBuf]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        files.len().hash(&mut h);
+        for f in files {
+            f.hash(&mut h);
+            if let Ok(m) = std::fs::metadata(f) {
+                m.len().hash(&mut h);
+                if let Ok(t) = m.modified()
+                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+                {
+                    d.as_nanos().hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+
+    fn to_cache_bytes(&self, fp: u64) -> Vec<u8> {
+        fn put_u32(out: &mut Vec<u8>, v: u32) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put_u64(out: &mut Vec<u8>, v: u64) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put_str(out: &mut Vec<u8>, s: &str) {
+            put_u32(out, s.len() as u32);
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+            match v {
+                Some(x) => {
+                    out.push(1);
+                    put_u64(out, x);
+                }
+                None => out.push(0),
+            }
+        }
+        let mut out = Vec::with_capacity(256 * 1024);
+        out.extend_from_slice(b"RUSTDSYM");
+        put_u64(&mut out, fp);
+        put_u32(&mut out, self.by_path.len() as u32);
+        for (k, list) in &self.by_path {
+            put_str(&mut out, k);
+            put_u32(&mut out, list.len() as u32);
+            for item in list {
+                put_str(&mut out, &item.name);
+                put_opt_u64(&mut out, item.place);
+            }
+        }
+        put_u32(&mut out, self.nested.len() as u32);
+        for (k, list) in &self.nested {
+            put_str(&mut out, k);
+            put_u32(&mut out, list.len() as u32);
+            for item in list {
+                put_str(&mut out, &item.name);
+                put_u32(&mut out, item.closures.len() as u32);
+                for &c in &item.closures {
+                    put_u32(&mut out, c);
+                }
+                put_opt_u64(&mut out, item.place);
+            }
+        }
+        put_u32(&mut out, self.crates.len() as u32);
+        for (k, &v) in &self.crates {
+            put_str(&mut out, k);
+            put_opt_u64(&mut out, v);
+        }
+        put_u32(&mut out, self.by_root.len() as u32);
+        for (k, &v) in &self.by_root {
+            put_str(&mut out, &k.to_string_lossy());
+            put_u64(&mut out, v);
+        }
+        out
+    }
+
+    fn from_cache_bytes(buf: &[u8], expected_fp: u64) -> Option<Self> {
+        if buf.len() < 16 || &buf[0..8] != b"RUSTDSYM" {
+            return None;
+        }
+        let mut pos = 8usize;
+        let get_u8 = |pos: &mut usize| -> Option<u8> {
+            let v = *buf.get(*pos)?;
+            *pos += 1;
+            Some(v)
+        };
+        let get_u32 = |pos: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(buf.get(*pos..*pos + 4)?.try_into().ok()?);
+            *pos += 4;
+            Some(v)
+        };
+        let get_u64 = |pos: &mut usize| -> Option<u64> {
+            let v = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
+            *pos += 8;
+            Some(v)
+        };
+        let get_str = |pos: &mut usize| -> Option<String> {
+            let len = get_u32(pos)? as usize;
+            let s = std::str::from_utf8(buf.get(*pos..*pos + len)?).ok()?.to_owned();
+            *pos += len;
+            Some(s)
+        };
+        let get_opt_u64 = |pos: &mut usize| -> Option<Option<u64>> {
+            match get_u8(pos)? {
+                0 => Some(None),
+                1 => Some(Some(get_u64(pos)?)),
+                _ => None,
+            }
+        };
+        if get_u64(&mut pos)? != expected_fp {
+            return None;
+        }
+        let mut table = SymbolTable::default();
+        let n_path = get_u32(&mut pos)? as usize;
+        table.by_path.reserve(n_path);
+        for _ in 0..n_path {
+            let k = get_str(&mut pos)?;
+            let count = get_u32(&mut pos)? as usize;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = get_str(&mut pos)?;
+                let place = get_opt_u64(&mut pos)?;
+                list.push(Placed { name, place });
+            }
+            table.by_path.insert(k, list);
+        }
+        let n_nested = get_u32(&mut pos)? as usize;
+        table.nested.reserve(n_nested);
+        for _ in 0..n_nested {
+            let k = get_str(&mut pos)?;
+            let count = get_u32(&mut pos)? as usize;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = get_str(&mut pos)?;
+                let c_len = get_u32(&mut pos)? as usize;
+                let mut closures = Vec::with_capacity(c_len);
+                for _ in 0..c_len {
+                    closures.push(get_u32(&mut pos)?);
+                }
+                let place = get_opt_u64(&mut pos)?;
+                list.push(NestedSymbol { name, closures, place });
+            }
+            table.nested.insert(k, list);
+        }
+        let n_crates = get_u32(&mut pos)? as usize;
+        table.crates.reserve(n_crates);
+        for _ in 0..n_crates {
+            let k = get_str(&mut pos)?;
+            let v = get_opt_u64(&mut pos)?;
+            table.crates.insert(k, v);
+        }
+        let n_roots = get_u32(&mut pos)? as usize;
+        table.by_root.reserve(n_roots);
+        for _ in 0..n_roots {
+            let k = PathBuf::from(get_str(&mut pos)?);
+            let v = get_u64(&mut pos)?;
+            table.by_root.insert(k, v);
+        }
+        Some(table)
+    }
+
     pub(crate) fn filter_to_binary(&mut self, bin_path: &Path) {
         let Ok(data) = std::fs::read(bin_path) else { return };
         let Ok(object) = object::File::parse(&*data) else { return };

@@ -101,7 +101,16 @@ impl BinaryIndex {
                 symbols.insert(name.to_owned(), sym.address());
             }
         }
-        for c_sym in ["memcpy", "memmove", "memset", "memcmp"] {
+        for c_sym in [
+            "memcpy",
+            "memmove",
+            "memset",
+            "memcmp",
+            "__rust_u128_mulo",
+            "__rust_i128_mulo",
+            "__udivti3",
+            "__umodti3",
+        ] {
             if let Some(&addr) = symbols.get(&format!("__rustd_sym_{c_sym}")) {
                 symbols.entry(c_sym.to_owned()).or_insert(addr);
             }
@@ -286,9 +295,9 @@ impl BinaryIndex {
 
         let seg_vmsize = (vmsize + 15) & !15;
         let got_size = nsyms * 8;
-        // Bytes 65536..262144 (192 KB) of VENEER_CAVE_START hold patch sections;
-        // PATCH_DATA_CAVE (64 KB) holds the GOT table.
-        if seg_vmsize > 192 * 1024 || got_size > 64 * 1024 {
+        // Bytes 65536..2097152 (1984 KB) of VENEER_CAVE_START hold patch sections;
+        // PATCH_DATA_CAVE (256 KB) holds the GOT table.
+        if seg_vmsize > 1984 * 1024 || got_size > 256 * 1024 {
             return None;
         }
 
@@ -394,8 +403,8 @@ impl BinaryIndex {
                             abs_reloc_offs.push(loc_off as u64);
                         }
                     }
-                    3 | 5 => {
-                        // Relax GOT_LOAD_PAGE21 (5) to PC-relative PAGE21 (3) against `target`.
+                    3 | 5 | 8 => {
+                        // Relax GOT_LOAD_PAGE21 (5) / TLVP_LOAD_PAGE21 (8) to PC-relative PAGE21 (3) against `target`.
                         let t = target.wrapping_add(pending_addend as u64);
                         let page_diff = (((t & !0xfff) as i64) - ((loc_vm & !0xfff) as i64)) >> 12;
                         let mut insn = read_u32_le(&code_buf, loc_off)?;
@@ -416,8 +425,8 @@ impl BinaryIndex {
                             .get_mut(loc_off..loc_off + 4)?
                             .copy_from_slice(&insn.to_le_bytes());
                     }
-                    6 => {
-                        // Relax GOT_LOAD_PAGEOFF12 (6) `ldr xd, [xn, #off]` into `add xd, xn, #off`.
+                    6 | 9 => {
+                        // Relax GOT_LOAD_PAGEOFF12 (6) / TLVP_LOAD_PAGEOFF12 (9) `ldr xd, [xn, #off]` into `add xd, xn, #off`.
                         let t = target.wrapping_add(pending_addend as u64);
                         let off = (t & 0xfff) as u32;
                         let insn = read_u32_le(&code_buf, loc_off)?;
@@ -572,7 +581,7 @@ impl BinaryIndex {
 
         let seg_vmsize = (total_size + 15) & !15;
         let got_size = nsyms * 8;
-        if seg_vmsize > 192 * 1024 || got_size > 64 * 1024 {
+        if seg_vmsize > 1984 * 1024 || got_size > 256 * 1024 {
             return None;
         }
 

@@ -31,22 +31,22 @@ use std::{
 static RUSTD_HOTPATCH_INIT: extern "C" fn() = rustd_hotpatch_init;
 
 #[repr(C, align(16384))]
-pub struct VeneerCave([u32; 65536]);
+pub struct VeneerCave([u32; 524288]);
 
 #[used]
 #[unsafe(no_mangle)]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__TEXT,__text"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".text"))]
-pub static VENEER_CAVE_START: VeneerCave = VeneerCave([0xd503_201f; 65536]);
+pub static VENEER_CAVE_START: VeneerCave = VeneerCave([0xd503_201f; 524288]);
 
 #[repr(C, align(16384))]
-pub struct DataCave([u64; 8192]);
+pub struct DataCave([u64; 32768]);
 
 #[used]
 #[unsafe(no_mangle)]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__data"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".data"))]
-pub static PATCH_DATA_CAVE: DataCave = DataCave([0; 8192]);
+pub static PATCH_DATA_CAVE: DataCave = DataCave([0; 32768]);
 
 unsafe extern "C" {
     static __rustd_veneer_cave_end: u32;
@@ -323,6 +323,30 @@ extern "C" fn fallback_fixunssfti(x: f32) -> u128 {
     x as u128
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rustd_sym___rust_u128_mulo(a: u128, b: u128, oflow: *mut i32) -> u128 {
+    let (res, ov) = a.overflowing_mul(b);
+    unsafe { *oflow = i32::from(ov) };
+    res
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rustd_sym___rust_i128_mulo(a: i128, b: i128, oflow: *mut i32) -> i128 {
+    let (res, ov) = a.overflowing_mul(b);
+    unsafe { *oflow = i32::from(ov) };
+    res
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __rustd_sym___udivti3(a: u128, b: u128) -> u128 {
+    a.wrapping_div(b)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __rustd_sym___umodti3(a: u128, b: u128) -> u128 {
+    a.wrapping_rem(b)
+}
+
 #[repr(C, align(16))]
 pub struct StaticInnerSlice([usize; 4]);
 #[used]
@@ -527,6 +551,10 @@ fn lookup_symbol(name: &str) -> *mut c_void {
         "memmove" => return __rustd_sym_memmove as *mut c_void,
         "memset" => return __rustd_sym_memset as *mut c_void,
         "memcmp" => return __rustd_sym_memcmp as *mut c_void,
+        "__rust_u128_mulo" => return __rustd_sym___rust_u128_mulo as *mut c_void,
+        "__rust_i128_mulo" => return __rustd_sym___rust_i128_mulo as *mut c_void,
+        "__udivti3" => return __rustd_sym___udivti3 as *mut c_void,
+        "__umodti3" => return __rustd_sym___umodti3 as *mut c_void,
         "__fixdfti" => return fallback_fixdfti as *mut c_void,
         "__fixunsdfti" => return fallback_fixunsdfti as *mut c_void,
         "__fixsfti" => return fallback_fixsfti as *mut c_void,
@@ -726,8 +754,8 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                         }
                     }
                 }
-                3 | 5 => {
-                    let t = if r_type == 5 {
+                3 | 5 | 8 => {
+                    let t = if r_type == 5 || r_type == 8 {
                         unsafe { got_base.add(r_symbolnum) as u64 }
                     } else {
                         target.wrapping_add(pending_addend as u64)
@@ -743,8 +771,8 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                         p.write_unaligned(insn);
                     }
                 }
-                4 | 6 => {
-                    let t = if r_type == 6 {
+                4 | 6 | 9 => {
+                    let t = if r_type == 6 || r_type == 9 {
                         unsafe { got_base.add(r_symbolnum) as u64 }
                     } else {
                         target.wrapping_add(pending_addend as u64)
@@ -777,9 +805,17 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
         }
     }
 
+    let max_exec_end = sects
+        .iter()
+        .filter(|s| (s.flags & 0x8000_0000) != 0)
+        .map(|s| s.addr + s.size)
+        .max()
+        .unwrap_or(seg_vmsize);
+    let rx_size = ((max_exec_end + 16383) & !16383).min(alloc_size);
+
     unsafe {
-        sys_icache_invalidate(jit as *const c_void, alloc_size);
-        mprotect(jit as *mut c_void, alloc_size, PROT_READ | PROT_EXEC);
+        sys_icache_invalidate(jit as *const c_void, rx_size);
+        mprotect(jit as *mut c_void, rx_size, PROT_READ | PROT_EXEC);
     }
 
     let mut patched = 0usize;

@@ -162,7 +162,14 @@ impl Resolver<'_> {
         let Some(assoc) = func.as_assoc_item(self.db) else {
             return self.item_path(func.module(self.db), name.as_str());
         };
-        let AssocItemContainer::Impl(imp) = assoc.container(self.db) else { return None };
+        let imp = match assoc.container(self.db) {
+            AssocItemContainer::Impl(imp) => imp,
+            AssocItemContainer::Trait(trait_) => {
+                let trait_path =
+                    self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
+                return Some(format!("{trait_path}::{}", name.as_str()));
+            }
+        };
         let self_ty = self.type_path(&imp.self_ty(self.db))?;
         match imp.trait_(self.db) {
             Some(trait_) => {
@@ -414,7 +421,15 @@ impl SymbolResolver for Resolver<'_> {
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
-        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+        let root = self.crate_root(krate);
+        root.as_deref()
+            .and_then(|r| self.table.stable_crate_id(name.crate_name().as_str(), r))
+            .or_else(|| {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                name.crate_name().as_str().hash(&mut h);
+                Some(h.finish())
+            })
     }
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
@@ -680,8 +695,14 @@ fn built_features(
     cargo_config: &CargoConfig,
 ) -> anyhow::Result<FxHashMap<(String, String), std::collections::BTreeSet<String>>> {
     let mut command = Command::new("cargo");
-    command.args(["tree", "--edges", "normal", "--prefix", "none", "--format", "{p}|{f}"]);
+    let edges = if cargo_config.set_test { "normal,dev" } else { "normal" };
+    command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
     command.arg("--manifest-path").arg(manifest);
+    if let Ok(pkg) = std::env::var("RUSTD_PKG")
+        && !pkg.is_empty()
+    {
+        command.args(["-p", &pkg]);
+    }
     if let CargoFeatures::Selected { features, .. } = &cargo_config.features
         && !features.is_empty()
     {
@@ -927,6 +948,7 @@ fn build(
     dirty_files: &FxHashSet<vfs::FileId>,
     initial_serials: &FxHashMap<FunctionId, u64>,
     changed_adts: &FxHashSet<hir_def::AdtId>,
+    changed_const_names: &FxHashSet<String>,
     is_cold: bool,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
@@ -954,53 +976,125 @@ fn build(
         let mut e = Vec::new();
         let mut o = Vec::new();
         let mut seen_crates = FxHashSet::default();
+        let mut candidate_crates = Vec::new();
         for &file in dirty_files {
             for &krate in ide_db::base_db::relevant_crates(db, file) {
                 if seen_crates.insert(krate) {
-                    let c = Crate::from(krate);
-                    local.push(c);
-                    let l = listed.of(db, c);
-                    if !changed_adts.is_empty() {
-                        let threads =
-                            std::thread::available_parallelism().map_or(1, |it| it.get());
-                        std::thread::scope(|scope| {
-                            for part in 0..threads.min(l.functions.len()) {
-                                let (db, funcs) = (db.clone(), &l.functions);
-                                scope.spawn(move || {
-                                    hir::attach_db(&db, || {
-                                        for &func in funcs.iter().skip(part).step_by(threads) {
-                                            let _ = hir_ty::mir::codegen::function_mentions_adts(
-                                                &db,
-                                                func,
-                                                changed_adts,
-                                            );
-                                        }
-                                    });
-                                });
-                            }
+                    candidate_crates.push(Crate::from(krate));
+                }
+            }
+        }
+        if !dirty_files.is_empty()
+            && let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
+            && let Ok(bin_crates) = crates_named(db, &bc)
+        {
+            for bc_krate in bin_crates {
+                if seen_crates.insert(bc_krate.into()) {
+                    let l = listed.of(db, bc_krate);
+                    if l.functions.len() <= 500 {
+                        candidate_crates.push(bc_krate);
+                    }
+                }
+            }
+        }
+        let mut global_need_callers = FxHashSet::default();
+        for c in candidate_crates {
+            local.push(c);
+            let l = listed.of(db, c);
+            let warm_deps = |db: &RootDatabase, funcs: &[FunctionId]| {
+                let threads =
+                    std::thread::available_parallelism().map_or(1, |it| it.get());
+                std::thread::scope(|scope| {
+                    for part in 0..threads.min(funcs.len()) {
+                        let db = db.clone();
+                        scope.spawn(move || {
+                            hir::attach_db(&db, || {
+                                for &func in funcs.iter().skip(part).step_by(threads) {
+                                    let _ =
+                                        hir_ty::mir::codegen::function_deps(&db, func);
+                                }
+                            });
                         });
                     }
-                    hir::attach_db(db, || {
+                });
+            };
+            if !changed_adts.is_empty() || !global_need_callers.is_empty() {
+                warm_deps(db, &l.functions);
+            }
+            let mut direct_changed = FxHashSet::default();
+            let mut need_callers = global_need_callers.clone();
+            hir::attach_db(db, || {
+                for &func in &l.functions {
+                    let f = func
+                        .lookup(db)
+                        .id
+                        .file_id
+                        .original_file_respecting_includes(db)
+                        .file_id(db);
+                    let in_dirty_changed = dirty_files.contains(&f)
+                        && initial_serials.get(&func).is_none_or(|&orig_s| {
+                            hir_ty::mir::codegen::function_tree_serial(db, func) != orig_s
+                        });
+                    let touches_changed_const = !changed_const_names.is_empty()
+                        && {
+                            let idents =
+                                hir_ty::mir::codegen::function_path_idents(db, func);
+                            changed_const_names.iter().any(|n| idents.contains(n))
+                        };
+                    let touches_changed_adt =
+                        hir_ty::mir::codegen::function_mentions_adts(db, func, changed_adts);
+                    if in_dirty_changed || touches_changed_const || touches_changed_adt {
+                        direct_changed.insert(func);
+                        if resolver.function(func).is_none()
+                            || hir_def::signatures::FunctionSignature::of(db, func).is_async()
+                            || hir_def::attrs::AttrFlags::query(db, func.into())
+                                .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE)
+                        {
+                            need_callers.insert(func);
+                        }
+                    }
+                }
+            });
+            if !need_callers.is_empty() {
+                if changed_adts.is_empty() && global_need_callers.is_empty() {
+                    warm_deps(db, &l.functions);
+                }
+                hir::attach_db(db, || {
+                    for _ in 0..3 {
+                        let mut newly_added = Vec::new();
                         for &func in &l.functions {
-                            let f = func
-                                .lookup(db)
-                                .id
-                                .file_id
-                                .original_file_respecting_includes(db)
-                                .file_id(db);
-                            let in_dirty_changed = dirty_files.contains(&f)
-                                && initial_serials.get(&func).is_none_or(|&orig_s| {
-                                    hir_ty::mir::codegen::function_tree_serial(db, func) != orig_s
-                                });
-                            let touches_changed_adt =
-                                hir_ty::mir::codegen::function_mentions_adts(db, func, changed_adts);
-                            if in_dirty_changed || touches_changed_adt {
-                                e.push(func);
-                            } else if resolver.path(func).is_none() {
-                                o.push(func);
+                            if !direct_changed.contains(&func)
+                                && hir_ty::mir::codegen::function_calls_any(
+                                    db,
+                                    func,
+                                    &need_callers,
+                                )
+                            {
+                                newly_added.push(func);
                             }
                         }
-                    });
+                        if newly_added.is_empty() {
+                            break;
+                        }
+                        for f in newly_added {
+                            direct_changed.insert(f);
+                            if resolver.function(f).is_none()
+                                || hir_def::signatures::FunctionSignature::of(db, f).is_async()
+                                || hir_def::attrs::AttrFlags::query(db, f.into())
+                                    .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE)
+                            {
+                                need_callers.insert(f);
+                            }
+                        }
+                    }
+                });
+            }
+            global_need_callers.extend(need_callers);
+            for &func in &l.functions {
+                if direct_changed.contains(&func) {
+                    e.push(func);
+                } else if resolver.path(func).is_none() {
+                    o.push(func);
                 }
             }
         }
@@ -1234,10 +1328,82 @@ struct AdtSnapshot {
     variants: usize,
 }
 
-fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FxHashMap<String, AdtSnapshot> {
-    let mut map = FxHashMap::default();
+#[derive(Clone, Default)]
+struct FileSnapshot {
+    adts: FxHashMap<String, AdtSnapshot>,
+    consts: FxHashMap<String, (u64, Option<StaticId>)>,
+}
+
+fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FileSnapshot {
+    use std::hash::{Hash, Hasher};
+    let mut adts = FxHashMap::default();
+    let mut consts = FxHashMap::default();
     let sema = hir::Semantics::new(db);
-    for module in sema.file_to_module_defs(file) {
+    let mut modules: Vec<hir::Module> = sema.file_to_module_defs(file).collect();
+    let mut seen_mods = FxHashSet::default();
+    while let Some(module) = modules.pop() {
+        let mod_id = hir_def::ModuleId::from(module);
+        if !seen_mods.insert(mod_id) {
+            continue;
+        }
+        let scope = mod_id.def_map(db).module(db, mod_id).scope(db);
+        for decl in scope.declarations() {
+            match decl {
+                ModuleDefId::ModuleId(child) => {
+                    let child_mod = hir::Module::from(child);
+                    if child_mod
+                        .definition_source_file_id(db)
+                        .original_file_respecting_includes(db)
+                        .file_id(db)
+                        == file
+                    {
+                        modules.push(child_mod);
+                    }
+                }
+                ModuleDefId::ConstId(c) => {
+                    if let Some(name) = hir::Const::from(c)
+                        .name(db)
+                        .map(|n| n.display(db, syntax::Edition::CURRENT).to_string())
+                    {
+                        let def: DefWithBodyId = c.into();
+                        let mut hasher = rustc_hash::FxHasher::default();
+                        Body::of(db, def)
+                            .pretty_print(db, def, syntax::Edition::CURRENT)
+                            .hash(&mut hasher);
+                        consts.insert(name, (hasher.finish(), None));
+                    }
+                }
+                ModuleDefId::StaticId(s) => {
+                    let name = hir::Static::from(s)
+                        .name(db)
+                        .display(db, syntax::Edition::CURRENT)
+                        .to_string();
+                    let def: DefWithBodyId = s.into();
+                    let mut hasher = rustc_hash::FxHasher::default();
+                    Body::of(db, def)
+                        .pretty_print(db, def, syntax::Edition::CURRENT)
+                        .hash(&mut hasher);
+                    consts.insert(name, (hasher.finish(), Some(s)));
+                }
+                _ => {}
+            }
+        }
+        for imp in scope.impls() {
+            for &(_, item) in imp.impl_items(db).items.iter() {
+                if let AssocItemId::ConstId(c) = item
+                    && let Some(name) = hir::Const::from(c)
+                        .name(db)
+                        .map(|n| n.display(db, syntax::Edition::CURRENT).to_string())
+                {
+                    let def: DefWithBodyId = c.into();
+                    let mut hasher = rustc_hash::FxHasher::default();
+                    Body::of(db, def)
+                        .pretty_print(db, def, syntax::Edition::CURRENT)
+                        .hash(&mut hasher);
+                    consts.insert(name, (hasher.finish(), None));
+                }
+            }
+        }
         for decl in module.declarations(db) {
             let ModuleDef::Adt(adt) = decl else { continue };
             let name = adt.name(db).display(db, syntax::Edition::CURRENT).to_string();
@@ -1275,7 +1441,7 @@ fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FxHashMap<String,
                     e.variants(db).len(),
                 ),
             };
-            map.insert(
+            adts.insert(
                 name,
                 AdtSnapshot {
                     id: hir_def::AdtId::from(adt),
@@ -1287,22 +1453,24 @@ fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FxHashMap<String,
             );
         }
     }
-    map
+    FileSnapshot { adts, consts }
 }
 
 fn detect_adt_layout_warnings(
     db: &RootDatabase,
     dirty_files: &FxHashSet<vfs::FileId>,
-    initial_adts: &FxHashMap<vfs::FileId, FxHashMap<String, AdtSnapshot>>,
-) -> (Vec<String>, FxHashSet<hir_def::AdtId>) {
+    initial_adts: &FxHashMap<vfs::FileId, FileSnapshot>,
+) -> (Vec<String>, FxHashSet<hir_def::AdtId>, FxHashSet<String>) {
     let mut warnings = Vec::new();
     let mut changed_adts = FxHashSet::default();
+    let mut changed_consts = FxHashSet::default();
+    let mut edited_statics = FxHashSet::default();
     hir::attach_db(db, || {
         for &file in dirty_files {
-            let Some(orig_map) = initial_adts.get(&file) else { continue };
-            let cur_map = snapshot_file_adts(db, file);
-            for (name, orig) in orig_map {
-                if let Some(cur) = cur_map.get(name)
+            let Some(orig_snap) = initial_adts.get(&file) else { continue };
+            let cur_snap = snapshot_file_adts(db, file);
+            for (name, orig) in &orig_snap.adts {
+                if let Some(cur) = cur_snap.adts.get(name)
                     && (cur.size != orig.size
                         || cur.align != orig.align
                         || cur.fields != orig.fields
@@ -1316,9 +1484,22 @@ fn detect_adt_layout_warnings(
                     ));
                 }
             }
+            for (name, &(orig_h, _)) in &orig_snap.consts {
+                if let Some(&(cur_h, cur_stat)) = cur_snap.consts.get(name)
+                    && cur_h != orig_h
+                {
+                    changed_consts.insert(name.clone());
+                    if let Some(s) = cur_stat {
+                        edited_statics.insert(s);
+                    }
+                }
+            }
         }
     });
-    (warnings, changed_adts)
+    if let Ok(mut guard) = hir_ty::mir::codegen::EDITED_STATICS.lock() {
+        *guard = (!edited_statics.is_empty()).then_some(edited_statics);
+    }
+    (warnings, changed_adts, changed_consts)
 }
 
 /// Something written in one of the edited files that cargo turns the crate down for. Nothing
@@ -1490,6 +1671,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
                 &FxHashSet::default(),
                 &FxHashMap::default(),
                 &FxHashSet::default(),
+                &FxHashSet::default(),
                 true,
             )
         }));
@@ -1554,9 +1736,19 @@ fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
 }
 
 fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path, root: &Path) -> anyhow::Result<()> {
+    let rt_o = base_o.with_extension("rt.o");
+    let cave_o = base_o.with_extension("cave.o");
+    if let Ok(rt_m) = std::fs::metadata(&rt_o).and_then(|m| m.modified())
+        && cave_o.exists()
+        && let Ok(exe_m) = std::env::current_exe()
+            .and_then(|p| std::fs::metadata(p))
+            .and_then(|m| m.modified())
+        && rt_m >= exe_m
+    {
+        return Ok(());
+    }
     let rt_src = include_str!("hotpatch_rt.rs");
     let rt_rs = base_o.with_extension("rt.rs");
-    let rt_o = base_o.with_extension("rt.o");
     std::fs::write(&rt_rs, rt_src)?;
     let abs_patch = std::env::current_dir()?.join(patch_o);
     let status = Command::new("rustc")
@@ -1580,7 +1772,6 @@ fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path, root: &Path) -> anyhow::Res
     let _ = std::fs::remove_file(&rt_rs);
 
     let cave_rs = base_o.with_extension("cave.rs");
-    let cave_o = base_o.with_extension("cave.o");
     std::fs::write(
         &cave_rs,
         "#[repr(C, align(1))] pub struct Cave([u8; 81920]);\n\
@@ -1653,9 +1844,10 @@ fn main() -> anyhow::Result<()> {
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
     let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
+    let sym_cache_path = (!args.out.is_dir()).then(|| args.out.with_extension("symbols.cache"));
     let table = std::thread::spawn(move || {
         let start = Instant::now();
-        let table = SymbolTable::load(&symbol_files, &root);
+        let table = SymbolTable::load_cached(&symbol_files, &root, sym_cache_path.as_deref());
         if let Ok(table) = &table {
             eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
         }
@@ -1704,8 +1896,7 @@ fn main() -> anyhow::Result<()> {
     let mut outlines = outline::Outlines::default();
     let mut initial_texts: FxHashMap<vfs::FileId, triomphe::Arc<str>> = FxHashMap::default();
     let mut initial_serials: FxHashMap<FunctionId, u64> = FxHashMap::default();
-    let mut initial_adts: FxHashMap<vfs::FileId, FxHashMap<String, AdtSnapshot>> =
-        FxHashMap::default();
+    let mut initial_adts: FxHashMap<vfs::FileId, FileSnapshot> = FxHashMap::default();
     let mut dirty_files: FxHashSet<vfs::FileId> = FxHashSet::default();
     let mut table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let cold = build(
@@ -1717,16 +1908,30 @@ fn main() -> anyhow::Result<()> {
         &dirty_files,
         &initial_serials,
         &FxHashSet::default(),
+        &FxHashSet::default(),
         true,
     )?;
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
-    link(&args)?;
-    let bin_index = args
-        .out
-        .parent()
-        .and_then(|d| Some(d.join(d.file_name()?)))
+    let cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
+    let skip_cold_link = args.krate.is_none()
+        && cold_bin_path.as_ref().is_some_and(|bp| {
+            let base_p = bp.with_extension("base");
+            let rt_o = args.out.with_extension("rt.o");
+            if let (Ok(bm), Ok(rm)) = (
+                std::fs::metadata(&base_p).and_then(|m| m.modified()),
+                std::fs::metadata(&rt_o).and_then(|m| m.modified()),
+            ) {
+                bm >= rm && bp.exists()
+            } else {
+                false
+            }
+        });
+    if !skip_cold_link {
+        link(&args)?;
+    }
+    let bin_index = cold_bin_path
         .filter(|p| p.exists())
         .and_then(|bin_path| {
             table.filter_to_binary(&bin_path);
@@ -1758,7 +1963,11 @@ fn main() -> anyhow::Result<()> {
         Some(path) => {
             // A socket file left by a daemon that is gone can't be bound again.
             let _ = std::fs::remove_file(path);
-            let l = UnixListener::bind(path)?;
+            let bind_path = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
+                .unwrap_or_else(|| path.clone());
+            let l = UnixListener::bind(&bind_path)?;
             if args.watch {
                 l.set_nonblocking(true)?;
             }
@@ -1800,6 +2009,7 @@ fn main() -> anyhow::Result<()> {
         // Source files that are no longer there.
         let mut gone = FxHashSet::default();
         loop {
+            let had_client = client.is_some();
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
             for (file, path) in tree.added(&mut db).added {
                 files.push(WatchedFile {
@@ -1829,16 +2039,13 @@ fn main() -> anyhow::Result<()> {
             {
                 client = requested(listener, true)?;
             }
-            if touched.len() + gone.len() == before || client.is_some() {
+            if had_client || (client.is_none() && touched.len() + gone.len() == before) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
-            if client.is_none()
-                && let Some(listener) = &listener
-            {
-                client = requested(listener, true)?;
-                if client.is_some() {
-                    break;
+            if client.is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+                if let Some(listener) = &listener {
+                    client = requested(listener, true)?;
                 }
             }
         }
@@ -2003,7 +2210,7 @@ fn main() -> anyhow::Result<()> {
             listed.touch(&db, crates);
         }
         let apply = start.elapsed();
-        let (layout_warnings, changed_adts) =
+        let (layout_warnings, changed_adts, changed_consts) =
             detect_adt_layout_warnings(&db, &dirty_files, &initial_adts);
         // The check of the edited files does not wait for the build: it reads other things.
         let (warm, broken) = std::thread::scope(|scope| {
@@ -2020,6 +2227,7 @@ fn main() -> anyhow::Result<()> {
                 &dirty_files,
                 &initial_serials,
                 &changed_adts,
+                &changed_consts,
                 false,
             );
             (warm, check.join().ok().flatten())
