@@ -91,6 +91,7 @@ unsafe extern "C" {
     fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
     fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_void;
     fn memcmp(s1: *const c_void, s2: *const c_void, n: usize) -> c_int;
+    fn __register_frame(fde: *const u8);
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *const c_void, len: usize);
     #[cfg(target_os = "macos")]
@@ -543,7 +544,144 @@ fn build_sym_cache() -> HashMap<&'static str, usize> {
     HashMap::new()
 }
 
-static DLSYM_CACHE: Mutex< Option<HashMap<String, usize>>> = Mutex::new(None);
+static DLSYM_CACHE: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+static NEW_TEST_FNS: [AtomicPtr<c_void>; 16] = [const { AtomicPtr::new(ptr::null_mut()) }; 16];
+static NEW_TESTS: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
+static ORIG_TEST_MAIN_STATIC: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+
+macro_rules! def_test_runner {
+    ($name:ident, $idx:expr) => {
+        fn $name() -> Result<(), String> {
+            let p = NEW_TEST_FNS[$idx].load(Ordering::Acquire);
+            if !p.is_null() {
+                let f: extern "C" fn() = unsafe { std::mem::transmute(p) };
+                f();
+            }
+            Ok(())
+        }
+    };
+}
+def_test_runner!(rustd_new_test_0, 0);
+def_test_runner!(rustd_new_test_1, 1);
+def_test_runner!(rustd_new_test_2, 2);
+def_test_runner!(rustd_new_test_3, 3);
+def_test_runner!(rustd_new_test_4, 4);
+def_test_runner!(rustd_new_test_5, 5);
+def_test_runner!(rustd_new_test_6, 6);
+def_test_runner!(rustd_new_test_7, 7);
+def_test_runner!(rustd_new_test_8, 8);
+def_test_runner!(rustd_new_test_9, 9);
+def_test_runner!(rustd_new_test_10, 10);
+def_test_runner!(rustd_new_test_11, 11);
+def_test_runner!(rustd_new_test_12, 12);
+def_test_runner!(rustd_new_test_13, 13);
+def_test_runner!(rustd_new_test_14, 14);
+def_test_runner!(rustd_new_test_15, 15);
+
+fn get_test_runner(idx: usize) -> Option<fn() -> Result<(), String>> {
+    match idx {
+        0 => Some(rustd_new_test_0),
+        1 => Some(rustd_new_test_1),
+        2 => Some(rustd_new_test_2),
+        3 => Some(rustd_new_test_3),
+        4 => Some(rustd_new_test_4),
+        5 => Some(rustd_new_test_5),
+        6 => Some(rustd_new_test_6),
+        7 => Some(rustd_new_test_7),
+        8 => Some(rustd_new_test_8),
+        9 => Some(rustd_new_test_9),
+        10 => Some(rustd_new_test_10),
+        11 => Some(rustd_new_test_11),
+        12 => Some(rustd_new_test_12),
+        13 => Some(rustd_new_test_13),
+        14 => Some(rustd_new_test_14),
+        15 => Some(rustd_new_test_15),
+        _ => None,
+    }
+}
+
+extern "C" fn rustd_test_main_static(tests_ptr: *const *const u64, tests_len: usize) {
+    let orig_addr = ORIG_TEST_MAIN_STATIC.load(Ordering::Acquire);
+    {
+        let mut saved = SAVED_PATCHES.lock().unwrap();
+        for s in saved.iter() {
+            if let SavedPatch::InlineBytes { addr, orig, len } = s
+                && ptr::eq(*addr, orig_addr)
+            {
+                unsafe {
+                    if make_text_writable(*addr as usize, *len) {
+                        ptr::copy_nonoverlapping(orig.as_ptr(), *addr, *len);
+                        make_text_executable(*addr as usize, *len);
+                    }
+                }
+            }
+        }
+        saved.retain(|s| !matches!(s, SavedPatch::InlineBytes { addr, .. } if ptr::eq(*addr, orig_addr)));
+    }
+    let mut extended: Vec<*const u64> = Vec::with_capacity(tests_len + 8);
+    if !tests_ptr.is_null() && tests_len > 0 {
+        for i in 0..tests_len {
+            extended.push(unsafe { *tests_ptr.add(i) });
+        }
+        let template = unsafe { *tests_ptr };
+        if !template.is_null()
+            && let Ok(new_tests) = NEW_TESTS.lock()
+        {
+            for &(name, idx) in new_tests.iter() {
+                if let Some(runner) = get_test_runner(idx) {
+                    let mut words = [0u64; 19];
+                    unsafe {
+                        ptr::copy_nonoverlapping(template, words.as_mut_ptr(), 19);
+                    }
+                    words[4] = name.as_ptr() as u64;
+                    words[5] = name.len() as u64;
+                    words[6] = 0;
+                    words[17] = runner as usize as u64;
+                    let leaked = Box::leak(Box::new(words));
+                    extended.push(leaked.as_ptr());
+                }
+            }
+        }
+    }
+    let real_fn: extern "C" fn(*const *const u64, usize) =
+        unsafe { std::mem::transmute(orig_addr) };
+    real_fn(extended.as_ptr(), extended.len());
+}
+
+fn register_new_test(encoded_name: &str, new_fn: *mut c_void, veneer_idx: &mut usize) -> bool {
+    let Ok(mut list) = NEW_TESTS.lock() else { return false };
+    let decoded = encoded_name.replace("__", "::");
+    if let Some(&(_, existing_idx)) = list.iter().find(|&&(n, _)| n == decoded) {
+        NEW_TEST_FNS[existing_idx].store(new_fn, Ordering::Release);
+        return true;
+    }
+    let idx = list.len();
+    if idx >= 16 {
+        return false;
+    }
+    NEW_TEST_FNS[idx].store(new_fn, Ordering::Release);
+    let leaked_name: &'static str = Box::leak(decoded.into_boxed_str());
+    list.push((leaked_name, idx));
+    drop(list);
+
+    if ORIG_TEST_MAIN_STATIC.load(Ordering::Acquire).is_null() {
+        let cache = SYM_CACHE.get_or_init(build_sym_cache);
+        if let Some((&_, &addr)) = cache
+            .iter()
+            .find(|(k, _)| k.ends_with("4test16test_main_static") || **k == "test_main_static")
+        {
+            let orig_fn = addr as *mut u8;
+            if detour_function_inline(
+                orig_fn,
+                rustd_test_main_static as *const () as usize,
+                veneer_idx,
+            ) {
+                ORIG_TEST_MAIN_STATIC.store(orig_fn, Ordering::Release);
+            }
+        }
+    }
+    true
+}
 
 fn lookup_symbol(name: &str) -> *mut c_void {
     match name {
@@ -668,10 +806,13 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
         reloff: usize,
         nreloc: usize,
         flags: u32,
+        is_eh_frame: bool,
     }
     let mut sects = Vec::with_capacity(nsects);
     for s in 0..nsects {
         let sp = seg_pos + 72 + s * 80;
+        let sectname = buf.get(sp..sp + 16).unwrap_or(&[]);
+        let is_eh_frame = sectname.starts_with(b"__rustd_eh") || sectname.starts_with(b"__eh_frame");
         let sect = Sect {
             addr: read_u64(buf, sp + 32)? as usize,
             size: read_u64(buf, sp + 40)? as usize,
@@ -679,6 +820,7 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
             reloff: read_u32(buf, sp + 56)? as usize,
             nreloc: read_u32(buf, sp + 60)? as usize,
             flags: read_u32(buf, sp + 64)?,
+            is_eh_frame,
         };
         if (sect.flags & 0xff) != 1 && sect.size > 0 {
             let src = buf.get(sect.offset..sect.offset + sect.size)?;
@@ -818,6 +960,24 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
         mprotect(jit as *mut c_void, rx_size, PROT_READ | PROT_EXEC);
     }
 
+    for sect in &sects {
+        if sect.is_eh_frame {
+            let base = unsafe { jit.add(sect.addr) };
+            let mut pos = 0usize;
+            while pos + 8 <= sect.size {
+                let len = unsafe { (base.add(pos) as *const u32).read_unaligned() } as usize;
+                if len == 0 || pos + 4 + len > sect.size {
+                    break;
+                }
+                let cie_id = unsafe { (base.add(pos + 4) as *const u32).read_unaligned() };
+                if cie_id != 0 {
+                    unsafe { __register_frame(base.add(pos)) };
+                }
+                pos += 4 + len;
+            }
+        }
+    }
+
     let mut patched = 0usize;
     let mut veneer_idx = 0usize;
     for i in 0..nsyms {
@@ -832,6 +992,12 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                 continue;
             }
             let new_fn = unsafe { *got_base.add(i) as *mut c_void };
+            if let Some(encoded_name) = sym_name.strip_prefix("__rustd_new_test__") {
+                if register_new_test(encoded_name, new_fn, &mut veneer_idx) {
+                    patched += 1;
+                }
+                continue;
+            }
             let ptr_name = format!("{sym_name}$rustd_ptr");
             let slot = lookup_symbol(&ptr_name) as *const AtomicPtr<c_void>;
             if !slot.is_null() {
@@ -1056,6 +1222,12 @@ fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
                 continue;
             }
             let new_fn = unsafe { *got_base.add(i) as *mut c_void };
+            if let Some(encoded_name) = sym_name.strip_prefix("__rustd_new_test__") {
+                if register_new_test(encoded_name, new_fn, &mut veneer_idx) {
+                    patched += 1;
+                }
+                continue;
+            }
             let ptr_name = format!("{sym_name}$rustd_ptr");
             let slot = lookup_symbol(&ptr_name) as *const AtomicPtr<c_void>;
             if !slot.is_null() {

@@ -97,8 +97,14 @@ impl BinaryIndex {
             }
             let Ok(raw_name) = sym.name() else { continue };
             let name = if is_macho { raw_name.strip_prefix('_').unwrap_or(raw_name) } else { raw_name };
-            if sym.is_global() || name == "VENEER_CAVE_START" || name == "PATCH_DATA_CAVE" || name == "__rustd_veneer_cave_end" {
+            if sym.is_global()
+                || name == "VENEER_CAVE_START"
+                || name == "PATCH_DATA_CAVE"
+                || name == "__rustd_veneer_cave_end"
+            {
                 symbols.insert(name.to_owned(), sym.address());
+            } else if sym.kind() == object::SymbolKind::Text {
+                symbols.entry(name.to_owned()).or_insert(sym.address());
             }
         }
         for c_sym in [

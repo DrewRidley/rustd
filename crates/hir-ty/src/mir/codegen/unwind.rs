@@ -108,15 +108,16 @@ pub(super) struct UnwindContext {
 impl UnwindContext {
     pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
-        if cfg!(target_os = "macos") {
-            return Ok(UnwindContext { frame_table, cie: None });
-        }
         let Some(mut cie) = module.isa().create_systemv_cie() else {
             return Ok(UnwindContext { frame_table, cie: None });
         };
-        let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
-        cie.fde_address_encoding = pcrel;
-        cie.lsda_encoding = Some(pcrel);
+        let ptr_enc = if cfg!(target_os = "macos") {
+            gimli::DW_EH_PE_absptr
+        } else {
+            gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
+        };
+        cie.fde_address_encoding = ptr_enc;
+        cie.lsda_encoding = Some(ptr_enc);
 
         let pointer = module.target_config().pointer_type();
         let personality = module
@@ -136,24 +137,30 @@ impl UnwindContext {
                 },
             )
             .map_err(|e| e.to_string())?;
-        // The personality is reached through a pointer, as it can live in another DSO. It
-        // must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
-        let personality_ref = module
-            .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
-            .map_err(|e| e.to_string())?;
-        let mut data = DataDescription::new();
-        data.define(
-            vec![0; usize::from(module.target_config().pointer_bytes())].into_boxed_slice(),
-        );
-        let func_ref = module.declare_func_in_data(personality, &mut data);
-        data.write_function_addr(0, func_ref);
-        module.define_data(personality_ref, &data).map_err(|e| e.to_string())?;
-        cie.personality = Some((
-            gimli::DwEhPe(
-                gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
-            ),
-            address_for_data(personality_ref),
-        ));
+        if cfg!(target_os = "macos") {
+            cie.personality = Some((gimli::DW_EH_PE_absptr, address_for_func(personality)));
+        } else {
+            // The personality is reached through a pointer, as it can live in another DSO. It
+            // must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
+            let personality_ref = module
+                .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
+                .map_err(|e| e.to_string())?;
+            let mut data = DataDescription::new();
+            data.define(
+                vec![0; usize::from(module.target_config().pointer_bytes())].into_boxed_slice(),
+            );
+            let func_ref = module.declare_func_in_data(personality, &mut data);
+            data.write_function_addr(0, func_ref);
+            module.define_data(personality_ref, &data).map_err(|e| e.to_string())?;
+            cie.personality = Some((
+                gimli::DwEhPe(
+                    gimli::DW_EH_PE_indirect.0
+                        | gimli::DW_EH_PE_pcrel.0
+                        | gimli::DW_EH_PE_sdata4.0,
+                ),
+                address_for_data(personality_ref),
+            ));
+        }
 
         Ok(UnwindContext { cie: Some(frame_table.add_cie(cie)), frame_table })
     }
@@ -170,8 +177,6 @@ impl UnwindContext {
         let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
         let mut data = DataDescription::new();
         data.define(unwind.landing_pads.clone().into_boxed_slice());
-        #[cfg(target_os = "macos")]
-        data.set_custom_section("__TEXT,__gcc_except_tab");
         #[cfg(not(target_os = "macos"))]
         data.set_custom_section(".gcc_except_table");
         module.define_data(lsda, &data).map_err(|e| e.to_string())?;
@@ -187,7 +192,15 @@ impl UnwindContext {
         if eh_frame.0.writer.slice().is_empty() {
             return Ok(());
         }
-        let section = product.object.section_id(StandardSection::EhFrame);
+        let section = if cfg!(target_os = "macos") {
+            product.object.add_section(
+                b"__DATA".to_vec(),
+                b"__rustd_eh".to_vec(),
+                cranelift_object::object::SectionKind::Data,
+            )
+        } else {
+            product.object.section_id(StandardSection::EhFrame)
+        };
         product.object.section_mut(section).set_data(eh_frame.0.writer.into_vec(), 8);
         for reloc in &eh_frame.0.relocs {
             let symbol = if reloc.symbol & DATA_SYMBOL == 0 {
@@ -195,9 +208,12 @@ impl UnwindContext {
             } else {
                 product.data_symbol(DataId::from_u32((reloc.symbol & !DATA_SYMBOL) as u32))
             };
-            // Local symbols are addressed through their section.
-            let (symbol, offset) =
-                product.object.symbol_section_and_offset(symbol).unwrap_or((symbol, 0));
+            // Local symbols are addressed through their section on ELF.
+            let (symbol, offset) = if cfg!(target_os = "macos") {
+                (symbol, 0)
+            } else {
+                product.object.symbol_section_and_offset(symbol).unwrap_or((symbol, 0))
+            };
             product
                 .object
                 .add_relocation(

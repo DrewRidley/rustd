@@ -373,13 +373,17 @@ impl SymbolTable {
         let mut defined_by_base = rustc_hash::FxHashMap::default();
         for symbol in object.symbols() {
             let defined = symbol.section_index().is_some() || symbol.is_common();
-            if !(defined && symbol.is_global()) {
+            if !(defined && (symbol.is_global() || symbol.kind() == object::SymbolKind::Text)) {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
             let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
-            defined_by_base
-                .insert(without_instantiating_crate(name).to_owned(), name.to_owned());
+            let key = without_instantiating_crate(name).to_owned();
+            if symbol.is_global() {
+                defined_by_base.insert(key, name.to_owned());
+            } else {
+                defined_by_base.entry(key).or_insert_with(|| name.to_owned());
+            }
         }
         if defined_by_base.is_empty() {
             return;
@@ -428,7 +432,8 @@ impl SymbolTable {
             // A reference is as good as a definition: something in the link defines it.
             // Not `is_definition`, which leaves out thread locals.
             let defined = symbol.section_index().is_some() || symbol.is_common();
-            let linkable = symbol.is_undefined() || (defined && symbol.is_global());
+            let linkable = symbol.is_undefined()
+                || (defined && (symbol.is_global() || symbol.kind() == object::SymbolKind::Text));
             if !linkable {
                 continue;
             }

@@ -415,7 +415,17 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
         }
-        self.table.get(&self.path(func)?).map(str::to_owned)
+        let path = self.path(func)?;
+        if let Some(sym) = self.table.get(&path) {
+            return Some(sym.to_owned());
+        }
+        if hir_def::attrs::AttrFlags::query(self.db, func.into())
+            .contains(hir_def::attrs::AttrFlags::IS_TEST)
+        {
+            let rel = path.split_once("::").map_or(path.as_str(), |(_, rest)| rest);
+            return Some(format!("__rustd_new_test__{}", rel.replace("::", "__")));
+        }
+        None
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
@@ -1039,6 +1049,7 @@ fn build(
             }
             let mut direct_changed = FxHashSet::default();
             let mut need_callers = global_need_callers.clone();
+            let mut vtable_adts = changed_adts.clone();
             hir::attach_db(db, || {
                 for &func in &l.functions {
                     let f = func
@@ -1058,20 +1069,28 @@ fn build(
                             changed_const_names.iter().any(|n| idents.contains(n))
                         };
                     let touches_changed_adt =
-                        hir_ty::mir::codegen::function_mentions_adts(db, func, changed_adts);
+                        hir_ty::mir::codegen::function_mentions_adts(db, func, &vtable_adts);
                     if in_dirty_changed || touches_changed_const || touches_changed_adt {
                         direct_changed.insert(func);
-                        if resolver.function(func).is_none()
-                            || hir_def::signatures::FunctionSignature::of(db, func).is_async()
-                            || hir_def::attrs::AttrFlags::query(db, func.into())
-                                .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE)
+                        if initial_serials.contains_key(&func)
+                            && (resolver.function(func).is_none()
+                                || hir_def::signatures::FunctionSignature::of(db, func).is_async()
+                                || hir_def::attrs::AttrFlags::query(db, func.into())
+                                    .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE))
                         {
                             need_callers.insert(func);
+                            let h_fn = hir::Function::from(func);
+                            if let Some(assoc) = h_fn.as_assoc_item(db)
+                                && let AssocItemContainer::Impl(imp) = assoc.container(db)
+                                && let Some(adt) = imp.self_ty(db).as_adt()
+                            {
+                                vtable_adts.insert(hir_def::AdtId::from(adt));
+                            }
                         }
                     }
                 }
             });
-            if !need_callers.is_empty() {
+            if !need_callers.is_empty() || vtable_adts.len() > changed_adts.len() {
                 if changed_adts.is_empty() && global_need_callers.is_empty() {
                     warm_deps(db, &l.functions);
                 }
@@ -1080,11 +1099,15 @@ fn build(
                         let mut newly_added = Vec::new();
                         for &func in &l.functions {
                             if !direct_changed.contains(&func)
-                                && hir_ty::mir::codegen::function_calls_any(
+                                && (hir_ty::mir::codegen::function_calls_any(
                                     db,
                                     func,
                                     &need_callers,
-                                )
+                                ) || hir_ty::mir::codegen::function_mentions_adts(
+                                    db,
+                                    func,
+                                    &vtable_adts,
+                                ))
                             {
                                 newly_added.push(func);
                             }
@@ -1107,7 +1130,7 @@ fn build(
             }
             global_need_callers.extend(need_callers);
             for &func in &l.functions {
-                if direct_changed.contains(&func) {
+                if direct_changed.contains(&func) && resolver.function(func).is_some() {
                     e.push(func);
                 } else if resolver.path(func).is_none() {
                     o.push(func);
@@ -1774,8 +1797,6 @@ fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path, root: &Path) -> anyhow::Res
             "--crate-name=rustd_hotpatch_rt",
             "--crate-type=rlib",
             "--emit=obj",
-            "-C",
-            "panic=abort",
             "-O",
         ])
         .arg(&rt_rs)
@@ -1860,25 +1881,39 @@ fn main() -> anyhow::Result<()> {
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
     let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
-    let cache_fp = {
+    let (cache_fp, baseline_fp) = {
         use std::hash::{Hash, Hasher};
-        let mut h = rustc_hash::FxHasher::default();
-        SymbolTable::files_fingerprint(&symbol_files).hash(&mut h);
-        for mf in [&args.project, &root.join("Cargo.lock")] {
-            if let Ok(m) = std::fs::metadata(mf) {
-                m.len().hash(&mut h);
+        let mut bh = rustc_hash::FxHasher::default();
+        for f in &symbol_files {
+            f.hash(&mut bh);
+            if let Ok(m) = std::fs::metadata(f) {
+                m.len().hash(&mut bh);
                 if let Ok(t) = m.modified()
                     && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
                 {
-                    d.as_nanos().hash(&mut h);
+                    d.as_nanos().hash(&mut bh);
                 }
             }
         }
-        args.cfg_test.hash(&mut h);
-        args.target.hash(&mut h);
-        args.features.hash(&mut h);
-        std::env::var("RUSTD_PKG").ok().hash(&mut h);
-        format!("{:016x}", h.finish())
+        for mf in [&args.project, &root.join("Cargo.lock")] {
+            if let Ok(m) = std::fs::metadata(mf) {
+                m.len().hash(&mut bh);
+                if let Ok(t) = m.modified()
+                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+                {
+                    d.as_nanos().hash(&mut bh);
+                }
+            }
+        }
+        args.cfg_test.hash(&mut bh);
+        args.target.hash(&mut bh);
+        args.features.hash(&mut bh);
+        std::env::var("RUSTD_PKG").ok().hash(&mut bh);
+        let b_fp = bh.finish();
+        let mut h = rustc_hash::FxHasher::default();
+        b_fp.hash(&mut h);
+        SymbolTable::files_fingerprint(&symbol_files).hash(&mut h);
+        (format!("{:016x}", h.finish()), format!("{:016x}", b_fp))
     };
     if !args.out.is_dir() {
         unsafe {
@@ -2017,7 +2052,7 @@ fn main() -> anyhow::Result<()> {
             *pos += len;
             Some(s)
         };
-        if get_str(&mut pos).as_deref() == Some(cache_fp.as_str())
+        if get_str(&mut pos).as_deref() == Some(baseline_fp.as_str())
             && let Some(count) = get_u32(&mut pos)
         {
             for _ in 0..count {
@@ -2127,7 +2162,7 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             let before = touched.len() + gone.len();
-            if client.is_some() && files.len() > 256 {
+            if files.len() > 256 {
                 let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(8);
                 let chunk_size = files.len().div_ceil(threads).max(1);
                 let results: Vec<Vec<(usize, Option<SystemTime>)>> = std::thread::scope(|scope| {
@@ -2278,7 +2313,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
                 if baseline_dirty {
-                    save_baseline(baseline_cache_path.as_deref(), &cache_fp, &baseline_by_path);
+                    save_baseline(baseline_cache_path.as_deref(), &baseline_fp, &baseline_by_path);
                 }
                 if std::env::var_os("RUSTD_STATS").is_some() && unprimed_crates.is_empty() {
                     eprintln!("primed workspace caches");
@@ -2360,7 +2395,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         if baseline_dirty {
-            save_baseline(baseline_cache_path.as_deref(), &cache_fp, &baseline_by_path);
+            save_baseline(baseline_cache_path.as_deref(), &baseline_fp, &baseline_by_path);
         }
         let read = read.elapsed();
         eprintln!("change: {changed} files");

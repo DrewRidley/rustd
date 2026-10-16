@@ -39,7 +39,7 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
                 "Usage:\n  \
                  rustd build [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
                  rustd run   [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
-                 rustd test  [FILTER] [-p PACKAGE] [--manifest-path PATH] [-- ARGS...]\n  \
+                 rustd test  [FILTER] [-p PACKAGE] [--test NAME] [--bin NAME] [--watch] [-- ARGS...]\n  \
                  rustd patch [--manifest-path PATH] [--bin NAME]\n  \
                  rustd sync  [--manifest-path PATH] [--bin NAME]\n  \
                  rustd status [--manifest-path PATH] [--bin NAME]\n  \
@@ -139,13 +139,21 @@ fn find_manifest_path(explicit: Option<PathBuf>) -> anyhow::Result<(PathBuf, Pat
 fn infer_default_bin(workspace_root: &Path) -> Option<String> {
     let rustd_dir = workspace_root.join("target").join("rustd");
     if let Ok(entries) = fs::read_dir(&rustd_dir) {
-        let mut dirs: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect();
-        if dirs.len() == 1 {
-            return dirs.pop();
+        let mut all_dirs = Vec::new();
+        let mut active_dirs = Vec::new();
+        for e in entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
+            if let Ok(name) = e.file_name().into_string() {
+                if e.path().join("rustd.sock").exists() {
+                    active_dirs.push(name.clone());
+                }
+                all_dirs.push(name);
+            }
+        }
+        if active_dirs.len() == 1 {
+            return active_dirs.pop();
+        }
+        if all_dirs.len() == 1 {
+            return all_dirs.pop();
         }
     }
     let manifest = workspace_root.join("Cargo.toml");
@@ -221,7 +229,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             "--target" => {
                 target = Some(it.next().context("--target requires a triple")?.clone());
             }
-            "--watch" => watch = true,
+            "-w" | "--watch" => watch = true,
             other if other.starts_with('-') => bail!("unknown option `{other}`"),
             positional if manifest.is_none() && Path::new(positional).exists() => {
                 manifest = Some(PathBuf::from(positional));
@@ -736,10 +744,39 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts_with_mode(args, true)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     ensure_daemon(&opts, &paths)?;
-    let mut cmd = Command::new(&paths.out_bin);
-    cmd.args(&opts.run_args);
-    let err = cmd.exec();
-    Err(err.into())
+    if !opts.watch {
+        let mut cmd = Command::new(&paths.out_bin);
+        cmd.args(&opts.run_args);
+        let err = cmd.exec();
+        return Err(err.into());
+    }
+    let max_runs = env::var("RUSTD_WATCH_MAX_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut runs = 0usize;
+    let t0 = Instant::now();
+    let status = Command::new(&paths.out_bin).args(&opts.run_args).status()?;
+    eprintln!("[rustd] initial test run finished in {:.1?} ({status})", t0.elapsed());
+    runs += 1;
+    if max_runs.is_some_and(|m| runs >= m) {
+        return Ok(());
+    }
+    let mut last_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
+    eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let cur_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
+        if cur_mtime.is_some() && cur_mtime != last_mtime {
+            last_mtime = cur_mtime;
+            let t0 = Instant::now();
+            let status = Command::new(&paths.out_bin).args(&opts.run_args).status()?;
+            eprintln!("[rustd] re-ran tests in {:.1?} ({status})", t0.elapsed());
+            runs += 1;
+            if max_runs.is_some_and(|m| runs >= m) {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn cmd_request(req: &str, args: &[String]) -> anyhow::Result<()> {
@@ -798,17 +835,34 @@ fn cmd_status(args: &[String]) -> anyhow::Result<()> {
 
 fn cmd_stop(args: &[String], quiet: bool) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
-    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    if let Ok(pid_str) = fs::read_to_string(&paths.pid_file)
-        && let Ok(pid) = pid_str.trim().parse::<u32>()
-        && pid > 0
-    {
-        let _ = Command::new("kill").arg("-15").arg(pid.to_string()).status();
+    let rustd_dir = opts.workspace_root.join("target").join("rustd");
+    let mut stopped = Vec::new();
+    if let Ok(entries) = fs::read_dir(&rustd_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && (p.join("rustd.sock").exists() || p.join("rustd.pid").exists()) {
+                if let Ok(pid_str) = fs::read_to_string(p.join("rustd.pid"))
+                    && let Ok(pid) = pid_str.trim().parse::<u32>()
+                    && pid > 0
+                {
+                    let _ = Command::new("kill").arg("-15").arg(pid.to_string()).status();
+                }
+                let _ = fs::remove_file(p.join("rustd.sock"));
+                let _ = fs::remove_file(p.join("rustd.pid"));
+                if let Ok(name) = e.file_name().into_string() {
+                    stopped.push(name);
+                }
+            }
+        }
     }
-    let _ = fs::remove_file(&paths.rustd_sock);
-    let _ = fs::remove_file(&paths.pid_file);
+    if stopped.is_empty() {
+        let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+        let _ = fs::remove_file(&paths.rustd_sock);
+        let _ = fs::remove_file(&paths.pid_file);
+        stopped.push(opts.bin_name);
+    }
     if !quiet {
-        println!("stopped rustd daemon for `{}`", opts.bin_name);
+        println!("stopped rustd daemon for `{}`", stopped.join("`, `"));
     }
     Ok(())
 }
