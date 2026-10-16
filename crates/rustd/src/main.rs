@@ -1059,11 +1059,11 @@ fn build(
         let mut global_need_callers = FxHashSet::default();
         let mut global_vtable_adts = changed_adts.clone();
         let mut global_test_adts = changed_adts.clone();
-        let mut global_test_traits = FxHashSet::default();
+        let mut global_test_trait_callees: FxHashMap<(FunctionId, hir_def::AdtId), String> =
+            FxHashMap::default();
         let mut global_impacted_fns = FxHashSet::default();
         let mut explain_reasons: FxHashMap<FunctionId, String> = FxHashMap::default();
         let mut adt_reasons: FxHashMap<hir_def::AdtId, String> = FxHashMap::default();
-        let mut trait_reasons: FxHashMap<hir_def::TraitId, String> = FxHashMap::default();
         hir::attach_db(db, || {
             for &adt_id in changed_adts {
                 let adt_name = hir::Adt::from(adt_id)
@@ -1151,34 +1151,50 @@ fn build(
                             && let AssocItemContainer::Impl(imp) = assoc.container(db)
                         {
                             let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
-                            if let Some(adt_id) = impl_adt {
-                                test_adts.insert(adt_id);
-                                let adt_name = hir::Adt::from(adt_id)
-                                    .name(db)
-                                    .display(db, syntax::Edition::CURRENT)
-                                    .to_string();
-                                adt_reasons.entry(adt_id).or_insert_with(|| {
-                                    format!("type `{adt_name}` <- `{fn_label}` edited")
-                                });
-                            }
                             if let Some(trait_) = imp.trait_(db) {
                                 let trait_id = hir_def::TraitId::from(trait_);
                                 let trait_name = trait_
                                     .name(db)
                                     .display(db, syntax::Edition::CURRENT)
                                     .to_string();
-                                global_test_traits.insert(trait_id);
-                                trait_reasons.entry(trait_id).or_insert_with(|| {
-                                    format!("trait `{trait_name}` <- `{fn_label}` edited")
-                                });
-                                if trait_.module(db).krate(db).origin(db).is_local() {
-                                    let fn_name = h_fn.name(db);
-                                    for &(ref t_name, item) in
-                                        trait_id.trait_items(db).items.iter()
+                                let is_local_trait =
+                                    trait_.module(db).krate(db).origin(db).is_local();
+                                if !is_local_trait
+                                    && in_dirty_changed
+                                    && let Some(adt_id) = impl_adt
+                                {
+                                    test_adts.insert(adt_id);
+                                    let adt_name = hir::Adt::from(adt_id)
+                                        .name(db)
+                                        .display(db, syntax::Edition::CURRENT)
+                                        .to_string();
+                                    adt_reasons.entry(adt_id).or_insert_with(|| {
+                                        format!("type `{adt_name}` <- `{fn_label}` edited")
+                                    });
+                                }
+                                let mut trait_impl_count = 0usize;
+                                if is_local_trait {
+                                    hir_ty::method_resolution::TraitImpls::for_crate(db, c.into())
+                                        .for_trait(trait_id, |impls| {
+                                            trait_impl_count +=
+                                                impls.either(|s| s.len(), |s| s.len());
+                                        });
+                                }
+                                let fn_name = h_fn.name(db);
+                                for &(ref t_name, item) in
+                                    trait_id.trait_items(db).items.iter()
+                                {
+                                    if let AssocItemId::FunctionId(fid) = item
+                                        && t_name.as_str() == fn_name.as_str()
                                     {
-                                        if let AssocItemId::FunctionId(fid) = item
-                                            && t_name.as_str() == fn_name.as_str()
-                                        {
+                                        if let Some(adt_id) = impl_adt {
+                                            global_test_trait_callees
+                                                .entry((fid, adt_id))
+                                                .or_insert_with(|| {
+                                                    format!("`{fn_label}` (edited)")
+                                                });
+                                        }
+                                        if is_local_trait && trait_impl_count <= 8 {
                                             global_impacted_fns.insert(fid);
                                             explain_reasons.entry(fid).or_insert_with(|| {
                                                 format!(
@@ -1259,7 +1275,7 @@ fn build(
             if args.cfg_test
                 && (!global_impacted_fns.is_empty()
                     || !global_test_adts.is_empty()
-                    || !global_test_traits.is_empty())
+                    || !global_test_trait_callees.is_empty())
             {
                 if !warmed {
                     warm_deps(db, &l.functions);
@@ -1273,6 +1289,12 @@ fn build(
                                 continue;
                             }
                             let deps = hir_ty::mir::codegen::function_deps(db, func);
+                            if (deps.local_callee_count > 20 || deps.adts.len() > 20)
+                                && !hir_def::attrs::AttrFlags::query(db, func.into())
+                                    .contains(hir_def::attrs::AttrFlags::IS_TEST)
+                            {
+                                continue;
+                            }
                             if let Some(&callee) =
                                 deps.callees.iter().find(|c| test_reach.contains(c))
                             {
@@ -1282,6 +1304,16 @@ fn build(
                                     .get(&callee)
                                     .cloned()
                                     .unwrap_or_else(|| "modified fn".to_owned());
+                                explain_reasons
+                                    .insert(func, format!("`{fn_label}` <- calls {prev}"));
+                                added.push(func);
+                            } else if let Some(prev) = deps
+                                .trait_callees
+                                .iter()
+                                .find_map(|pair| global_test_trait_callees.get(pair))
+                            {
+                                let fn_label =
+                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
                                 explain_reasons
                                     .insert(func, format!("`{fn_label}` <- calls {prev}"));
                                 added.push(func);
@@ -1297,18 +1329,6 @@ fn build(
                                 explain_reasons
                                     .insert(func, format!("`{fn_label}` <- uses {prev}"));
                                 added.push(func);
-                            } else if let Some(&trait_id) =
-                                deps.traits.iter().find(|t| global_test_traits.contains(t))
-                            {
-                                let fn_label =
-                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
-                                let prev = trait_reasons
-                                    .get(&trait_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| "modified trait".to_owned());
-                                explain_reasons
-                                    .insert(func, format!("`{fn_label}` <- uses dyn {prev}"));
-                                added.push(func);
                             }
                         }
                         if added.is_empty() {
@@ -1322,43 +1342,37 @@ fn build(
                                 .unwrap_or_else(|| "reached fn".to_owned());
                             if let Some(assoc) = h_fn.as_assoc_item(db)
                                 && let AssocItemContainer::Impl(imp) = assoc.container(db)
+                                && let Some(trait_) = imp.trait_(db)
                             {
-                                if let Some(adt) = imp.self_ty(db).as_adt() {
-                                    let adt_id = hir_def::AdtId::from(adt);
-                                    if global_test_adts.insert(adt_id) {
-                                        let adt_name = adt
-                                            .name(db)
-                                            .display(db, syntax::Edition::CURRENT)
-                                            .to_string();
-                                        adt_reasons.insert(
-                                            adt_id,
-                                            format!("type `{adt_name}` <- {fn_why}"),
-                                        );
-                                    }
+                                let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
+                                let trait_id = hir_def::TraitId::from(trait_);
+                                let is_local_trait =
+                                    trait_.module(db).krate(db).origin(db).is_local();
+                                let mut trait_impl_count = 0usize;
+                                if is_local_trait {
+                                    hir_ty::method_resolution::TraitImpls::for_crate(db, c.into())
+                                        .for_trait(trait_id, |impls| {
+                                            trait_impl_count +=
+                                                impls.either(|s| s.len(), |s| s.len());
+                                        });
                                 }
-                                if let Some(trait_) = imp.trait_(db) {
-                                    let trait_id = hir_def::TraitId::from(trait_);
-                                    if global_test_traits.insert(trait_id) {
-                                        let trait_name = trait_
-                                            .name(db)
-                                            .display(db, syntax::Edition::CURRENT)
-                                            .to_string();
-                                        trait_reasons.insert(
-                                            trait_id,
-                                            format!("trait `{trait_name}` <- {fn_why}"),
-                                        );
-                                    }
-                                    if trait_.module(db).krate(db).origin(db).is_local() {
-                                        let fn_name = h_fn.name(db);
-                                        for &(ref t_name, item) in
-                                            trait_id.trait_items(db).items.iter()
+                                let fn_name = h_fn.name(db);
+                                for &(ref t_name, item) in
+                                    trait_id.trait_items(db).items.iter()
+                                {
+                                    if let AssocItemId::FunctionId(fid) = item
+                                        && t_name.as_str() == fn_name.as_str()
+                                    {
+                                        if let Some(adt_id) = impl_adt {
+                                            global_test_trait_callees
+                                                .entry((fid, adt_id))
+                                                .or_insert_with(|| fn_why.clone());
+                                        }
+                                        if is_local_trait
+                                            && trait_impl_count <= 8
+                                            && test_reach.insert(fid)
                                         {
-                                            if let AssocItemId::FunctionId(fid) = item
-                                                && t_name.as_str() == fn_name.as_str()
-                                                && test_reach.insert(fid)
-                                            {
-                                                explain_reasons.insert(fid, fn_why.clone());
-                                            }
+                                            explain_reasons.insert(fid, fn_why.clone());
                                         }
                                     }
                                 }
@@ -2783,54 +2797,83 @@ fn run_backtest(
         }
     });
 
-    // Build reverse call/ADT/trait reachability from tests (ground truth) and compare against selector
-    let mut candidates = Vec::new();
+    // Build reverse call/trait-callee adjacency lists in O(N)
+    let mut callers_of: FxHashMap<FunctionId, Vec<FunctionId>> = FxHashMap::default();
+    let mut trait_callers_of: FxHashMap<(FunctionId, hir_def::AdtId), Vec<FunctionId>> =
+        FxHashMap::default();
+    let is_test_set: FxHashSet<FunctionId> = tests.iter().copied().collect();
     hir::attach_db(db, || {
-        for &cand in &core_fns {
-            let h_fn = hir::Function::from(cand);
-            let impl_adt = h_fn
-                .as_assoc_item(db)
-                .and_then(|assoc| match assoc.container(db) {
-                    AssocItemContainer::Impl(imp) => imp.self_ty(db).as_adt(),
-                    _ => None,
-                })
-                .map(hir_def::AdtId::from);
-            let mut reach = FxHashSet::default();
-            reach.insert(cand);
-            let mut adts = FxHashSet::default();
-            if let Some(a) = impl_adt {
-                adts.insert(a);
+        for &f in &all_funcs {
+            let deps = hir_ty::mir::codegen::function_deps(db, f);
+            if (deps.local_callee_count > 20 || deps.adts.len() > 20) && !is_test_set.contains(&f) {
+                continue;
             }
-            loop {
-                let mut added = Vec::new();
-                for &f in &all_funcs {
-                    if !reach.contains(&f)
-                        && (hir_ty::mir::codegen::function_calls_any(db, f, &reach)
-                            || hir_ty::mir::codegen::function_mentions_adts(db, f, &adts))
-                    {
-                        added.push(f);
+            for &c in &deps.callees {
+                callers_of.entry(c).or_default().push(f);
+            }
+            for &pair in &deps.trait_callees {
+                trait_callers_of.entry(pair).or_default().push(f);
+            }
+        }
+    });
+
+    let mut candidates = Vec::new();
+    let stride = (core_fns.len() / faults.saturating_mul(4).max(1)).max(1);
+    hir::attach_db(db, || {
+        for &cand in core_fns.iter().step_by(stride) {
+            if candidates.len() >= faults {
+                break;
+            }
+            let Some(path) = resolver.path(cand) else {
+                continue;
+            };
+            let mut reach = FxHashSet::default();
+            let mut queue = vec![cand];
+            reach.insert(cand);
+            while let Some(cur) = queue.pop() {
+                if let Some(callers) = callers_of.get(&cur) {
+                    for &caller in callers {
+                        if reach.insert(caller) {
+                            queue.push(caller);
+                        }
                     }
                 }
-                if added.is_empty() {
-                    break;
+                let h_fn = hir::Function::from(cur);
+                if let Some(assoc) = h_fn.as_assoc_item(db)
+                    && let AssocItemContainer::Impl(imp) = assoc.container(db)
+                    && let Some(trait_) = imp.trait_(db)
+                {
+                    let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
+                    let trait_id = hir_def::TraitId::from(trait_);
+                    let fn_name = h_fn.name(db);
+                    for &(ref t_name, item) in trait_id.trait_items(db).items.iter() {
+                        if let AssocItemId::FunctionId(fid) = item
+                            && t_name.as_str() == fn_name.as_str()
+                            && let Some(adt_id) = impl_adt
+                            && let Some(t_callers) = trait_callers_of.get(&(fid, adt_id))
+                        {
+                            for &caller in t_callers {
+                                if reach.insert(caller) {
+                                    queue.push(caller);
+                                }
+                            }
+                        }
+                    }
                 }
-                reach.extend(added);
             }
             let covering_tests: Vec<FunctionId> = tests
                 .iter()
                 .copied()
                 .filter(|t| reach.contains(t))
                 .collect();
-            if !covering_tests.is_empty()
-                && let Some(path) = resolver.path(cand)
-            {
+            if !covering_tests.is_empty() {
                 candidates.push((cand, path, covering_tests));
             }
         }
     });
 
     let total = faults.min(candidates.len());
-    let step = if total > 0 { (candidates.len() / total).max(1) } else { 1 };
+    let step = 1;
     let mut caught = 0usize;
     let mut report_lines = Vec::new();
     hir::attach_db(db, || {

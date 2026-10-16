@@ -918,12 +918,24 @@ pub struct FunctionDeps {
     pub adts: FxHashSet<hir_def::AdtId>,
     pub callees: FxHashSet<FunctionId>,
     pub traits: FxHashSet<hir_def::TraitId>,
+    pub trait_callees: FxHashSet<(FunctionId, hir_def::AdtId)>,
+    pub local_callee_count: usize,
 }
 
 #[salsa::tracked(returns(ref))]
 pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
     let infer = InferenceResult::of(db, func);
-    struct Collector<'a>(&'a mut FunctionDeps);
+    struct AdtCollector<'a>(&'a mut FxHashSet<(FunctionId, hir_def::AdtId)>, FunctionId);
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for AdtCollector<'_> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if let TyKind::Adt(def, _) = ty.kind() {
+                self.0.insert((self.1, def.def_id()));
+            }
+            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self);
+        }
+    }
+    struct Collector<'a>(&'a mut FunctionDeps, &'a dyn HirDatabase);
     impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'_> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
@@ -931,9 +943,13 @@ pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
                 TyKind::Adt(def, _) => {
                     self.0.adts.insert(def.def_id());
                 }
-                TyKind::FnDef(callable, _) => {
+                TyKind::FnDef(callable, substs) => {
                     if let CallableDefId::FunctionId(f) = callable.0 {
                         self.0.callees.insert(f);
+                        if matches!(f.lookup(self.1).container, ItemContainerId::TraitId(_)) {
+                            let mut adt_col = AdtCollector(&mut self.0.trait_callees, f);
+                            rustc_type_ir::TypeVisitable::visit_with(&substs, &mut adt_col);
+                        }
                     }
                 }
                 TyKind::Dynamic(preds, _) => {
@@ -950,21 +966,40 @@ pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
     }
     let mut deps = FunctionDeps::default();
     for (expr_id, ty) in infer.type_of_expr.iter() {
-        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps));
+        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps, db));
         if let Some((f, substs)) = infer.method_resolution(expr_id) {
             deps.callees.insert(f);
-            rustc_type_ir::TypeVisitable::visit_with(&substs.as_ref(), &mut Collector(&mut deps));
+            if matches!(f.lookup(db).container, ItemContainerId::TraitId(_)) {
+                let mut adt_col = AdtCollector(&mut deps.trait_callees, f);
+                rustc_type_ir::TypeVisitable::visit_with(&substs.as_ref(), &mut adt_col);
+            }
+            rustc_type_ir::TypeVisitable::visit_with(
+                &substs.as_ref(),
+                &mut Collector(&mut deps, db),
+            );
         }
         if let Some((cand, substs)) = infer.assoc_resolutions_for_expr(expr_id) {
             if let crate::method_resolution::CandidateId::FunctionId(f) = cand {
                 deps.callees.insert(f);
+                if matches!(f.lookup(db).container, ItemContainerId::TraitId(_)) {
+                    let mut adt_col = AdtCollector(&mut deps.trait_callees, f);
+                    rustc_type_ir::TypeVisitable::visit_with(&substs.as_ref(), &mut adt_col);
+                }
             }
-            rustc_type_ir::TypeVisitable::visit_with(&substs.as_ref(), &mut Collector(&mut deps));
+            rustc_type_ir::TypeVisitable::visit_with(
+                &substs.as_ref(),
+                &mut Collector(&mut deps, db),
+            );
         }
     }
     for (_, ty) in infer.type_of_binding.iter() {
-        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps));
+        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut Collector(&mut deps, db));
     }
+    deps.local_callee_count = deps
+        .callees
+        .iter()
+        .filter(|&&c| c.krate(db).data(db).origin.is_local())
+        .count();
     deps
 }
 
