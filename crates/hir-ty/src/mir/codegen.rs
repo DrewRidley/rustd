@@ -920,7 +920,6 @@ pub struct FunctionDeps {
     pub traits: FxHashSet<hir_def::TraitId>,
     pub trait_callees: FxHashSet<(FunctionId, hir_def::AdtId)>,
     pub local_callee_count: usize,
-    pub string_lits: Vec<String>,
 }
 
 #[salsa::tracked(returns(ref))]
@@ -1001,18 +1000,6 @@ pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
         .iter()
         .filter(|&&c| c.krate(db).data(db).origin.is_local())
         .count();
-    let body = hir_def::expr_store::Body::of(db, func.into());
-    for (_, expr) in body.exprs() {
-        if let hir_def::hir::Expr::Literal(hir_def::hir::Literal::String(s)) = expr {
-            let text = s.as_str();
-            if text.len() >= 3
-                && text.len() <= 512
-                && !deps.string_lits.iter().any(|x| x == text)
-            {
-                deps.string_lits.push(text.to_owned());
-            }
-        }
-    }
     deps
 }
 

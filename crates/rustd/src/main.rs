@@ -1061,7 +1061,6 @@ fn build(
         let mut global_test_adts = changed_adts.clone();
         let mut global_test_trait_callees: FxHashMap<(FunctionId, hir_def::AdtId), String> =
             FxHashMap::default();
-        let mut global_dispatch_keys: FxHashMap<String, String> = FxHashMap::default();
         let mut global_impacted_fns = FxHashSet::default();
         let mut explain_reasons: FxHashMap<FunctionId, String> = FxHashMap::default();
         let mut adt_reasons: FxHashMap<hir_def::AdtId, String> = FxHashMap::default();
@@ -1206,26 +1205,6 @@ fn build(
                                         }
                                     }
                                 }
-                                for sib_item in imp.items(db) {
-                                    if let hir::AssocItem::Function(sib_fn) = sib_item
-                                        && let Ok(sib_fid) = FunctionId::try_from(sib_fn)
-                                    {
-                                        let sib_deps =
-                                            hir_ty::mir::codegen::function_deps(db, sib_fid);
-                                        if sib_deps.string_lits.len() == 1 {
-                                            let key = &sib_deps.string_lits[0];
-                                            if key.contains("::") {
-                                                global_dispatch_keys
-                                                    .entry(key.clone())
-                                                    .or_insert_with(|| {
-                                                        format!(
-                                                            "dispatch key `\"{key}\"` <- `{fn_label}` edited"
-                                                        )
-                                                    });
-                                            }
-                                        }
-                                    }
-                                }
                             }
                             if initial_serials.contains_key(&func)
                                 && (resolver.function(func).is_none()
@@ -1350,35 +1329,6 @@ fn build(
                                 explain_reasons
                                     .insert(func, format!("`{fn_label}` <- uses {prev}"));
                                 added.push(func);
-                            } else if !global_dispatch_keys.is_empty()
-                                && deps.string_lits.len() <= 12
-                                && let Some(prev) = deps.string_lits.iter().find_map(|lit| {
-                                    global_dispatch_keys.iter().find_map(|(key, why)| {
-                                        let is_id = |b: u8| {
-                                            b.is_ascii_alphanumeric() || b == b'_' || b == b':'
-                                        };
-                                        let mut start = 0;
-                                        while let Some(pos) = lit[start..].find(key.as_str()) {
-                                            let abs = start + pos;
-                                            let end = abs + key.len();
-                                            let before_ok =
-                                                abs == 0 || !is_id(lit.as_bytes()[abs - 1]);
-                                            let after_ok =
-                                                end == lit.len() || !is_id(lit.as_bytes()[end]);
-                                            if before_ok && after_ok {
-                                                return Some(why.clone());
-                                            }
-                                            start = abs + 1;
-                                        }
-                                        None
-                                    })
-                                })
-                            {
-                                let fn_label =
-                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
-                                explain_reasons
-                                    .insert(func, format!("`{fn_label}` <- mentions {prev}"));
-                                added.push(func);
                             }
                         }
                         if added.is_empty() {
@@ -1423,24 +1373,6 @@ fn build(
                                             && test_reach.insert(fid)
                                         {
                                             explain_reasons.insert(fid, fn_why.clone());
-                                        }
-                                    }
-                                }
-                                for sib_item in imp.items(db) {
-                                    if let hir::AssocItem::Function(sib_fn) = sib_item
-                                        && let Ok(sib_fid) = FunctionId::try_from(sib_fn)
-                                    {
-                                        let sib_deps =
-                                            hir_ty::mir::codegen::function_deps(db, sib_fid);
-                                        if sib_deps.string_lits.len() == 1 {
-                                            let key = &sib_deps.string_lits[0];
-                                            if key.contains("::") {
-                                                global_dispatch_keys
-                                                    .entry(key.clone())
-                                                    .or_insert_with(|| {
-                                                        format!("dispatch key `\"{key}\"` <- {fn_why}")
-                                                    });
-                                            }
                                         }
                                     }
                                 }
