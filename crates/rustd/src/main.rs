@@ -1012,6 +1012,7 @@ fn build(
                 }
             }
         }
+        let mut impacted_tests = Vec::new();
         if !dirty_files.is_empty()
             && let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
             && let Ok(bin_crates) = crates_named(db, &bc)
@@ -1019,13 +1020,15 @@ fn build(
             for bc_krate in bin_crates {
                 if seen_crates.insert(bc_krate.into()) {
                     let l = listed.of(db, bc_krate);
-                    if l.functions.len() <= 500 {
+                    if args.cfg_test || l.functions.len() <= 500 {
                         candidate_crates.push(bc_krate);
                     }
                 }
             }
         }
         let mut global_need_callers = FxHashSet::default();
+        let mut global_vtable_adts = changed_adts.clone();
+        let mut global_impacted_fns = FxHashSet::default();
         for c in candidate_crates {
             local.push(c);
             let l = listed.of(db, c);
@@ -1046,12 +1049,15 @@ fn build(
                     }
                 });
             };
-            if !changed_adts.is_empty() || !global_need_callers.is_empty() {
+            let mut warmed = false;
+            if !global_vtable_adts.is_empty() || !global_need_callers.is_empty() {
                 warm_deps(db, &l.functions);
+                warmed = true;
             }
             let mut direct_changed = FxHashSet::default();
             let mut need_callers = global_need_callers.clone();
-            let mut vtable_adts = changed_adts.clone();
+            let mut vtable_adts = global_vtable_adts.clone();
+            let mut test_adts = global_vtable_adts.clone();
             hir::attach_db(db, || {
                 for &func in &l.functions {
                     let f = func
@@ -1074,6 +1080,17 @@ fn build(
                         hir_ty::mir::codegen::function_mentions_adts(db, func, &vtable_adts);
                     if in_dirty_changed || touches_changed_const || touches_changed_adt {
                         direct_changed.insert(func);
+                        let h_fn = hir::Function::from(func);
+                        let impl_adt = h_fn
+                            .as_assoc_item(db)
+                            .and_then(|assoc| match assoc.container(db) {
+                                AssocItemContainer::Impl(imp) => imp.self_ty(db).as_adt(),
+                                _ => None,
+                            })
+                            .map(hir_def::AdtId::from);
+                        if let Some(adt_id) = impl_adt {
+                            test_adts.insert(adt_id);
+                        }
                         if initial_serials.contains_key(&func)
                             && (resolver.function(func).is_none()
                                 || hir_def::signatures::FunctionSignature::of(db, func).is_async()
@@ -1081,20 +1098,17 @@ fn build(
                                     .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE))
                         {
                             need_callers.insert(func);
-                            let h_fn = hir::Function::from(func);
-                            if let Some(assoc) = h_fn.as_assoc_item(db)
-                                && let AssocItemContainer::Impl(imp) = assoc.container(db)
-                                && let Some(adt) = imp.self_ty(db).as_adt()
-                            {
-                                vtable_adts.insert(hir_def::AdtId::from(adt));
+                            if let Some(adt_id) = impl_adt {
+                                vtable_adts.insert(adt_id);
                             }
                         }
                     }
                 }
             });
             if !need_callers.is_empty() || vtable_adts.len() > changed_adts.len() {
-                if changed_adts.is_empty() && global_need_callers.is_empty() {
+                if !warmed {
                     warm_deps(db, &l.functions);
+                    warmed = true;
                 }
                 hir::attach_db(db, || {
                     for _ in 0..3 {
@@ -1131,6 +1145,52 @@ fn build(
                 });
             }
             global_need_callers.extend(need_callers);
+            global_vtable_adts.extend(&test_adts);
+            global_impacted_fns.extend(&direct_changed);
+            if args.cfg_test && (!global_impacted_fns.is_empty() || !global_vtable_adts.is_empty()) {
+                if !warmed {
+                    warm_deps(db, &l.functions);
+                }
+                let mut test_reach = global_impacted_fns.clone();
+                hir::attach_db(db, || {
+                    for _ in 0..3 {
+                        let mut added = Vec::new();
+                        for &func in &l.functions {
+                            if !test_reach.contains(&func)
+                                && (hir_ty::mir::codegen::function_calls_any(
+                                    db,
+                                    func,
+                                    &test_reach,
+                                ) || hir_ty::mir::codegen::function_mentions_adts(
+                                    db,
+                                    func,
+                                    &global_vtable_adts,
+                                ))
+                            {
+                                added.push(func);
+                            }
+                        }
+                        if added.is_empty() {
+                            break;
+                        }
+                        test_reach.extend(added);
+                    }
+                    for &func in &l.functions {
+                        if test_reach.contains(&func)
+                            && hir_def::attrs::AttrFlags::query(db, func.into())
+                                .contains(hir_def::attrs::AttrFlags::IS_TEST)
+                            && let Some(path) = resolver.path(func)
+                        {
+                            let rel = path.split_once("::").map_or(path.as_str(), |(_, r)| r);
+                            let name = rel.to_owned();
+                            if !impacted_tests.contains(&name) {
+                                impacted_tests.push(name);
+                            }
+                        }
+                    }
+                });
+                global_impacted_fns.extend(test_reach);
+            }
             for &func in &l.functions {
                 if direct_changed.contains(&func) && resolver.function(func).is_some() {
                     e.push(func);
@@ -1139,6 +1199,8 @@ fn build(
                 }
             }
         }
+        let tests_txt = args.out.with_extension("tests.txt");
+        let _ = std::fs::write(&tests_txt, impacted_tests.join("\n"));
         (e, o)
     };
     let list = start.elapsed();
@@ -2665,6 +2727,20 @@ fn main() -> anyhow::Result<()> {
                                 hir_ty::mir::codegen::function_tree_serial(&db, func)
                             });
                         }
+                    }
+                });
+                let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+                let funcs = &l.functions;
+                std::thread::scope(|scope| {
+                    for part in 0..threads.min(funcs.len()) {
+                        let db = db.clone();
+                        scope.spawn(move || {
+                            hir::attach_db(&db, || {
+                                for &func in funcs.iter().skip(part).step_by(threads) {
+                                    let _ = hir_ty::mir::codegen::function_deps(&db, func);
+                                }
+                            });
+                        });
                     }
                 });
                 if baseline_dirty {

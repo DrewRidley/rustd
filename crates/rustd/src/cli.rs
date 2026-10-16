@@ -73,6 +73,7 @@ struct CliOpts {
     crates: Vec<String>,
     target: Option<String>,
     watch: bool,
+    all_tests: bool,
     cfg_test: bool,
     run_args: Vec<String>,
 }
@@ -206,6 +207,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let mut crates = Vec::new();
     let mut target = None;
     let mut watch = false;
+    let mut all_tests = false;
     let mut run_args = Vec::new();
 
     let mut it = args.iter();
@@ -242,6 +244,8 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                 target = Some(it.next().context("--target requires a triple")?.clone());
             }
             "-w" | "--watch" => watch = true,
+            "-c" | "--changed" => all_tests = false,
+            "--all" => all_tests = true,
             other if other.starts_with('-') => bail!("unknown option `{other}`"),
             positional if manifest.is_none() && Path::new(positional).exists() => {
                 manifest = Some(PathBuf::from(positional));
@@ -285,6 +289,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         crates,
         target,
         watch,
+        all_tests,
         cfg_test,
         run_args,
     })
@@ -833,13 +838,44 @@ fn cmd_run(args: &[String]) -> anyhow::Result<()> {
     Err(err.into())
 }
 
+fn resolve_test_args(opts: &CliOpts, paths: &TargetPaths) -> Vec<String> {
+    if !opts.run_args.is_empty() || opts.all_tests {
+        return opts.run_args.clone();
+    }
+    let tests_txt = paths.base_o.with_extension("tests.txt");
+    if let Ok(txt) = fs::read_to_string(tests_txt) {
+        let impacted: Vec<String> = txt
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !impacted.is_empty() && impacted.len() <= 64 {
+            let preview: Vec<&str> = impacted.iter().take(5).map(String::as_str).collect();
+            let suffix = if impacted.len() > 5 {
+                format!(", ... (+{} more)", impacted.len() - 5)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[rustd] running {} impacted test(s): {}{suffix}",
+                impacted.len(),
+                preview.join(", ")
+            );
+            return impacted;
+        }
+    }
+    opts.run_args.clone()
+}
+
 fn cmd_test(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts_with_mode(args, true)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     ensure_daemon(&opts, &paths)?;
     if !opts.watch {
+        let test_args = resolve_test_args(&opts, &paths);
         let mut cmd = Command::new(&paths.out_bin);
-        cmd.args(&opts.run_args);
+        cmd.args(&test_args);
         let err = cmd.exec();
         return Err(err.into());
     }
@@ -848,7 +884,8 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         .and_then(|v| v.parse::<usize>().ok());
     let mut runs = 0usize;
     let t0 = Instant::now();
-    let status = Command::new(&paths.out_bin).args(&opts.run_args).status()?;
+    let initial_args = resolve_test_args(&opts, &paths);
+    let status = Command::new(&paths.out_bin).args(&initial_args).status()?;
     eprintln!("[rustd] initial test run finished in {:.1?} ({status})", t0.elapsed());
     runs += 1;
     if max_runs.is_some_and(|m| runs >= m) {
@@ -862,7 +899,8 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         if cur_mtime.is_some() && cur_mtime != last_mtime {
             last_mtime = cur_mtime;
             let t0 = Instant::now();
-            let status = Command::new(&paths.out_bin).args(&opts.run_args).status()?;
+            let next_args = resolve_test_args(&opts, &paths);
+            let status = Command::new(&paths.out_bin).args(&next_args).status()?;
             eprintln!("[rustd] re-ran tests in {:.1?} ({status})", t0.elapsed());
             runs += 1;
             if max_runs.is_some_and(|m| runs >= m) {
