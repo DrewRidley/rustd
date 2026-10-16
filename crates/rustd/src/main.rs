@@ -1030,6 +1030,23 @@ fn build(
             && let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
             && let Ok(bin_crates) = crates_named(db, &bc)
         {
+            let mut bin_deps = FxHashSet::default();
+            for &bc_krate in &bin_crates {
+                let raw: ide_db::base_db::Crate = bc_krate.into();
+                bin_deps.extend(raw.transitive_deps(db));
+            }
+            let base_candidates = candidate_crates.clone();
+            for base_c in base_candidates {
+                let raw_base: ide_db::base_db::Crate = base_c.into();
+                for rev in raw_base.transitive_rev_deps(db) {
+                    if bin_deps.contains(&rev)
+                        && Crate::from(rev).origin(db).is_local()
+                        && seen_crates.insert(rev)
+                    {
+                        candidate_crates.push(Crate::from(rev));
+                    }
+                }
+            }
             for bc_krate in bin_crates {
                 if seen_crates.insert(bc_krate.into()) {
                     let l = listed.of(db, bc_krate);
@@ -1202,7 +1219,7 @@ fn build(
                     warmed = true;
                 }
                 hir::attach_db(db, || {
-                    for _ in 0..8 {
+                    loop {
                         let mut newly_added = Vec::new();
                         for &func in &l.functions {
                             if !direct_changed.contains(&func)
@@ -1249,7 +1266,7 @@ fn build(
                 }
                 let mut test_reach = global_impacted_fns.clone();
                 hir::attach_db(db, || {
-                    for _ in 0..32 {
+                    loop {
                         let mut added = Vec::new();
                         for &func in &l.functions {
                             if test_reach.contains(&func) {
@@ -1296,6 +1313,56 @@ fn build(
                         }
                         if added.is_empty() {
                             break;
+                        }
+                        for &f in &added {
+                            let h_fn = hir::Function::from(f);
+                            let fn_why = explain_reasons
+                                .get(&f)
+                                .cloned()
+                                .unwrap_or_else(|| "reached fn".to_owned());
+                            if let Some(assoc) = h_fn.as_assoc_item(db)
+                                && let AssocItemContainer::Impl(imp) = assoc.container(db)
+                            {
+                                if let Some(adt) = imp.self_ty(db).as_adt() {
+                                    let adt_id = hir_def::AdtId::from(adt);
+                                    if global_test_adts.insert(adt_id) {
+                                        let adt_name = adt
+                                            .name(db)
+                                            .display(db, syntax::Edition::CURRENT)
+                                            .to_string();
+                                        adt_reasons.insert(
+                                            adt_id,
+                                            format!("type `{adt_name}` <- {fn_why}"),
+                                        );
+                                    }
+                                }
+                                if let Some(trait_) = imp.trait_(db) {
+                                    let trait_id = hir_def::TraitId::from(trait_);
+                                    if global_test_traits.insert(trait_id) {
+                                        let trait_name = trait_
+                                            .name(db)
+                                            .display(db, syntax::Edition::CURRENT)
+                                            .to_string();
+                                        trait_reasons.insert(
+                                            trait_id,
+                                            format!("trait `{trait_name}` <- {fn_why}"),
+                                        );
+                                    }
+                                    if trait_.module(db).krate(db).origin(db).is_local() {
+                                        let fn_name = h_fn.name(db);
+                                        for &(ref t_name, item) in
+                                            trait_id.trait_items(db).items.iter()
+                                        {
+                                            if let AssocItemId::FunctionId(fid) = item
+                                                && t_name.as_str() == fn_name.as_str()
+                                                && test_reach.insert(fid)
+                                            {
+                                                explain_reasons.insert(fid, fn_why.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         test_reach.extend(added);
                     }
@@ -2402,7 +2469,7 @@ fn run_backtest(
             if let Some(a) = impl_adt {
                 adts.insert(a);
             }
-            for _ in 0..16 {
+            loop {
                 let mut added = Vec::new();
                 for &f in &all_funcs {
                     if !reach.contains(&f)
