@@ -104,6 +104,43 @@ pub fn layout_of_adt_query(
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
     };
+    if let rustc_abi::Variants::Multiple {
+        ref mut tag,
+        tag_encoding:
+            rustc_abi::TagEncoding::Niche {
+                untagged_variant,
+                ref niche_variants,
+                ref mut niche_start,
+            },
+        ref variants,
+        ..
+    } = result.variants
+        && niche_variants.start() == niche_variants.end()
+        && let Some(orig_niche) = variants[untagged_variant].largest_niche
+    {
+        let v = orig_niche.valid_range;
+        let max_value = orig_niche.value.size(&dl).unsigned_int_max();
+        let distance_end_zero = max_value - v.end;
+        if v.start == 0 && v.start <= v.end && v.start <= distance_end_zero {
+            let new_start = v.end.wrapping_add(1) & max_value;
+            *niche_start = new_start;
+            *tag.valid_range_mut() = rustc_abi::WrappingRange { start: v.start, end: new_start };
+            match &mut result.backend_repr {
+                rustc_abi::BackendRepr::Scalar(s) => {
+                    *s = *tag;
+                }
+                rustc_abi::BackendRepr::ScalarPair(a, b) => {
+                    if orig_niche.offset == rustc_abi::Size::ZERO {
+                        *a = *tag;
+                    } else {
+                        *b = *tag;
+                    }
+                }
+                _ => {}
+            }
+            result.largest_niche = rustc_abi::Niche::from_scalar(&dl, orig_niche.offset, *tag);
+        }
+    }
     let valid_range = AttrFlags::rustc_layout_scalar_valid_range(db, def);
     if valid_range.start.is_some() || valid_range.end.is_some() {
         if let rustc_abi::BackendRepr::Scalar(scalar)

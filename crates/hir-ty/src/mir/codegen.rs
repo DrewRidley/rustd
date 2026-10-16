@@ -893,6 +893,52 @@ pub fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
 }
 
 #[salsa::tracked(returns(copy))]
+pub fn function_tree_serial(db: &dyn HirDatabase, func: FunctionId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    let def: DefWithBodyId = func.into();
+    hir_def::expr_store::Body::of(db, def)
+        .pretty_print(db, def, span::Edition::CURRENT)
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+#[salsa::tracked(returns(ref))]
+fn function_adts(db: &dyn HirDatabase, func: FunctionId) -> FxHashSet<hir_def::AdtId> {
+    let infer = InferenceResult::of(db, func);
+    struct Collector(FxHashSet<hir_def::AdtId>);
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if let TyKind::Adt(def, _) = ty.kind() {
+                self.0.insert(def.def_id());
+            }
+            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self);
+        }
+    }
+    let mut collector = Collector(FxHashSet::default());
+    for (_, ty) in infer.type_of_expr.iter() {
+        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut collector);
+    }
+    for (_, ty) in infer.type_of_binding.iter() {
+        rustc_type_ir::TypeVisitable::visit_with(&ty.as_ref(), &mut collector);
+    }
+    collector.0
+}
+
+pub fn function_mentions_adts(
+    db: &dyn HirDatabase,
+    func: FunctionId,
+    adts: &FxHashSet<hir_def::AdtId>,
+) -> bool {
+    if adts.is_empty() {
+        return false;
+    }
+    let f_adts = function_adts(db, func);
+    adts.iter().any(|adt| f_adts.contains(adt))
+}
+
+#[salsa::tracked(returns(copy))]
 fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u64 {
     compiled_instance(db, instance, env);
     next_serial()
@@ -2197,7 +2243,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     ) -> Result<FuncId> {
         let (def, args) = (instance.def, instance.args.as_ref());
         if let InstanceDef::Fn(func) = def
-            && args.is_empty()
+            && (args.is_empty()
+                || (!self.own_statics.crates.contains(&func.krate(self.db))
+                    && args
+                        .iter()
+                        .all(|a| a.ty().is_some_and(|t| matches!(t.kind(), TyKind::Adt(..))))))
             && let Some(symbol) = self.symbols.function(func)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))
@@ -2217,6 +2267,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         let name = self.callee_name(def);
         if let Some(Rejected { why, .. }) = self.rejected.get(instance) {
+            if let InstanceDef::Fn(func) = def
+                && let Some(symbol) = self.symbols.function(func)
+                && !returns_async_block(self.db, func)
+            {
+                self.want(func);
+                return self.import(&symbol, sig);
+            }
             unsupported!("callee `{name}`: {why}");
         }
         if let Some(&id) = self.instances.get(instance) {
@@ -7259,6 +7316,43 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 self.builder.ins().store(MEM, acc, dst, 0);
             }
+            ("simd_cast" | "simd_as" | "simd_neg", [arg]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (in_lane, count) = self.simd_lanes(ty)?;
+                let (out_lane, _) = self.simd_lanes(dst_ty)?;
+                for i in 0..count {
+                    let in_off = (i * in_lane.ty.bytes() as u64) as i32;
+                    let out_off = (i * out_lane.ty.bytes() as u64) as i32;
+                    let val = self.builder.ins().load(in_lane.ty, MEM, src, in_off);
+                    let res = if name == "simd_neg" {
+                        if in_lane.ty.is_float() {
+                            self.builder.ins().fneg(val)
+                        } else {
+                            self.builder.ins().ineg(val)
+                        }
+                    } else if !in_lane.ty.is_float() && !out_lane.ty.is_float() {
+                        self.int_cast(val, in_lane, out_lane)
+                    } else {
+                        unsupported!("intrinsic `{name}` on {:?} -> {:?}", in_lane.ty, out_lane.ty);
+                    };
+                    self.builder.ins().store(MEM, res, dst, out_off);
+                }
+            }
+            ("simd_reduce_add_ordered" | "simd_reduce_add_unordered", [arg, acc]) => {
+                let (src, ty) = self.operand(arg)?;
+                let (mut sum, _) = self.load_scalar(acc)?;
+                let (lane, count) = self.simd_lanes(ty)?;
+                for i in 0..count {
+                    let offset = (i * lane.ty.bytes() as u64) as i32;
+                    let value = self.builder.ins().load(lane.ty, MEM, src, offset);
+                    sum = if lane.ty.is_float() {
+                        self.builder.ins().fadd(sum, value)
+                    } else {
+                        self.builder.ins().iadd(sum, value)
+                    };
+                }
+                self.builder.ins().store(MEM, sum, dst, 0);
+            }
             (
                 "fabs"
                 | "fabsf32"
@@ -7456,6 +7550,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         match (name, args) {
+            (
+                "aarch64.isb"
+                | "aarch64.dmb"
+                | "aarch64.dsb"
+                | "aarch64.hint"
+                | "x86.sse2.pause",
+                _,
+            ) => {
+                self.builder.ins().fence();
+            }
             ("x86.sse3.ldu.dq" | "x86.avx.ldu.dq.256", [ptr]) => {
                 let (ptr, _) = self.load_scalar(ptr)?;
                 let size = self.layout(dst_ty)?.size;

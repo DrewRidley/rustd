@@ -89,10 +89,12 @@ fn outline(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<u64> {
     };
     // A function the edit took away is an edit to more than bodies, and asking for its body
     // panics.
+    crate::PROBING.set(true);
     let seen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::lower(db, functions.iter().map(|&it| it.into()).collect());
         Written::of(db, &functions)
     }));
+    crate::PROBING.set(false);
     let seen = match seen {
         Ok(Some(seen)) => seen,
         Ok(None) => {

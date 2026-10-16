@@ -158,7 +158,13 @@ impl SymbolTable {
                 let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
                 let closures = path
                     .split("::")
-                    .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
+                    .filter_map(|it| {
+                        if it == "{{closure}}" {
+                            Some(0)
+                        } else {
+                            it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok()
+                        }
+                    })
                     .collect();
                 let symbols = table.nested.entry(named.join("::")).or_default();
                 if symbols.iter().all(|it| it.name != name) {
@@ -168,6 +174,52 @@ impl SymbolTable {
             table.by_path.entry(path).or_default().push(Placed { name, place });
         }
         Ok(table)
+    }
+
+    pub(crate) fn filter_to_binary(&mut self, bin_path: &Path) {
+        let Ok(data) = std::fs::read(bin_path) else { return };
+        let Ok(object) = object::File::parse(&*data) else { return };
+        let is_macho = object.format() == object::BinaryFormat::MachO;
+        let mut defined_by_base = rustc_hash::FxHashMap::default();
+        for symbol in object.symbols() {
+            let defined = symbol.section_index().is_some() || symbol.is_common();
+            if !(defined && symbol.is_global()) {
+                continue;
+            }
+            let Ok(name) = symbol.name() else { continue };
+            let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
+            defined_by_base
+                .insert(without_instantiating_crate(name).to_owned(), name.to_owned());
+        }
+        if defined_by_base.is_empty() {
+            return;
+        }
+        self.by_path.retain(|_, list| {
+            list.retain_mut(|it| {
+                if let Some(actual) =
+                    defined_by_base.get(without_instantiating_crate(&it.name))
+                {
+                    it.name = actual.clone();
+                    true
+                } else {
+                    it.name.ends_with("STATIC_INNER_SLICE")
+                }
+            });
+            !list.is_empty()
+        });
+        self.nested.retain(|_, list| {
+            list.retain_mut(|it| {
+                if let Some(actual) =
+                    defined_by_base.get(without_instantiating_crate(&it.name))
+                {
+                    it.name = actual.clone();
+                    true
+                } else {
+                    false
+                }
+            });
+            !list.is_empty()
+        });
     }
 
     fn collect_names(

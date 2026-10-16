@@ -19,13 +19,17 @@ use std::{
 use anyhow::{Context, bail, ensure};
 
 pub(crate) fn is_subcommand(arg: &str) -> bool {
-    matches!(arg, "build" | "run" | "patch" | "sync" | "status" | "stop" | "help" | "--help" | "-h")
+    matches!(
+        arg,
+        "build" | "run" | "test" | "patch" | "sync" | "status" | "stop" | "help" | "--help" | "-h"
+    )
 }
 
 pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
     match sub {
         "build" => cmd_build(&args),
         "run" => cmd_run(&args),
+        "test" => cmd_test(&args),
         "patch" => cmd_request("patch", &args),
         "sync" => cmd_request("sync", &args),
         "status" => cmd_status(&args),
@@ -35,12 +39,13 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
                 "Usage:\n  \
                  rustd build [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
                  rustd run   [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
+                 rustd test  [FILTER] [-p PACKAGE] [--manifest-path PATH] [-- ARGS...]\n  \
                  rustd patch [--manifest-path PATH] [--bin NAME]\n  \
                  rustd sync  [--manifest-path PATH] [--bin NAME]\n  \
                  rustd status [--manifest-path PATH] [--bin NAME]\n  \
                  rustd stop   [--manifest-path PATH] [--bin NAME]\n\n\
                  Low-level daemon invocation:\n  \
-                 rustd <Cargo.toml> --crate <CRATE> --out <BASE.O> [--patch <PATCH.O>] [--symbols <RLIB>]... [--watch]"
+                 rustd <Cargo.toml> [--crate <CRATE>] --out <BASE.O> [--patch <PATCH.O>] [--symbols <RLIB>]... [--watch]"
             );
             Ok(())
         }
@@ -51,9 +56,11 @@ struct CliOpts {
     manifest_path: PathBuf,
     workspace_root: PathBuf,
     bin_name: String,
+    pkg_name: Option<String>,
     crates: Vec<String>,
     target: Option<String>,
     watch: bool,
+    cfg_test: bool,
     run_args: Vec<String>,
 }
 
@@ -170,9 +177,10 @@ fn infer_default_bin(workspace_root: &Path) -> Option<String> {
     None
 }
 
-fn parse_opts(args: &[String]) -> anyhow::Result<CliOpts> {
+fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOpts> {
     let mut manifest = None;
     let mut bin_name = None;
+    let mut pkg_name = None;
     let mut crates = Vec::new();
     let mut target = None;
     let mut watch = false;
@@ -186,15 +194,23 @@ fn parse_opts(args: &[String]) -> anyhow::Result<CliOpts> {
                 break;
             }
             "--manifest-path" => {
-                manifest = Some(PathBuf::from(it.next().context("--manifest-path requires a path")?));
+                manifest =
+                    Some(PathBuf::from(it.next().context("--manifest-path requires a path")?));
             }
             "--bin" => {
                 bin_name = Some(it.next().context("--bin requires a name")?.clone());
             }
+            "-p" | "--package" if cfg_test => {
+                pkg_name = Some(it.next().context("-p requires a package name")?.clone());
+            }
             "--crate" | "-p" | "--package" => {
                 let val = it.next().context("--crate requires a crate name")?;
-                for c in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    crates.push(c.replace('-', "_"));
+                if cfg_test && pkg_name.is_none() {
+                    pkg_name = Some(val.clone());
+                } else {
+                    for c in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        crates.push(c.replace('-', "_"));
+                    }
                 }
             }
             "--target" => {
@@ -205,16 +221,44 @@ fn parse_opts(args: &[String]) -> anyhow::Result<CliOpts> {
             positional if manifest.is_none() && Path::new(positional).exists() => {
                 manifest = Some(PathBuf::from(positional));
             }
+            filter if cfg_test => {
+                run_args.push(filter.to_owned());
+            }
             other => bail!("unexpected argument `{other}`"),
         }
     }
 
     let (manifest_path, workspace_root) = find_manifest_path(manifest)?;
-    let bin_name = match bin_name.or_else(|| infer_default_bin(&workspace_root)) {
-        Some(b) => b,
-        None => bail!("could not infer binary target; pass `--bin <NAME>`"),
+    let bin_name = if cfg_test {
+        let pkg = pkg_name
+            .clone()
+            .or_else(|| infer_default_bin(&workspace_root))
+            .context("could not infer package for `rustd test`; pass `-p <PACKAGE>`")?;
+        if pkg_name.is_none() {
+            pkg_name = Some(pkg.clone());
+        }
+        format!("test-{}", pkg.replace('-', "_"))
+    } else {
+        match bin_name.or_else(|| infer_default_bin(&workspace_root)) {
+            Some(b) => b,
+            None => bail!("could not infer binary target; pass `--bin <NAME>`"),
+        }
     };
-    Ok(CliOpts { manifest_path, workspace_root, bin_name, crates, target, watch, run_args })
+    Ok(CliOpts {
+        manifest_path,
+        workspace_root,
+        bin_name,
+        pkg_name,
+        crates,
+        target,
+        watch,
+        cfg_test,
+        run_args,
+    })
+}
+
+fn parse_opts(args: &[String]) -> anyhow::Result<CliOpts> {
+    parse_opts_with_mode(args, false)
 }
 
 fn find_wild() -> anyhow::Result<PathBuf> {
@@ -302,8 +346,47 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
     if paths.link_args_txt.exists() {
         return Ok(fs::read_to_string(&paths.link_args_txt)?);
     }
-    eprintln!("Capturing linker arguments via `cargo build --bin {}`...", opts.bin_name);
     let debug_dir = opts.workspace_root.join("target").join("debug");
+    if opts.cfg_test {
+        let pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
+        let krate = pkg.replace('-', "_");
+        eprintln!("Capturing test linker arguments via `cargo test --no-run -p {pkg} --lib`...");
+        if let Ok(entries) = fs::read_dir(debug_dir.join("deps")) {
+            let prefix = format!("{krate}-");
+            for e in entries.flatten() {
+                let p = e.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && name.starts_with(&prefix)
+                    && p.extension().is_none()
+                {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&opts.workspace_root)
+            .args(["rustc", "-p", pkg, "--lib", "--profile", "test"])
+            .env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
+        if let Some(t) = &opts.target {
+            cmd.args(["--target", t]);
+        }
+        cmd.args(["--", "-C", "save-temps"]);
+        let out = cmd.output().context("running cargo rustc --profile test to capture link args")?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        ensure!(
+            combined
+                .lines()
+                .any(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang"))),
+            "cargo test --no-run did not emit a linker command for `{pkg}`"
+        );
+        fs::write(&paths.link_args_txt, &combined)?;
+        return Ok(combined);
+    }
+    eprintln!("Capturing linker arguments via `cargo build --bin {}`...", opts.bin_name);
     let _ = fs::remove_file(debug_dir.join(&opts.bin_name));
     if let Ok(entries) = fs::read_dir(debug_dir.join("deps")) {
         let prefix = format!("{}-", opts.bin_name.replace('-', "_"));
@@ -319,12 +402,13 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
     }
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&opts.workspace_root)
-        .args(["build", "--bin", &opts.bin_name])
+        .args(["rustc", "--bin", &opts.bin_name])
         .env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
     if let Some(t) = &opts.target {
         cmd.args(["--target", t]);
     }
-    let out = cmd.output().context("running cargo build to capture link args")?;
+    cmd.args(["--", "-C", "save-temps"]);
+    let out = cmd.output().context("running cargo rustc to capture link args")?;
     let combined = format!(
         "{}\n{}",
         String::from_utf8_lossy(&out.stdout),
@@ -386,7 +470,7 @@ fn prepare_link_script_and_symbols(
     } else {
         let line = link_text
             .lines()
-            .find(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang")))
+            .rfind(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang")))
             .context("no cc/clang invocation found in link_args.txt")?;
         let words = shell_words(line);
         let idx = words
@@ -477,6 +561,14 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
     for c in &opts.crates {
         cmd.args(["--crate", c]);
     }
+    let bin_crate = opts
+        .pkg_name
+        .as_deref()
+        .unwrap_or(&opts.bin_name)
+        .replace('-', "_");
+    if opts.cfg_test {
+        cmd.arg("--cfg-test");
+    }
     cmd.arg("--out")
         .arg(&paths.base_o)
         .arg("--patch")
@@ -486,7 +578,7 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
         .arg(&paths.rustd_sock)
         .arg("--link-cmd")
         .arg(&paths.link_sh)
-        .env("RUSTD_BIN_CRATE", &opts.bin_name)
+        .env("RUSTD_BIN_CRATE", &bin_crate)
         .env("RUSTD_STATS", "1");
     if opts.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
         cmd.env("RUSTD_WASM_TRAMPOLINES", "1");
@@ -567,6 +659,16 @@ fn cmd_build(args: &[String]) -> anyhow::Result<()> {
 
 fn cmd_run(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
+    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    ensure_daemon(&opts, &paths)?;
+    let mut cmd = Command::new(&paths.out_bin);
+    cmd.args(&opts.run_args);
+    let err = cmd.exec();
+    Err(err.into())
+}
+
+fn cmd_test(args: &[String]) -> anyhow::Result<()> {
+    let opts = parse_opts_with_mode(args, true)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     ensure_daemon(&opts, &paths)?;
     let mut cmd = Command::new(&paths.out_bin);

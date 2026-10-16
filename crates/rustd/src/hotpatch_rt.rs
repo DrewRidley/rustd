@@ -1,22 +1,24 @@
 //! Pure-Rust in-process hot-patch runtime (`base.rt.o`) when `rustd` builds a binary.
 //!
 //! Supports both:
-//! 1. Jump-table slot patching (`<sym>$rustd_ptr` in `__DATA,__data`) when `--crate` pre-compiles
-//!    a crate into `base.o`.
-//! 2. Zero-config workspace-wide 4-byte inline branch detouring (`b <veneer>`) on any `rustc`
-//!    function in `__TEXT,__text` via `VENEER_CAVE_START` / `__rustd_veneer_cave_end` and
-//!    Copy-on-Write `mach_vm_protect` / `mprotect`, so `rustd run` works across all workspace
-//!    crates without needing `--crate`.
+//! 1. Jump-table slot patching (`<sym>$rustd_ptr` in `__DATA,__data` / `.data`) when `--crate`
+//!    pre-compiles a crate into `base.o`.
+//! 2. Zero-config workspace-wide inline branch detouring (`b <veneer>` on `aarch64`,
+//!    `jmp rel32 <veneer>` on `x86_64`) on any `rustc` function in `__TEXT,__text` / `.text`
+//!    via `VENEER_CAVE_START` / `__rustd_veneer_cave_end` and Copy-on-Write `mach_vm_protect` /
+//!    `mprotect`, so `rustd run` and `rustd test` work across all workspace crates without
+//!    needing `--crate`.
 
 #![allow(unsafe_op_in_unsafe_fn, clippy::manual_slice_size_calculation)]
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs,
     path::{Path, PathBuf},
     ptr,
     sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicPtr, Ordering},
     },
     thread,
@@ -29,12 +31,22 @@ use std::{
 static RUSTD_HOTPATCH_INIT: extern "C" fn() = rustd_hotpatch_init;
 
 #[repr(C, align(16384))]
-struct VeneerCave([u32; 16384]);
+pub struct VeneerCave([u32; 65536]);
 
 #[used]
+#[unsafe(no_mangle)]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__TEXT,__text"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".text"))]
-static VENEER_CAVE_START: VeneerCave = VeneerCave([0xd503_201f; 16384]);
+pub static VENEER_CAVE_START: VeneerCave = VeneerCave([0xd503_201f; 65536]);
+
+#[repr(C, align(16384))]
+pub struct DataCave([u64; 8192]);
+
+#[used]
+#[unsafe(no_mangle)]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__data"))]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".data"))]
+pub static PATCH_DATA_CAVE: DataCave = DataCave([0; 8192]);
 
 unsafe extern "C" {
     static __rustd_veneer_cave_end: u32;
@@ -75,6 +87,10 @@ unsafe extern "C" {
     fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+    fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+    fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_void;
+    fn memcmp(s1: *const c_void, s2: *const c_void, n: usize) -> c_int;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *const c_void, len: usize);
     #[cfg(target_os = "macos")]
@@ -87,11 +103,17 @@ unsafe extern "C" {
         set_maximum: c_int,
         new_protection: c_int,
     ) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn _dyld_image_count() -> u32;
+    #[cfg(target_os = "macos")]
+    fn _dyld_get_image_header(image_index: u32) -> *const u8;
+    #[cfg(target_os = "macos")]
+    fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
 }
 
 enum SavedPatch {
     PtrSlot { slot: *const AtomicPtr<c_void>, orig: *mut c_void },
-    InlineBranch { addr: *mut u32, orig_insn: u32 },
+    InlineBytes { addr: *mut u8, orig: [u8; 8], len: usize },
 }
 
 unsafe impl Send for SavedPatch {}
@@ -159,11 +181,7 @@ fn record_and_patch_slot(slot: *const AtomicPtr<c_void>, new_fn: *mut c_void) {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn detour_function_inline(
-    orig_fn: *mut u32,
-    new_fn: usize,
-    veneer_idx: &mut usize,
-) -> bool {
+fn detour_function_inline(orig_fn: *mut u8, new_fn: usize, veneer_idx: &mut usize) -> bool {
     let orig_addr = orig_fn as usize;
     let start_cave = VENEER_CAVE_START.0.as_ptr() as usize;
     let end_cave = (((&raw const __rustd_veneer_cave_end) as usize) + 16383) & !16383;
@@ -198,29 +216,76 @@ fn detour_function_inline(
 
         let mut saved = SAVED_PATCHES.lock().unwrap();
         let already = saved.iter().any(
-            |s| matches!(s, SavedPatch::InlineBranch { addr, .. } if ptr::eq(*addr, orig_fn)),
+            |s| matches!(s, SavedPatch::InlineBytes { addr, .. } if ptr::eq(*addr, orig_fn)),
         );
-        let orig_insn = orig_fn.read();
         if !already {
-            saved.push(SavedPatch::InlineBranch { addr: orig_fn, orig_insn });
+            let mut orig = [0u8; 8];
+            ptr::copy_nonoverlapping(orig_fn, orig.as_mut_ptr(), 4);
+            saved.push(SavedPatch::InlineBytes { addr: orig_fn, orig, len: 4 });
         }
         if !make_text_writable(orig_addr, 4) {
             return false;
         }
         let b_insn = 0x1400_0000u32 | ((diff as u32) & 0x03ff_ffff);
-        orig_fn.write(b_insn);
+        (orig_fn as *mut u32).write(b_insn);
         make_text_executable(orig_addr, 4);
     }
     true
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn detour_function_inline(
-    _orig_fn: *mut u32,
-    _new_fn: usize,
-    _veneer_idx: &mut usize,
-) -> bool {
-    false
+#[cfg(target_arch = "x86_64")]
+fn detour_function_inline(orig_fn: *mut u8, new_fn: usize, veneer_idx: &mut usize) -> bool {
+    let orig_addr = orig_fn as usize;
+    let start_cave = VENEER_CAVE_START.0.as_ptr() as usize;
+    let end_cave = (((&raw const __rustd_veneer_cave_end) as usize) + 4095) & !4095;
+
+    let slot_offset = *veneer_idx * 16;
+    if slot_offset + 16 > 65536 {
+        return false;
+    }
+    let cave_base = if orig_addr.abs_diff(start_cave + slot_offset) < 0x7000_0000 {
+        start_cave
+    } else if orig_addr.abs_diff(end_cave + slot_offset) < 0x7000_0000 {
+        end_cave
+    } else {
+        return false;
+    };
+    let veneer_addr = cave_base + slot_offset;
+    let rel = (veneer_addr as i64) - ((orig_addr + 5) as i64);
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+        return false;
+    }
+    *veneer_idx += 1;
+
+    unsafe {
+        if !make_text_writable(veneer_addr, 16) {
+            return false;
+        }
+        let vp = veneer_addr as *mut u8;
+        // jmp *0(%rip) followed by 8-byte absolute target
+        let stub: [u8; 6] = [0xff, 0x25, 0x00, 0x00, 0x00, 0x00];
+        ptr::copy_nonoverlapping(stub.as_ptr(), vp, 6);
+        (vp.add(6) as *mut u64).write_unaligned(new_fn as u64);
+        make_text_executable(veneer_addr, 16);
+
+        let mut saved = SAVED_PATCHES.lock().unwrap();
+        let already = saved.iter().any(
+            |s| matches!(s, SavedPatch::InlineBytes { addr, .. } if ptr::eq(*addr, orig_fn)),
+        );
+        if !already {
+            let mut orig = [0u8; 8];
+            ptr::copy_nonoverlapping(orig_fn, orig.as_mut_ptr(), 5);
+            saved.push(SavedPatch::InlineBytes { addr: orig_fn, orig, len: 5 });
+        }
+        if !make_text_writable(orig_addr, 5) {
+            return false;
+        }
+        let rel_bytes = (rel as i32).to_le_bytes();
+        let jmp: [u8; 5] = [0xe9, rel_bytes[0], rel_bytes[1], rel_bytes[2], rel_bytes[3]];
+        ptr::copy_nonoverlapping(jmp.as_ptr(), orig_fn, 5);
+        make_text_executable(orig_addr, 5);
+    }
+    true
 }
 
 fn restore_all() -> usize {
@@ -231,10 +296,10 @@ fn restore_all() -> usize {
             SavedPatch::PtrSlot { slot, orig } => unsafe {
                 (*slot).store(orig, Ordering::Release);
             },
-            SavedPatch::InlineBranch { addr, orig_insn } => unsafe {
-                if make_text_writable(addr as usize, 4) {
-                    addr.write(orig_insn);
-                    make_text_executable(addr as usize, 4);
+            SavedPatch::InlineBytes { addr, orig, len } => unsafe {
+                if make_text_writable(addr as usize, len) {
+                    ptr::copy_nonoverlapping(orig.as_ptr(), addr, len);
+                    make_text_executable(addr as usize, len);
                 }
             },
         }
@@ -259,26 +324,168 @@ extern "C" fn fallback_fixunssfti(x: f32) -> u128 {
 }
 
 #[repr(C, align(16))]
-struct StaticInnerSlice([usize; 4]);
-static FALLBACK_STATIC_INNER_SLICE: StaticInnerSlice =
+pub struct StaticInnerSlice([usize; 4]);
+#[used]
+#[unsafe(no_mangle)]
+pub static __rustd_sym_STATIC_INNER_SLICE: StaticInnerSlice =
     StaticInnerSlice([usize::MAX >> 1, usize::MAX >> 1, 0, 0]);
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rustd_sym_memcpy(
+    dst: *mut c_void,
+    src: *const c_void,
+    n: usize,
+) -> *mut c_void {
+    memcpy(dst, src, n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rustd_sym_memmove(
+    dst: *mut c_void,
+    src: *const c_void,
+    n: usize,
+) -> *mut c_void {
+    memmove(dst, src, n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rustd_sym_memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_void {
+    memset(dst, c, n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rustd_sym_memcmp(
+    s1: *const c_void,
+    s2: *const c_void,
+    n: usize,
+) -> c_int {
+    memcmp(s1, s2, n)
+}
+
+static SYM_CACHE: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn build_sym_cache() -> HashMap<&'static str, usize> {
+    let mut map = HashMap::new();
+    unsafe {
+        let count = _dyld_image_count();
+        for idx in 0..count {
+            let hdr = _dyld_get_image_header(idx);
+            if hdr.is_null() {
+                continue;
+            }
+            let magic = (hdr as *const u32).read_unaligned();
+            let filetype = (hdr.add(12) as *const u32).read_unaligned();
+            if magic != 0xfeed_facf || filetype != 2 {
+                continue;
+            }
+            let slide = _dyld_get_image_vmaddr_slide(idx);
+            let ncmds = (hdr.add(16) as *const u32).read_unaligned() as usize;
+            let mut linkedit_base: Option<usize> = None;
+            let mut symtab_cmd: Option<(usize, usize, usize, usize)> = None;
+            let mut lc = hdr.add(32);
+            for _ in 0..ncmds {
+                let cmd = (lc as *const u32).read_unaligned();
+                let cmdsize = (lc.add(4) as *const u32).read_unaligned() as usize;
+                if cmd == 0x19 {
+                    let segname = std::slice::from_raw_parts(lc.add(8), 16);
+                    if segname.starts_with(b"__LINKEDIT\0") {
+                        let vmaddr = (lc.add(24) as *const u64).read_unaligned() as usize;
+                        let fileoff = (lc.add(40) as *const u64).read_unaligned() as usize;
+                        linkedit_base =
+                            Some(((vmaddr as isize) + slide) as usize - fileoff);
+                    }
+                } else if cmd == 0x02 {
+                    let symoff = (lc.add(8) as *const u32).read_unaligned() as usize;
+                    let nsyms = (lc.add(12) as *const u32).read_unaligned() as usize;
+                    let stroff = (lc.add(16) as *const u32).read_unaligned() as usize;
+                    let strsize = (lc.add(20) as *const u32).read_unaligned() as usize;
+                    symtab_cmd = Some((symoff, nsyms, stroff, strsize));
+                }
+                lc = lc.add(cmdsize);
+            }
+            if let (Some(base), Some((symoff, nsyms, stroff, strsize))) =
+                (linkedit_base, symtab_cmd)
+            {
+                map.reserve(nsyms);
+                let symtab = (base + symoff) as *const u8;
+                let strtab =
+                    std::slice::from_raw_parts((base + stroff) as *const u8, strsize);
+                for i in 0..nsyms {
+                    let entry = symtab.add(i * 16);
+                    let n_type = *entry.add(4);
+                    if (n_type & 0x0e) != 0x0e {
+                        continue;
+                    }
+                    let n_value = (entry.add(8) as *const u64).read_unaligned() as usize;
+                    if n_value == 0 {
+                        continue;
+                    }
+                    let strx = (entry as *const u32).read_unaligned() as usize;
+                    let Some(tail) = strtab.get(strx..) else { continue };
+                    let Ok(cstr) = CStr::from_bytes_until_nul(tail) else { continue };
+                    let Ok(raw) = cstr.to_str() else { continue };
+                    let name = raw.strip_prefix('_').unwrap_or(raw);
+                    let addr = ((n_value as isize) + slide) as usize;
+                    if (n_type & 0x01) != 0 {
+                        map.insert(name, addr);
+                    } else {
+                        map.entry(name).or_insert(addr);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    map
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_sym_cache() -> HashMap<&'static str, usize> {
+    HashMap::new()
+}
+
+static DLSYM_CACHE: Mutex< Option<HashMap<String, usize>>> = Mutex::new(None);
+
 fn lookup_symbol(name: &str) -> *mut c_void {
-    let Ok(cstr) = CString::new(name) else { return ptr::null_mut() };
-    let p = unsafe { dlsym(RTLD_DEFAULT, cstr.as_ptr()) };
-    if !p.is_null() {
-        return p;
+    match name {
+        "memcpy" => return __rustd_sym_memcpy as *mut c_void,
+        "memmove" => return __rustd_sym_memmove as *mut c_void,
+        "memset" => return __rustd_sym_memset as *mut c_void,
+        "memcmp" => return __rustd_sym_memcmp as *mut c_void,
+        "__fixdfti" => return fallback_fixdfti as *mut c_void,
+        "__fixunsdfti" => return fallback_fixunsdfti as *mut c_void,
+        "__fixsfti" => return fallback_fixsfti as *mut c_void,
+        "__fixunssfti" => return fallback_fixunssfti as *mut c_void,
+        _ => {}
+    }
+    let cache = SYM_CACHE.get_or_init(build_sym_cache);
+    if let Some(&addr) = cache.get(name) {
+        return addr as *mut c_void;
+    }
+    if name.ends_with("$rustd_ptr") {
+        return ptr::null_mut();
     }
     if name.ends_with("STATIC_INNER_SLICE") {
-        return (&raw const FALLBACK_STATIC_INNER_SLICE) as *mut c_void;
+        return (&raw const __rustd_sym_STATIC_INNER_SLICE) as *mut c_void;
     }
-    match name {
-        "__fixdfti" => fallback_fixdfti as *mut c_void,
-        "__fixunsdfti" => fallback_fixunsdfti as *mut c_void,
-        "__fixsfti" => fallback_fixsfti as *mut c_void,
-        "__fixunssfti" => fallback_fixunssfti as *mut c_void,
-        _ => ptr::null_mut(),
+    if let Ok(guard) = DLSYM_CACHE.lock()
+        && let Some(map) = &*guard
+        && let Some(&addr) = map.get(name)
+    {
+        return addr as *mut c_void;
     }
+    let Ok(cstr) = CString::new(name) else { return ptr::null_mut() };
+    let p = unsafe { dlsym(RTLD_DEFAULT, cstr.as_ptr()) };
+    if let Ok(mut guard) = DLSYM_CACHE.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(name.to_owned(), p as usize);
+    }
+    p
+}
+
+#[cfg(target_os = "linux")]
+fn read_u16(buf: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
 }
 
 fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
@@ -330,7 +537,7 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
     for i in 0..nsyms {
         let entry = symoff + i * 16;
         let n_type = *buf.get(entry + 4)?;
-        if (n_type & 0x0e) == 0x0e && (n_type & 0x01) != 0 {
+        if (n_type & 0x0e) == 0x0e && (n_type & 0x01) != 0 && (n_type & 0x10) == 0 {
             has_defined_ext = true;
             break;
         }
@@ -339,7 +546,6 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
         return Some(restore_all());
     }
 
-    // Restore any previous inline/slot patches before applying the current patch object.
     let _ = restore_all();
 
     let seg_vmsize = (vmsize + 15) & !15;
@@ -508,10 +714,13 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
         let entry = symoff + i * 16;
         let strx = read_u32(buf, entry)? as usize;
         let n_type = *buf.get(entry + 4)?;
-        if (n_type & 0x0e) == 0x0e && (n_type & 0x01) != 0 {
+        if (n_type & 0x0e) == 0x0e && (n_type & 0x01) != 0 && (n_type & 0x10) == 0 {
             let cstr = CStr::from_bytes_until_nul(buf.get(stroff + strx..)?).ok()?;
             let raw_name = cstr.to_str().ok()?;
             let sym_name = raw_name.strip_prefix('_').unwrap_or(raw_name);
+            if sym_name.starts_with("rustd::") || sym_name.starts_with("rustd.patch::") {
+                continue;
+            }
             let new_fn = unsafe { *got_base.add(i) as *mut c_void };
             let ptr_name = format!("{sym_name}$rustd_ptr");
             let slot = lookup_symbol(&ptr_name) as *const AtomicPtr<c_void>;
@@ -519,7 +728,7 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
                 record_and_patch_slot(slot, new_fn);
                 patched += 1;
             } else {
-                let orig_fn = lookup_symbol(sym_name) as *mut u32;
+                let orig_fn = lookup_symbol(sym_name) as *mut u8;
                 if !orig_fn.is_null()
                     && detour_function_inline(orig_fn, new_fn as usize, &mut veneer_idx)
                 {
@@ -532,8 +741,183 @@ fn apply_macho_patch(buf: &[u8]) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_elf_patch(_buf: &[u8]) -> Option<usize> {
-    None
+fn apply_elf_patch(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 64 || &buf[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let e_shoff = read_u64(buf, 40)? as usize;
+    let e_shentsize = read_u16(buf, 58)? as usize;
+    let e_shnum = read_u16(buf, 60)? as usize;
+    if e_shnum == 0 {
+        return Some(restore_all());
+    }
+
+    let mut sec_offsets = vec![0usize; e_shnum];
+    let mut total_size = 0usize;
+    let mut symtab_idx = None;
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        let sh_type = read_u32(buf, sh + 4)?;
+        let sh_size = read_u64(buf, sh + 32)? as usize;
+        let sh_addralign = (read_u64(buf, sh + 48)? as usize).max(1);
+        if sh_type == 2 {
+            symtab_idx = Some(i);
+        }
+        total_size = (total_size + sh_addralign - 1) & !(sh_addralign - 1);
+        sec_offsets[i] = total_size;
+        total_size += sh_size;
+    }
+
+    let Some(sym_sec) = symtab_idx else { return Some(restore_all()) };
+    let sym_sh = e_shoff + sym_sec * e_shentsize;
+    let sym_off = read_u64(buf, sym_sh + 24)? as usize;
+    let sym_size = read_u64(buf, sym_sh + 32)? as usize;
+    let str_sec = read_u32(buf, sym_sh + 40)? as usize;
+    let str_sh = e_shoff + str_sec * e_shentsize;
+    let str_off = read_u64(buf, str_sh + 24)? as usize;
+    let nsyms = sym_size / 24;
+
+    let mut has_defined_ext = false;
+    for i in 1..nsyms {
+        let sp = sym_off + i * 24;
+        let st_info = *buf.get(sp + 4)?;
+        let st_shndx = read_u16(buf, sp + 6)?;
+        if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < 0xff00 {
+            has_defined_ext = true;
+            break;
+        }
+    }
+    if !has_defined_ext {
+        return Some(restore_all());
+    }
+
+    let _ = restore_all();
+
+    let got_offset = (total_size + 15) & !15;
+    let alloc_size = ((got_offset + nsyms * 8 + 4095) & !4095).max(4096);
+    let jit = unsafe {
+        mmap(ptr::null_mut(), alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+    } as *mut u8;
+    if jit.is_null() || jit as isize == -1 {
+        return None;
+    }
+
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        let sh_type = read_u32(buf, sh + 4)?;
+        let sh_offset = read_u64(buf, sh + 24)? as usize;
+        let sh_size = read_u64(buf, sh + 32)? as usize;
+        if sh_type != 8 && sh_size > 0 {
+            let src = buf.get(sh_offset..sh_offset + sh_size)?;
+            unsafe {
+                ptr::copy_nonoverlapping(src.as_ptr(), jit.add(sec_offsets[i]), sh_size);
+            }
+        }
+    }
+
+    let got_base = unsafe { jit.add(got_offset) as *mut u64 };
+    for i in 1..nsyms {
+        let sp = sym_off + i * 24;
+        let st_name = read_u32(buf, sp)? as usize;
+        let st_shndx = read_u16(buf, sp + 6)? as usize;
+        let st_value = read_u64(buf, sp + 8)? as usize;
+        if st_shndx != 0 && st_shndx < e_shnum {
+            unsafe { *got_base.add(i) = jit.add(sec_offsets[st_shndx] + st_value) as u64 };
+        } else if st_shndx == 0 {
+            let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
+            let sym_name = cstr.to_str().ok()?;
+            let resolved = lookup_symbol(sym_name);
+            if resolved.is_null() {
+                unsafe { munmap(jit as *mut c_void, alloc_size) };
+                return None;
+            }
+            unsafe { *got_base.add(i) = resolved as u64 };
+        }
+    }
+
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        let sh_type = read_u32(buf, sh + 4)?;
+        if sh_type != 4 {
+            continue;
+        }
+        let rela_off = read_u64(buf, sh + 24)? as usize;
+        let rela_size = read_u64(buf, sh + 32)? as usize;
+        let target_sec = read_u32(buf, sh + 44)? as usize;
+        let sec_base = unsafe { jit.add(sec_offsets[target_sec]) };
+        let nrela = rela_size / 24;
+        for r in 0..nrela {
+            let rp = rela_off + r * 24;
+            let r_offset = read_u64(buf, rp)? as usize;
+            let r_info = read_u64(buf, rp + 8)?;
+            let r_addend = read_u64(buf, rp + 16)? as i64;
+            let r_sym = (r_info >> 32) as usize;
+            let r_type = (r_info & 0xffff_ffff) as u32;
+            let loc = unsafe { sec_base.add(r_offset) };
+            let sym_val = unsafe { *got_base.add(r_sym) };
+            match r_type {
+                1 => {
+                    unsafe {
+                        (loc as *mut u64).write_unaligned(sym_val.wrapping_add(r_addend as u64));
+                    }
+                }
+                2 | 4 => {
+                    let val = (sym_val as i64)
+                        .wrapping_add(r_addend)
+                        .wrapping_sub(loc as u64 as i64);
+                    unsafe {
+                        (loc as *mut i32).write_unaligned(val as i32);
+                    }
+                }
+                9 | 41 | 42 => {
+                    let got_slot = unsafe { got_base.add(r_sym) as u64 as i64 };
+                    let val = got_slot.wrapping_add(r_addend).wrapping_sub(loc as u64 as i64);
+                    unsafe {
+                        (loc as *mut i32).write_unaligned(val as i32);
+                    }
+                }
+                _ => {
+                    unsafe { munmap(jit as *mut c_void, alloc_size) };
+                    return None;
+                }
+            }
+        }
+    }
+
+    unsafe {
+        mprotect(jit as *mut c_void, alloc_size, PROT_READ | PROT_EXEC);
+    }
+
+    let mut patched = 0usize;
+    let mut veneer_idx = 0usize;
+    for i in 1..nsyms {
+        let sp = sym_off + i * 24;
+        let st_name = read_u32(buf, sp)? as usize;
+        let st_info = *buf.get(sp + 4)?;
+        let st_shndx = read_u16(buf, sp + 6)? as usize;
+        if (st_info >> 4) != 0 && st_shndx != 0 && st_shndx < e_shnum {
+            let cstr = CStr::from_bytes_until_nul(buf.get(str_off + st_name..)?).ok()?;
+            let sym_name = cstr.to_str().ok()?;
+            if sym_name.starts_with("rustd::") || sym_name.starts_with("rustd.patch::") {
+                continue;
+            }
+            let new_fn = unsafe { *got_base.add(i) as *mut c_void };
+            let ptr_name = format!("{sym_name}$rustd_ptr");
+            let slot = lookup_symbol(&ptr_name) as *const AtomicPtr<c_void>;
+            if !slot.is_null() {
+                record_and_patch_slot(slot, new_fn);
+                patched += 1;
+            } else {
+                let orig_fn = lookup_symbol(sym_name) as *mut u8;
+                if !orig_fn.is_null()
+                    && detour_function_inline(orig_fn, new_fn as usize, &mut veneer_idx)
+                {
+                    patched += 1;
+                }
+            }
+        }
+    }
+    Some(patched)
 }
 
 fn apply_patch_bytes(bytes: &[u8]) -> Option<usize> {
@@ -548,9 +932,9 @@ fn apply_patch_bytes(bytes: &[u8]) -> Option<usize> {
 }
 
 fn watch_loop(patch_path: PathBuf) {
-    let _ = lookup_symbol("main");
     let mut last_mtime: Option<SystemTime> =
         fs::metadata(&patch_path).and_then(|m| m.modified()).ok();
+    let _ = SYM_CACHE.get_or_init(build_sym_cache);
     let quiet = std::env::var_os("RUSTD_QUIET").is_some();
     let ack_path = patch_path.with_extension("ack");
 
@@ -578,6 +962,34 @@ fn watch_loop(patch_path: PathBuf) {
 }
 
 extern "C" fn rustd_hotpatch_init() {
+    std::hint::black_box((
+        &raw const PATCH_DATA_CAVE,
+        &raw const __rustd_sym_STATIC_INNER_SLICE,
+        __rustd_sym_memcpy as *const (),
+        __rustd_sym_memmove as *const (),
+        __rustd_sym_memset as *const (),
+        __rustd_sym_memcmp as *const (),
+    ));
+    unsafe {
+        let hdr = (&raw const PATCH_DATA_CAVE.0) as *const u64;
+        if hdr.read_volatile() == 0x5255_5354_445f_494e {
+            let unslid_cave = hdr.add(1).read_volatile() as usize;
+            let count = hdr.add(2).read_volatile() as usize;
+            let rt_cave = (&raw const VENEER_CAVE_START.0) as usize;
+            let slide = rt_cave.wrapping_sub(unslid_cave);
+            if slide != 0 && count > 0 {
+                let code_base = rt_cave + 65536;
+                if make_text_writable(code_base, 192 * 1024) {
+                    for i in 0..count {
+                        let off = hdr.add(3 + i).read_volatile() as usize;
+                        let p = (code_base + off) as *mut usize;
+                        p.write_unaligned(p.read_unaligned().wrapping_add(slide));
+                    }
+                    make_text_executable(code_base, 192 * 1024);
+                }
+            }
+        }
+    }
     let path = std::env::var_os("RUSTD_PATCH_PATH")
         .map(PathBuf::from)
         .or_else(|| option_env!("RUSTD_DEFAULT_PATCH_PATH").map(PathBuf::from));

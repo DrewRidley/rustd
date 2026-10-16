@@ -460,7 +460,13 @@ pub fn layout_of_ty_query(
                         scalar.valid_range_mut().end = extract_const_value(end)
                             .ok()
                             .and_then(|v| v.try_to_bits(db, trait_env.as_ref(db)))
-                            .unwrap_or_else(|| layout.size.signed_int_max() as u128);
+                            .unwrap_or_else(|| {
+                                if scalar.is_signed() {
+                                    layout.size.signed_int_max() as u128
+                                } else {
+                                    layout.size.unsigned_int_max()
+                                }
+                            });
 
                         // FIXME(pattern_types): create implied bounds from pattern types in signatures
                         // that require that the range end is >= the range start so that we can't hit
