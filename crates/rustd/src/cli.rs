@@ -80,6 +80,9 @@ struct CliOpts {
     pkg_name: Option<String>,
     test_target: Option<String>,
     crates: Vec<String>,
+    features: Vec<String>,
+    all_features: bool,
+    no_default_features: bool,
     target: Option<String>,
     watch: bool,
     all_tests: bool,
@@ -223,6 +226,9 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let mut pkg_name = None;
     let mut test_target = None;
     let mut crates = Vec::new();
+    let mut features = Vec::new();
+    let mut all_features = false;
+    let mut no_default_features = false;
     let mut target = None;
     let mut watch = false;
     let mut all_tests = false;
@@ -267,6 +273,16 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                     }
                 }
             }
+            "-F" | "--features" => {
+                let val = it.next().context("--features requires feature name(s)")?;
+                for f in val.split([' ', ',']).map(str::trim).filter(|s| !s.is_empty()) {
+                    if !features.iter().any(|x| x == f) {
+                        features.push(f.to_owned());
+                    }
+                }
+            }
+            "--all-features" => all_features = true,
+            "--no-default-features" => no_default_features = true,
             "--target" => {
                 target = Some(it.next().context("--target requires a triple")?.clone());
             }
@@ -356,6 +372,9 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         pkg_name,
         test_target,
         crates,
+        features,
+        all_features,
+        no_default_features,
         target,
         watch,
         all_tests,
@@ -458,7 +477,42 @@ fn sysroot_rlibs(workspace_root: &Path, target: Option<&str>) -> anyhow::Result<
     Ok(collect_rlibs_in(&PathBuf::from(format!("{sysroot}/lib/rustlib/{triple}/lib"))))
 }
 
+fn apply_feature_args(cmd: &mut Command, opts: &CliOpts) {
+    if !opts.features.is_empty() {
+        cmd.arg("--features").arg(opts.features.join(","));
+    }
+    if opts.all_features {
+        cmd.arg("--all-features");
+    }
+    if opts.no_default_features {
+        cmd.arg("--no-default-features");
+    }
+}
+
+fn features_fingerprint(opts: &CliOpts) -> String {
+    format!(
+        "features={} all={} nodefault={}\n",
+        opts.features.join(","),
+        opts.all_features,
+        opts.no_default_features
+    )
+}
+
+fn ensure_features_consistent(opts: &CliOpts, paths: &TargetPaths) {
+    let feat_file = paths.dir.join("features.key");
+    let expected = features_fingerprint(opts);
+    if fs::read_to_string(&feat_file).ok().as_deref() != Some(expected.as_str()) {
+        stop_target_daemon(paths);
+        let _ = fs::remove_file(&paths.link_args_txt);
+        let _ = fs::remove_file(paths.dir.join("clippy.sh"));
+        let _ = fs::remove_file(paths.out_bin.with_extension("base"));
+        let _ = fs::create_dir_all(&paths.dir);
+        let _ = fs::write(&feat_file, expected);
+    }
+}
+
 fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<String> {
+    ensure_features_consistent(opts, paths);
     if let Ok(la_meta) = fs::metadata(&paths.link_args_txt)
         && let Ok(la_mtime) = la_meta.modified()
     {
@@ -515,6 +569,7 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
         }
         cmd.args(["--profile", "test"])
             .env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
+        apply_feature_args(&mut cmd, opts);
         if let Some(t) = &opts.target {
             cmd.args(["--target", t]);
         }
@@ -552,6 +607,7 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
     cmd.current_dir(&opts.workspace_root)
         .args(["rustc", "--bin", &opts.bin_name])
         .env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
+    apply_feature_args(&mut cmd, opts);
     if let Some(t) = &opts.target {
         cmd.args(["--target", t]);
     }
@@ -708,6 +764,7 @@ fn send_unix_line(sock: &Path, line: &str) -> anyhow::Result<String> {
 }
 
 fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<String>> {
+    ensure_features_consistent(opts, paths);
     if paths.rustd_sock.exists()
         && let Ok(reply) = send_unix_line(&paths.rustd_sock, "patch")
     {
@@ -734,6 +791,9 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
         .replace('-', "_");
     if opts.cfg_test {
         cmd.arg("--cfg-test");
+    }
+    if !opts.features.is_empty() {
+        cmd.args(["--features", &opts.features.join(",")]);
     }
     if let Some(pkg) = &opts.pkg_name {
         cmd.env("RUSTD_PKG", pkg);
@@ -913,6 +973,7 @@ fn cmd_check(args: &[String], req_cmd: &str) -> anyhow::Result<()> {
 
 fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&paths.dir)?;
+    ensure_features_consistent(opts, paths);
     let clippy_sh = paths.dir.join("clippy.sh");
     if let Ok(meta) = fs::metadata(&clippy_sh)
         && let Ok(mtime) = meta.modified()
@@ -956,11 +1017,14 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
     eprintln!(
         "[rustd] capturing real `clippy-driver` invocation via `cargo clippy -p {pkg} --no-deps`..."
     );
-    let out = Command::new("cargo")
+    let mut clippy_cmd = Command::new("cargo");
+    clippy_cmd
         .current_dir(&opts.workspace_root)
         .args(["clippy", "-p", pkg, "--profile", "test", "--no-deps", "-vv"])
         .env("RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "");
+    apply_feature_args(&mut clippy_cmd, opts);
+    let out = clippy_cmd
         .output()
         .context("running `cargo clippy -vv`")?;
     let stderr = String::from_utf8_lossy(&out.stderr);
