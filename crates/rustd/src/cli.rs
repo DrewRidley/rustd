@@ -21,13 +21,24 @@ use anyhow::{Context, bail, ensure};
 pub(crate) fn is_subcommand(arg: &str) -> bool {
     matches!(
         arg,
-        "build" | "run" | "test" | "patch" | "sync" | "status" | "stop" | "help" | "--help" | "-h"
+        "build"
+            | "check"
+            | "run"
+            | "test"
+            | "patch"
+            | "sync"
+            | "status"
+            | "stop"
+            | "help"
+            | "--help"
+            | "-h"
     )
 }
 
 pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
     match sub {
         "build" => cmd_build(&args),
+        "check" => cmd_check(&args),
         "run" => cmd_run(&args),
         "test" => cmd_test(&args),
         "patch" => cmd_request("patch", &args),
@@ -37,6 +48,7 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
         _ => {
             eprintln!(
                 "Usage:\n  \
+                 rustd check [-p PACKAGE] [--bin NAME] [--test NAME] [--watch]\n  \
                  rustd build [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
                  rustd run   [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
                  rustd test  [FILTER] [-p PACKAGE] [--test NAME] [--bin NAME] [--watch] [-- ARGS...]\n  \
@@ -695,6 +707,87 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<()> {
     );
     let _ = send_unix_line(&paths.rustd_sock, "patch");
     Ok(())
+}
+
+fn print_check_file(opts: &CliOpts, check_txt: &Path, fallback_elapsed: Option<Duration>) -> usize {
+    let mut errors = 0usize;
+    let mut us = 0u64;
+    if let Ok(content) = fs::read_to_string(check_txt) {
+        let (header, body) = content.split_once('\n').unwrap_or((&content, ""));
+        for word in header.split_whitespace() {
+            if let Some(val) = word.strip_prefix("errors=") {
+                errors = val.parse().unwrap_or(0);
+            } else if let Some(val) = word.strip_prefix("us=") {
+                us = val.parse().unwrap_or(0);
+            }
+        }
+        if !body.is_empty() {
+            eprint!("{body}");
+        }
+    }
+    let elapsed = fallback_elapsed.unwrap_or_else(|| Duration::from_micros(us));
+    let raw_label = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
+    let target_label = raw_label.strip_prefix("test-").unwrap_or(raw_label);
+    if errors > 0 {
+        let plural = if errors == 1 { "" } else { "s" };
+        eprintln!(
+            "\x1b[1;31merror\x1b[0m\x1b[1m: could not compile `{target_label}` due to {errors} previous error{plural}\x1b[0m"
+        );
+    } else {
+        eprintln!(
+            "    \x1b[1;32mFinished\x1b[0m `dev` profile [unoptimized + debuginfo] target(s) in {:.2}s ({:.1?})",
+            elapsed.as_secs_f64(),
+            elapsed
+        );
+    }
+    errors
+}
+
+fn run_one_check(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<usize> {
+    let t0 = Instant::now();
+    let _reply = send_unix_line(&paths.rustd_sock, "check")?;
+    let elapsed = t0.elapsed();
+    let check_txt = paths.base_o.with_extension("check.txt");
+    Ok(print_check_file(opts, &check_txt, Some(elapsed)))
+}
+
+fn cmd_check(args: &[String]) -> anyhow::Result<()> {
+    let has_test_flag = args.iter().any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests");
+    let mut opts = parse_opts_with_mode(args, has_test_flag)?;
+    if opts.bin_name.starts_with("test-") {
+        opts.cfg_test = true;
+    }
+    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    ensure_daemon(&opts, &paths)?;
+    let errors = run_one_check(&opts, &paths)?;
+    if !opts.watch {
+        if errors > 0 {
+            std::process::exit(101);
+        }
+        return Ok(());
+    }
+    let max_runs = env::var("RUSTD_WATCH_MAX_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut runs = 1usize;
+    if max_runs.is_some_and(|m| runs >= m) {
+        return Ok(());
+    }
+    let check_txt = paths.base_o.with_extension("check.txt");
+    let mut last_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
+    eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let cur_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
+        if cur_mtime.is_some() && cur_mtime != last_mtime {
+            last_mtime = cur_mtime;
+            print_check_file(&opts, &check_txt, None);
+            runs += 1;
+            if max_runs.is_some_and(|m| runs >= m) {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn cmd_build(args: &[String]) -> anyhow::Result<()> {

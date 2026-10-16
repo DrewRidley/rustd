@@ -22,7 +22,9 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
+use hir::{
+    AsAssocItem, AssocItemContainer, Crate, HirDisplay as _, Module, ModuleDef, db::HirDatabase,
+};
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body, item_scope::ItemScope,
@@ -1541,69 +1543,406 @@ fn detect_adt_layout_warnings(
     (warnings, changed_adts, changed_consts)
 }
 
-/// Something written in one of the edited files that cargo turns the crate down for. Nothing
-/// may reach it, so the build never looks at it.
-fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
+fn modules_in_file(db: &RootDatabase, file: vfs::FileId) -> Vec<hir::Module> {
+    let sema = hir::Semantics::new(db);
+    let mut stack: Vec<hir::Module> = sema.file_to_module_defs(file).collect();
+    let mut seen = FxHashSet::default();
+    let mut out = Vec::new();
+    while let Some(module) = stack.pop() {
+        let mod_id = hir_def::ModuleId::from(module);
+        if !seen.insert(mod_id) {
+            continue;
+        }
+        out.push(module);
+        let scope = mod_id.def_map(db).module(db, mod_id).scope(db);
+        for decl in scope.declarations() {
+            if let ModuleDefId::ModuleId(child) = decl {
+                let child_mod = hir::Module::from(child);
+                if child_mod
+                    .definition_source_file_id(db)
+                    .original_file_respecting_includes(db)
+                    .file_id(db)
+                    == file
+                {
+                    stack.push(child_mod);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Default)]
+struct CheckReport {
+    errors: usize,
+    warnings: usize,
+    rendered: String,
+    first_summary: Option<String>,
+}
+
+fn format_cargo_snippet(
+    db: &RootDatabase,
+    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    root: &Path,
+    file_id: vfs::FileId,
+    range: syntax::TextRange,
+    code: Option<&'static str>,
+    message: &str,
+    label: &str,
+) -> String {
+    let full_path = paths.get(&file_id).cloned().unwrap_or_default();
+    let rel_path = full_path
+        .strip_prefix(root)
+        .unwrap_or(&full_path)
+        .display()
+        .to_string();
+    let text = db.file_text(file_id).text(db);
+    let start_off = usize::from(range.start()).min(text.len());
+    let end_off = usize::from(range.end()).min(text.len()).max(start_off);
+    let before = &text[..start_off];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[start_off..].find('\n').map_or(text.len(), |i| start_off + i);
+    let line_no = before.bytes().filter(|&b| b == b'\n').count() + 1;
+    let raw_line = text[line_start..line_end].trim_end_matches('\r');
+    let span_start_in_line = start_off.saturating_sub(line_start).min(raw_line.len());
+    let span_end_in_line = end_off.min(line_end).saturating_sub(line_start).min(raw_line.len());
+    let mut display_line = String::with_capacity(raw_line.len() + 16);
+    let mut caret_col = 0usize;
+    let mut caret_len = 0usize;
+    for (byte_idx, ch) in raw_line.char_indices() {
+        let width = if ch == '\t' { 4 } else { 1 };
+        if byte_idx < span_start_in_line {
+            caret_col += width;
+        } else if byte_idx < span_end_in_line {
+            caret_len += width;
+        }
+        if ch == '\t' {
+            display_line.push_str("    ");
+        } else {
+            display_line.push(ch);
+        }
+    }
+    let col_no = raw_line[..span_start_in_line].chars().count() + 1;
+    let carets = "^".repeat(caret_len.max(1));
+    let pad_num = line_no.to_string();
+    let gutter_pad = " ".repeat(pad_num.len());
+    let caret_pad = " ".repeat(caret_col);
+    let header = match code {
+        Some(c) => format!("\x1b[1;31merror[{c}]\x1b[0m\x1b[1m: {message}\x1b[0m"),
+        None => format!("\x1b[1;31merror\x1b[0m\x1b[1m: {message}\x1b[0m"),
+    };
+    format!(
+        "{header}\n\
+         {gutter_pad}\x1b[1;34m-->\x1b[0m {rel_path}:{line_no}:{col_no}\n\
+         {gutter_pad} \x1b[1;34m|\x1b[0m\n\
+         \x1b[1;34m{pad_num} |\x1b[0m {display_line}\n\
+         {gutter_pad} \x1b[1;34m|\x1b[0m {caret_pad}\x1b[1;31m{carets} {label}\x1b[0m\n\n"
+    )
+}
+
+fn check_files_diagnostics(
+    db: &RootDatabase,
+    files_to_check: &[vfs::FileId],
+    layout_warnings: &[String],
+    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    root: &Path,
+) -> CheckReport {
     use hir::AnyDiagnostic as Diagnostic;
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-    let broken = std::thread::scope(|scope| {
-        let checks: Vec<_> = (0..threads.min(edited.len()))
-            .map(|part| {
-                let db = db.clone();
-                scope.spawn(move || {
-                    hir::attach_db(&db, || {
-                        let sema = hir::Semantics::new(&db);
-                        let modules = edited
-                            .iter()
-                            .skip(part)
-                            .step_by(threads)
-                            .flat_map(|&file| sema.file_to_module_defs(file));
-                        for module in modules {
-                            let mut found = Vec::new();
-                            module.diagnostics(&db, &mut found, false);
-                            // Only what rust-analyzer is as sure of as rustc is: a wrong
-                            // refusal costs a cargo build.
-                            let why = found.iter().find_map(|it| match it {
-                                Diagnostic::TypeMismatch(_) => Some("mismatched types"),
-                                Diagnostic::UnresolvedIdent(_) => Some("unresolved name"),
-                                Diagnostic::MismatchedArgCount(_)
-                                | Diagnostic::MismatchedTupleStructPatArgCount(_) => {
-                                    Some("wrong number of arguments")
-                                }
-                                Diagnostic::MissingFields(_) => Some("missing fields"),
-                                Diagnostic::NoSuchField(_) | Diagnostic::UnresolvedField(_) => {
-                                    Some("no such field")
-                                }
-                                Diagnostic::UnresolvedMethodCall(_)
-                                | Diagnostic::UnresolvedAssocItem(_) => Some("no such method"),
-                                Diagnostic::MissingMatchArms(_)
-                                | Diagnostic::NonExhaustiveLet(_) => Some("patterns not covered"),
-                                Diagnostic::TraitImplMissingAssocItems(_)
-                                | Diagnostic::TraitImplRedundantAssocItems(_) => {
-                                    Some("an impl does not match its trait")
-                                }
-                                Diagnostic::UnresolvedModule(_) => Some("a module without a file"),
-                                Diagnostic::UnresolvedImport(_) => Some("unresolved import"),
-                                Diagnostic::UnresolvedMacroCall(_) => Some("unresolved macro"),
-                                _ => None,
-                            });
-                            if let Some(why) = why {
-                                let name = module.name(&db).map_or_else(
-                                    || "the crate root".to_owned(),
-                                    |it| format!("`{}`", it.display(&db, syntax::Edition::CURRENT)),
-                                );
-                                return Some((name, why));
-                            }
+    let mut rep = CheckReport::default();
+    let mut seen_codes = Vec::new();
+    let mut seen_diags = FxHashSet::default();
+    for w in layout_warnings {
+        rep.warnings += 1;
+        rep.rendered.push_str(&format!("\x1b[1;33mwarning\x1b[0m\x1b[1m: {w}\x1b[0m\n\n"));
+    }
+    hir::attach_db(db, || {
+        let sema = hir::Semantics::new(db);
+        for &file in files_to_check {
+            let crates = ide_db::base_db::relevant_crates(db, file);
+            let edition = crates
+                .first()
+                .map_or(syntax::Edition::CURRENT, |&krate| Crate::from(krate).edition(db));
+            let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
+            for err in parse.errors() {
+                let msg = err.to_string();
+                if seen_diags.insert((file, err.range(), msg.clone())) {
+                    rep.errors += 1;
+                    if rep.first_summary.is_none() {
+                        rep.first_summary = Some(msg.clone());
+                    }
+                    rep.rendered.push_str(&format_cargo_snippet(
+                        db,
+                        paths,
+                        root,
+                        file,
+                        err.range(),
+                        None,
+                        &msg,
+                        "syntax error",
+                    ));
+                }
+            }
+            for module in modules_in_file(db, file) {
+                let mut found = Vec::new();
+                module.diagnostics(db, &mut found, false);
+                let disp = module.krate(db).to_display_target(db);
+                for diag in &found {
+                    let info: Option<(
+                        Option<&'static str>,
+                        String,
+                        hir::FileRangeWrapper<vfs::FileId>,
+                        String,
+                        &'static str,
+                    )> = match diag {
+                        Diagnostic::TypeMismatch(d) => {
+                            let exp = d.expected.display(db, disp).to_string();
+                            let act = d.actual.display(db, disp).to_string();
+                            let r = sema.diagnostics_display_range(d.expr_or_pat.map(|it| it.into()));
+                            Some((
+                                Some("E0308"),
+                                "mismatched types".to_owned(),
+                                r,
+                                format!("expected `{exp}`, found `{act}`"),
+                                "mismatched types",
+                            ))
                         }
-                        None
-                    })
-                })
-            })
-            .collect();
-        checks.into_iter().find_map(|it| it.join().ok().flatten())
+                        Diagnostic::UnresolvedIdent(d) => {
+                            let r = match d.node.value.1 {
+                                Some(sub) => sema.diagnostics_display_range_for_range(
+                                    hir::InFile::new(d.node.file_id, sub),
+                                ),
+                                None => sema.diagnostics_display_range(hir::InFile::new(
+                                    d.node.file_id,
+                                    d.node.value.0.into(),
+                                )),
+                            };
+                            let txt = db.file_text(r.file_id).text(db);
+                            let s = usize::from(r.range.start()).min(txt.len());
+                            let e = usize::from(r.range.end()).min(txt.len()).max(s);
+                            let ident = &txt[s..e];
+                            Some((
+                                Some("E0425"),
+                                format!("cannot find value `{ident}` in this scope"),
+                                r,
+                                "not found in this scope".to_owned(),
+                                "unresolved name",
+                            ))
+                        }
+                        Diagnostic::MismatchedArgCount(d) => {
+                            let r = sema.diagnostics_display_range(d.call_expr.map(|it| it.into()));
+                            Some((
+                                Some("E0061"),
+                                format!(
+                                    "this function takes {} argument(s) but {} argument(s) were supplied",
+                                    d.expected, d.found
+                                ),
+                                r,
+                                format!("expected {} argument(s), found {}", d.expected, d.found),
+                                "wrong number of arguments",
+                            ))
+                        }
+                        Diagnostic::MismatchedTupleStructPatArgCount(d) => {
+                            let r = sema.diagnostics_display_range(d.expr_or_pat.map(|it| it.into()));
+                            Some((
+                                Some("E0023"),
+                                format!(
+                                    "this pattern has {} field(s), but the corresponding tuple variant has {} field(s)",
+                                    d.found, d.expected
+                                ),
+                                r,
+                                format!("expected {} field(s), found {}", d.expected, d.found),
+                                "wrong number of arguments",
+                            ))
+                        }
+                        Diagnostic::MissingFields(d) => {
+                            let names: Vec<String> = d
+                                .missed_fields
+                                .iter()
+                                .map(|(n, _)| format!("`{}`", n.display(db, edition)))
+                                .collect();
+                            let list = names.join(", ");
+                            let r = sema.diagnostics_display_range(hir::InFile::new(
+                                d.file,
+                                d.field_list_parent.into(),
+                            ));
+                            Some((
+                                Some("E0063"),
+                                format!("missing field(s) {list} in initializer"),
+                                r,
+                                format!("missing {list}"),
+                                "missing fields",
+                            ))
+                        }
+                        Diagnostic::NoSuchField(d) => {
+                            let r = sema.diagnostics_display_range(d.field.map(|it| it.into()));
+                            Some((
+                                Some("E0560"),
+                                "struct or enum variant has no such field".to_owned(),
+                                r,
+                                "unknown field".to_owned(),
+                                "no such field",
+                            ))
+                        }
+                        Diagnostic::UnresolvedField(d) => {
+                            let recv = d.receiver.display(db, disp).to_string();
+                            let name = d.name.display(db, edition).to_string();
+                            let r = sema.diagnostics_display_range(d.expr.map(|it| it.into()));
+                            Some((
+                                Some("E0609"),
+                                format!("no field `{name}` on type `{recv}`"),
+                                r,
+                                "unknown field".to_owned(),
+                                "no such field",
+                            ))
+                        }
+                        Diagnostic::UnresolvedMethodCall(d) => {
+                            let recv = d.receiver.display(db, disp).to_string();
+                            let name = d.name.display(db, edition).to_string();
+                            let r = sema.diagnostics_display_range(d.expr.map(|it| it.into()));
+                            Some((
+                                Some("E0599"),
+                                format!("no method named `{name}` found for type `{recv}` in the current scope"),
+                                r,
+                                format!("method not found in `{recv}`"),
+                                "no such method",
+                            ))
+                        }
+                        Diagnostic::UnresolvedAssocItem(d) => {
+                            let r = sema.diagnostics_display_range(d.expr_or_pat.map(|it| it.into()));
+                            Some((
+                                Some("E0599"),
+                                "no associated item found for type in the current scope".to_owned(),
+                                r,
+                                "associated item not found".to_owned(),
+                                "no such method",
+                            ))
+                        }
+                        Diagnostic::MissingMatchArms(d) => {
+                            let r = sema.diagnostics_display_range(d.scrutinee_expr.map(|it| it.into()));
+                            Some((
+                                Some("E0004"),
+                                format!("non-exhaustive patterns: {} not covered", d.uncovered_patterns),
+                                r,
+                                format!("pattern {} not covered", d.uncovered_patterns),
+                                "patterns not covered",
+                            ))
+                        }
+                        Diagnostic::NonExhaustiveLet(d) => {
+                            let r = sema.diagnostics_display_range(d.pat.map(|it| it.into()));
+                            Some((
+                                Some("E0005"),
+                                format!("refutable pattern in local binding: {} not covered", d.uncovered_patterns),
+                                r,
+                                format!("pattern {} not covered", d.uncovered_patterns),
+                                "patterns not covered",
+                            ))
+                        }
+                        Diagnostic::TraitImplMissingAssocItems(d) => {
+                            let names: Vec<String> = d
+                                .missing
+                                .iter()
+                                .map(|(n, _)| format!("`{}`", n.display(db, edition)))
+                                .collect();
+                            let list = names.join(", ");
+                            let r = sema.diagnostics_display_range(hir::InFile::new(
+                                d.file_id,
+                                d.impl_.into(),
+                            ));
+                            Some((
+                                Some("E0046"),
+                                format!("not all trait items implemented, missing: {list}"),
+                                r,
+                                format!("missing {list} in implementation"),
+                                "an impl does not match its trait",
+                            ))
+                        }
+                        Diagnostic::TraitImplRedundantAssocItems(d) => {
+                            let item_name = d.assoc_item.0.display(db, edition).to_string();
+                            let trait_name = d.trait_.name(db).display(db, edition).to_string();
+                            let r = sema.diagnostics_display_range(hir::InFile::new(
+                                d.file_id,
+                                d.impl_.into(),
+                            ));
+                            Some((
+                                Some("E0407"),
+                                format!("item `{item_name}` is not a member of trait `{trait_name}`"),
+                                r,
+                                format!("not a member of trait `{trait_name}`"),
+                                "an impl does not match its trait",
+                            ))
+                        }
+                        Diagnostic::UnresolvedModule(d) => {
+                            let r = sema.diagnostics_display_range(d.decl.map(|it| it.into()));
+                            Some((
+                                Some("E0583"),
+                                "file not found for module".to_owned(),
+                                r,
+                                "file not found for module".to_owned(),
+                                "a module without a file",
+                            ))
+                        }
+                        Diagnostic::UnresolvedImport(d) => {
+                            let r = sema.diagnostics_display_range(d.decl.map(|it| it.into()));
+                            Some((
+                                Some("E0432"),
+                                "unresolved import".to_owned(),
+                                r,
+                                "unresolved import".to_owned(),
+                                "unresolved import",
+                            ))
+                        }
+                        Diagnostic::UnresolvedMacroCall(d) => {
+                            let name = d.path.display(db, edition).to_string();
+                            let r = sema.diagnostics_display_range_for_range(d.range);
+                            Some((
+                                None,
+                                format!("cannot find macro `{name}` in this scope"),
+                                r,
+                                "not found in this scope".to_owned(),
+                                "unresolved macro",
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some((code, msg, range, label, short_why)) = info
+                        && seen_diags.insert((range.file_id, range.range, msg.clone()))
+                    {
+                        rep.errors += 1;
+                        if let Some(c) = code
+                            && !seen_codes.contains(&c)
+                        {
+                            seen_codes.push(c);
+                        }
+                        if rep.first_summary.is_none() {
+                            let mod_name = module.name(db).map_or_else(
+                                || "the crate root".to_owned(),
+                                |it| format!("`{}`", it.display(db, syntax::Edition::CURRENT)),
+                            );
+                            rep.first_summary = Some(format!(
+                                "{mod_name} has errors, `cargo check` shows them: {short_why}"
+                            ));
+                        }
+                        rep.rendered.push_str(&format_cargo_snippet(
+                            db,
+                            paths,
+                            root,
+                            range.file_id,
+                            range.range,
+                            code,
+                            &msg,
+                            &label,
+                        ));
+                    }
+                }
+            }
+        }
     });
-    let (module, why) = broken?;
-    Some(format!("{module} has errors, `cargo check` shows them: {why}"))
+    if let Some(&first_code) = seen_codes.first() {
+        rep.rendered.push_str(&format!(
+            "\x1b[1mFor more information about this error, try `rustc --explain {first_code}`.\x1b[0m\n"
+        ));
+    }
+    rep
 }
 
 /// A file whose changes the daemon picks up.
@@ -1739,6 +2078,8 @@ enum Request {
     /// Bring the objects up to date and leave the linking to the client, which loads the
     /// patch object into a program that is running.
     Patch,
+    /// Run incremental syntax and semantic diagnostics and write a cargo-style report.
+    Check,
 }
 
 impl Request {
@@ -1746,6 +2087,7 @@ impl Request {
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
+            "check" => Some(Request::Check),
             _ => None,
         }
     }
@@ -1754,6 +2096,7 @@ impl Request {
         match self {
             Request::Sync => "sync\n",
             Request::Patch => "patch\n",
+            Request::Check => "check\n",
         }
     }
 }
@@ -2132,6 +2475,10 @@ fn main() -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
+    let check_root = args.root()?;
+    let check_report_path = args.out.with_extension("check.txt");
+    let _ = std::fs::write(&check_report_path, "errors=0 warnings=0 us=0\n");
+    let mut last_check_report = CheckReport::default();
     loop {
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
@@ -2267,6 +2614,14 @@ fn main() -> anyhow::Result<()> {
                             t0.elapsed().as_millis()
                         );
                     }
+                } else if matches!(req, Request::Check) {
+                    let _ = writeln!(
+                        &client,
+                        "ok check errors={} warnings={} ms=0 report={}",
+                        last_check_report.errors,
+                        last_check_report.warnings,
+                        check_report_path.display()
+                    );
                 } else {
                     let _ = writeln!(&client, "ok unchanged");
                 }
@@ -2436,11 +2791,65 @@ fn main() -> anyhow::Result<()> {
         let apply = start.elapsed();
         let (layout_warnings, changed_adts, changed_consts) =
             detect_adt_layout_warnings(&db, &dirty_files, &initial_adts);
+        let paths: FxHashMap<vfs::FileId, PathBuf> = files
+            .iter()
+            .filter_map(|it| match it.file {
+                Watched::Source(id) => Some((id, it.path.clone())),
+                Watched::Included(_) => None,
+            })
+            .collect();
+        let mut check_files: Vec<vfs::FileId> = edited.clone();
+        for &df in &dirty_files {
+            if !check_files.contains(&df) {
+                check_files.push(df);
+            }
+        }
+        let check_client = if matches!(client, Some((Request::Check, _))) {
+            client.take().map(|(_, s)| s)
+        } else {
+            None
+        };
         // The check of the edited files does not wait for the build: it reads other things.
-        let (warm, broken) = std::thread::scope(|scope| {
+        let (warm, check_rep) = std::thread::scope(|scope| {
             let check = {
-                let (db, edited) = (db.clone(), &edited);
-                scope.spawn(move || broken_in(&db, edited))
+                let (db, check_files, layout_warnings, paths, check_root, check_report_path) = (
+                    db.clone(),
+                    &check_files,
+                    &layout_warnings,
+                    &paths,
+                    &check_root,
+                    &check_report_path,
+                );
+                scope.spawn(move || {
+                    let t_check = Instant::now();
+                    let rep = check_files_diagnostics(
+                        &db,
+                        check_files,
+                        layout_warnings,
+                        paths,
+                        check_root,
+                    );
+                    let check_us = t_check.elapsed().as_micros();
+                    let file_body = format!(
+                        "errors={} warnings={} us={}\n{}",
+                        rep.errors, rep.warnings, check_us, rep.rendered
+                    );
+                    let tmp = check_report_path.with_extension("txt.tmp");
+                    if std::fs::write(&tmp, &file_body).is_ok() {
+                        let _ = std::fs::rename(&tmp, check_report_path);
+                    }
+                    if let Some(mut stream) = check_client {
+                        let _ = writeln!(
+                            stream,
+                            "ok check errors={} warnings={} ms={} report={}",
+                            rep.errors,
+                            rep.warnings,
+                            start.elapsed().as_millis(),
+                            check_report_path.display()
+                        );
+                    }
+                    rep
+                })
             };
             let warm = build(
                 &db,
@@ -2454,22 +2863,19 @@ fn main() -> anyhow::Result<()> {
                 &changed_consts,
                 false,
             );
-            (warm, check.join().ok().flatten())
+            (warm, check.join().ok())
         });
         let warm = warm?;
+        let broken = check_rep.as_ref().and_then(|r| r.first_summary.clone());
+        if let Some(rep) = check_rep {
+            last_check_report = rep;
+        }
         let built = start.elapsed();
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
-        let paths = files
-            .iter()
-            .filter_map(|it| match it.file {
-                Watched::Source(id) => Some((id, it.path.clone())),
-                Watched::Included(_) => None,
-            })
-            .collect();
         for w in &layout_warnings {
             eprintln!("warning: {w}");
         }
