@@ -80,6 +80,7 @@ struct CliOpts {
     pkg_name: Option<String>,
     test_target: Option<String>,
     crates: Vec<String>,
+    exclude: Vec<String>,
     features: Vec<String>,
     all_features: bool,
     no_default_features: bool,
@@ -226,6 +227,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let mut pkg_name = None;
     let mut test_target = None;
     let mut crates = Vec::new();
+    let mut exclude = Vec::new();
     let mut features = Vec::new();
     let mut all_features = false;
     let mut no_default_features = false;
@@ -273,6 +275,15 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                     }
                 }
             }
+            "--exclude" => {
+                let val = it.next().context("--exclude requires a package name")?;
+                for ex in val.split([' ', ',']).map(str::trim).filter(|s| !s.is_empty()) {
+                    if !exclude.iter().any(|x| x == ex) {
+                        exclude.push(ex.to_owned());
+                    }
+                }
+            }
+            "--workspace" | "--all-targets" | "--lib" | "--bins" | "--tests" => {}
             "-F" | "--features" => {
                 let val = it.next().context("--features requires feature name(s)")?;
                 for f in val.split([' ', ',']).map(str::trim).filter(|s| !s.is_empty()) {
@@ -337,7 +348,10 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         && let Some(sha) = &since
     {
         let diff_files = crate::ci::analyze_git_diff_since(&workspace_root, sha)?;
-        let inferred = crate::ci::infer_packages_from_diff(&workspace_root, &diff_files);
+        let inferred: Vec<String> = crate::ci::infer_packages_from_diff(&workspace_root, &diff_files)
+            .into_iter()
+            .filter(|p| !exclude.iter().any(|ex| ex == p))
+            .collect();
         if let Some(first_pkg) = inferred.into_iter().next() {
             pkg_name = Some(first_pkg);
         }
@@ -372,6 +386,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         pkg_name,
         test_target,
         crates,
+        exclude,
         features,
         all_features,
         no_default_features,
@@ -1096,6 +1111,14 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
 fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
     let mut opts = parse_opts_with_mode(args, true)?;
     opts.cfg_test = true;
+    if opts
+        .pkg_name
+        .as_ref()
+        .is_some_and(|p| opts.exclude.iter().any(|ex| ex == p))
+    {
+        eprintln!("[rustd] package excluded by --exclude; skipping clippy");
+        return Ok(());
+    }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     let clippy_sh = ensure_clippy_script(&opts, &paths)?;
     let run_once = || -> anyhow::Result<bool> {
@@ -1366,6 +1389,21 @@ fn stop_target_daemon(paths: &TargetPaths) {
 
 fn cmd_test(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts_with_mode(args, true)?;
+    if opts
+        .pkg_name
+        .as_ref()
+        .is_some_and(|p| opts.exclude.iter().any(|ex| ex == p))
+    {
+        if let Some(junit_path) = &opts.junit {
+            crate::ci::write_junit_xml(junit_path, &[], Duration::ZERO)?;
+        }
+        if opts.json {
+            crate::ci::print_json_summary(&[], Duration::ZERO);
+        } else {
+            eprintln!("[rustd] package excluded by --exclude; 0 tests to run");
+        }
+        return Ok(());
+    }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     let had_daemon = paths.rustd_sock.exists();
 

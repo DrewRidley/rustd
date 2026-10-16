@@ -645,7 +645,16 @@ fn get_test_runner(idx: usize) -> Option<fn() -> Result<(), String>> {
     }
 }
 
-extern "C" fn rustd_test_main_static(tests_ptr: *const *const u64, tests_len: usize) {
+/// libtest `TestDescAndFn` viewed as words: `desc.name` is a `StaticTestName` (ptr, len) at
+/// words 4..6 and `testfn` is a `StaticTestFn` pointer at word 17.
+fn test_name_of(desc: *const u64) -> &'static [u8] {
+    unsafe { std::slice::from_raw_parts(*desc.add(4) as *const u8, *desc.add(5) as usize) }
+}
+
+/// Detour for libtest's harness entry (`test_main_env_args` on current toolchains,
+/// `test_main_static` on older ones). Returns the original's `ExitCode` byte, which the
+/// harness `main` turns into the process exit status.
+extern "C" fn rustd_test_main_static(tests_ptr: *const *const u64, tests_len: usize) -> u8 {
     let orig_addr = ORIG_TEST_MAIN_STATIC.load(Ordering::Acquire);
     {
         let mut saved = SAVED_PATCHES.lock().unwrap();
@@ -687,10 +696,13 @@ extern "C" fn rustd_test_main_static(tests_ptr: *const *const u64, tests_len: us
                 }
             }
         }
+        // `test_main_env_args` assumes the rustc-generated order (sorted by name) and
+        // binary-searches it for `--exact`, so appended tests must be put in place.
+        extended.sort_by(|&a, &b| test_name_of(a).cmp(test_name_of(b)));
     }
-    let real_fn: extern "C" fn(*const *const u64, usize) =
+    let real_fn: extern "C" fn(*const *const u64, usize) -> u8 =
         unsafe { std::mem::transmute(orig_addr) };
-    real_fn(extended.as_ptr(), extended.len());
+    real_fn(extended.as_ptr(), extended.len())
 }
 
 fn register_new_test(
@@ -718,10 +730,10 @@ fn register_new_test(
 
     if ORIG_TEST_MAIN_STATIC.load(Ordering::Acquire).is_null() {
         let cache = SYM_CACHE.get_or_init(build_sym_cache);
-        if let Some((&_, &addr)) = cache
-            .iter()
-            .find(|(k, _)| k.ends_with("4test16test_main_static") || **k == "test_main_static")
-        {
+        let entry = ["4test18test_main_env_args", "4test16test_main_static"].iter().find_map(|suffix| {
+            cache.iter().find(|(k, _)| k.ends_with(suffix)).map(|(_, &addr)| addr)
+        }).or_else(|| cache.get("test_main_static").copied());
+        if let Some(addr) = entry {
             let orig_fn = addr as *mut u8;
             if detour_function_inline(
                 orig_fn,
