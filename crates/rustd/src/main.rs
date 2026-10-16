@@ -1199,6 +1199,87 @@ fn refusal(
     ))
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct AdtSnapshot {
+    size: u64,
+    align: u64,
+    fields: Vec<(String, Option<u64>)>,
+    variants: usize,
+}
+
+fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FxHashMap<String, AdtSnapshot> {
+    let mut map = FxHashMap::default();
+    let sema = hir::Semantics::new(db);
+    for module in sema.file_to_module_defs(file) {
+        for decl in module.declarations(db) {
+            let ModuleDef::Adt(adt) = decl else { continue };
+            let name = adt.name(db).display(db, syntax::Edition::CURRENT).to_string();
+            let Ok(layout) = adt.layout(db) else { continue };
+            let (fields, variants) = match adt {
+                hir::Adt::Struct(s) => (
+                    s.fields(db)
+                        .into_iter()
+                        .map(|f| {
+                            (
+                                f.name(db).display(db, syntax::Edition::CURRENT).to_string(),
+                                layout.field_offset(f),
+                            )
+                        })
+                        .collect(),
+                    1,
+                ),
+                hir::Adt::Union(u) => (
+                    u.fields(db)
+                        .into_iter()
+                        .map(|f| {
+                            (
+                                f.name(db).display(db, syntax::Edition::CURRENT).to_string(),
+                                layout.field_offset(f),
+                            )
+                        })
+                        .collect(),
+                    1,
+                ),
+                hir::Adt::Enum(e) => (
+                    vec![("tag".to_owned(), layout.enum_tag_size().map(|s| s as u64))],
+                    e.variants(db).len(),
+                ),
+            };
+            map.insert(
+                name,
+                AdtSnapshot { size: layout.size(), align: layout.align(), fields, variants },
+            );
+        }
+    }
+    map
+}
+
+fn detect_adt_layout_warnings(
+    db: &RootDatabase,
+    dirty_files: &FxHashSet<vfs::FileId>,
+    initial_adts: &FxHashMap<vfs::FileId, FxHashMap<String, AdtSnapshot>>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    hir::attach_db(db, || {
+        for &file in dirty_files {
+            let Some(orig_map) = initial_adts.get(&file) else { continue };
+            let cur_map = snapshot_file_adts(db, file);
+            for (name, orig) in orig_map {
+                if let Some(cur) = cur_map.get(name)
+                    && cur != orig
+                {
+                    warnings.push(format!(
+                        "layout of `{name}` changed ({}B/align {} -> {}B/align {}); \
+                         unedited files or live in-memory instances using `{name}` require `cargo build` + restart",
+                        orig.size, orig.align, cur.size, cur.align
+                    ));
+                }
+            }
+        }
+    });
+    warnings
+}
+
 /// Something written in one of the edited files that cargo turns the crate down for. Nothing
 /// may reach it, so the build never looks at it.
 fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
@@ -1581,6 +1662,8 @@ fn main() -> anyhow::Result<()> {
     let mut outlines = outline::Outlines::default();
     let mut initial_texts: FxHashMap<vfs::FileId, triomphe::Arc<str>> = FxHashMap::default();
     let mut initial_serials: FxHashMap<FunctionId, u64> = FxHashMap::default();
+    let mut initial_adts: FxHashMap<vfs::FileId, FxHashMap<String, AdtSnapshot>> =
+        FxHashMap::default();
     let mut dirty_files: FxHashSet<vfs::FileId> = FxHashSet::default();
     let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     let cold = build(
@@ -1713,6 +1796,8 @@ fn main() -> anyhow::Result<()> {
                 Watched::Source(id) => {
                     if !initial_texts.contains_key(id) {
                         initial_texts.insert(*id, db.file_text(*id).text(&db).clone());
+                        initial_adts
+                            .insert(*id, hir::attach_db(&db, || snapshot_file_adts(&db, *id)));
                         if args.krate.is_none() {
                             for &krate in ide_db::base_db::relevant_crates(&db, *id) {
                                 let l = listed.of(&db, Crate::from(krate));
@@ -1817,6 +1902,10 @@ fn main() -> anyhow::Result<()> {
                 Watched::Included(_) => None,
             })
             .collect();
+        let layout_warnings = detect_adt_layout_warnings(&db, &dirty_files, &initial_adts);
+        for w in &layout_warnings {
+            eprintln!("warning: {w}");
+        }
         let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
         let is_live_patch = args.patch.is_some()
             && known.stats.patched.is_some()
@@ -1893,9 +1982,14 @@ fn main() -> anyhow::Result<()> {
                 (Some(patch), Some(_)) => ("patch", patch),
                 _ => ("object", &args.out),
             };
+            let warn_suffix = if layout_warnings.is_empty() {
+                String::new()
+            } else {
+                format!(" warning={:?}", layout_warnings.join("; "))
+            };
             let _ = writeln!(
                 &client,
-                "ok {kind}={} functions={} files={changed} ms={}",
+                "ok {kind}={} functions={} files={changed} ms={}{warn_suffix}",
                 object.display(),
                 known.stats.patched.unwrap_or(known.stats.compiled),
                 total.as_millis()
