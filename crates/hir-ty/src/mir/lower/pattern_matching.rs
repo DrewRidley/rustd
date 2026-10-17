@@ -344,7 +344,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                             );
                         } else {
                             let c = Operand::from_concrete_const(
-                                pattern_len.to_le_bytes().into(),
+                                crate::mir::lower::word_bytes(pattern_len),
                                 MemoryMap::default(),
                                 Ty::new_usize(self.interner()),
                             );
@@ -703,12 +703,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     .len()
                     == 1;
                 if mode == MatchingMode::Check && !only_variant {
-                    let discr = self.const_eval_discriminant(v)?;
-                    let e = if crate::mir::codegen::is_wasm32() {
-                        discr as i64 as u64 as u128
-                    } else {
-                        discr as u128
-                    };
+                    let e = self.const_eval_discriminant(v)? as u128;
                     let tmp = self.discr_temp_place(current);
                     self.push_assignment(
                         current,

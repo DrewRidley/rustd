@@ -3,56 +3,80 @@
 
 mod ci;
 mod cli;
-mod incremental_link;
+mod content;
+mod deps;
+mod impact;
+mod memory;
 mod outline;
+mod remote;
+mod splice;
+mod stub;
 mod symbols;
 mod tree;
+mod weaken;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at.
+#[cfg(not(feature = "heap-profile"))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use ide_db::base_db::SourceDatabase as _;
 use std::{
+    collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
-    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, bail};
-use hir::{
-    AsAssocItem, AssocItemContainer, Crate, HasSource as _, HirDisplay as _, Module, ModuleDef,
-    db::HirDatabase,
-};
+use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty::mir::codegen::{
-    CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
+    Backend, CodegenError, CodegenUnit, ParallelWork, Rejections, Roots, SymbolResolver,
+    exported_symbol,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
-    RustLibSource,
+    RustLibSource, TargetDirectoryConfig, TargetKind,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     AstNode, SyntaxNode,
-    ast::{self, HasArgList, HasName},
+    ast::{self, HasName},
     match_ast,
 };
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
-use crate::symbols::SymbolTable;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+// The same sockets, which the standard library does not have on Windows.
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
+use crate::{
+    splice::{Baseline, Linked, Spliced},
+    symbols::SymbolTable,
+};
+
+#[derive(Clone)]
 struct Args {
     project: PathBuf,
-    krate: Option<String>,
+    krate: String,
     /// More crates to compile from the same loaded workspace, into the same object. When `out`
     /// is a directory, each crate is a program of its own instead: `out` and `report` get a
     /// file per crate, and a crate that fails gets a `.error` file instead of ending the run.
@@ -66,6 +90,9 @@ struct Args {
     /// Where to write the object that amends `out` after an edit, for the link to take ahead of
     /// `out`. Without it every edit writes `out` again.
     patch: Option<PathBuf>,
+    /// The executable `link_cmd` writes. With it an edit that fits a patch is added to the
+    /// executable where it is, and `link_cmd` only runs when that can't be done.
+    splice: Option<PathBuf>,
     /// Tab-separated per-function outcome, for the harness.
     report: Option<PathBuf>,
     /// File of function paths to leave to rustc, for bisecting miscompiles.
@@ -74,16 +101,50 @@ struct Args {
     isolate: Option<PathBuf>,
     /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
     cfg_test: bool,
+    /// Load what the tests, examples and benchmarks of the workspace depend on: a target of
+    /// those kinds is built.
+    dev_deps: bool,
     /// Cargo features to build the workspace's crates with, on top of the default ones.
     features: Vec<String>,
-    /// Target triple (e.g. `wasm32-unknown-unknown`).
+    /// Other checkouts of projects to load into the same database, for requests that name
+    /// one as their `--project`. What they have in common with `project` is there once.
+    also: Vec<PathBuf>,
+    /// The triple to emit code for, when it is not the host: the workspace is loaded as
+    /// cargo builds it for that target, and the objects are of its format and architecture.
     target: Option<String>,
+    /// The root of the workspace `project` is in. Another checkout has crates of the same
+    /// names, and the ones to build are the ones below this.
+    checkout: PathBuf,
+    /// The loaded checkout that `checkout` reads the packages from that are the same in both.
+    base: Option<PathBuf>,
+    /// The crates of `checkout`. One that is the same in another checkout is of both.
+    members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    /// The source files as they were when the daemon first read them.
+    as_compiled: Arc<FxHashMap<PathBuf, triomphe::Arc<str>>>,
 }
 
 impl Args {
+    /// What `path` is called in the checkout, when it is a file of it.
+    fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        let base = self.base.as_deref().and_then(|base| path.strip_prefix(base).ok());
+        path.strip_prefix(&self.checkout).ok().or(base)
+    }
+
+    /// Whether the file is one the checkout is built from. A file of the checkout it shares
+    /// packages with is, when a crate of this one has it.
+    fn owns(&self, db: &RootDatabase, file: vfs::FileId, path: &Path) -> bool {
+        path.starts_with(&self.checkout)
+            || self.base.as_ref().is_some_and(|base| {
+                path.starts_with(base)
+                    && ide_db::base_db::relevant_crates(db, file)
+                        .iter()
+                        .any(|it| self.members.contains(it))
+            })
+    }
+
     /// The directory of the project, which cargo runs rustc in.
     fn root(&self) -> anyhow::Result<PathBuf> {
-        let mut root = std::fs::canonicalize(&self.project)?;
+        let mut root = dunce::canonicalize(&self.project)?;
         if root.is_file() {
             root.pop();
         }
@@ -101,11 +162,14 @@ impl Args {
         let mut socket = None;
         let mut link_cmd = None;
         let mut patch = None;
+        let mut splice = None;
         let mut report = None;
         let mut deny = None;
         let mut isolate = None;
         let mut cfg_test = false;
+        let mut dev_deps = false;
         let mut features = Vec::new();
+        let mut also = Vec::new();
         let mut target = None;
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -116,21 +180,24 @@ impl Args {
                 "--symbols" => symbol_files.push(PathBuf::from(value()?)),
                 "--link-cmd" => link_cmd = Some(value()?),
                 "--patch" => patch = Some(PathBuf::from(value()?)),
+                "--binary" | "--splice" => splice = Some(PathBuf::from(value()?)),
                 "--report" => report = Some(PathBuf::from(value()?)),
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
-                "--features" => features.extend(value()?.split(',').map(str::to_owned)),
+                "--dev-deps" => dev_deps = true,
+                "--also" => also.push(PathBuf::from(value()?)),
                 "--target" => target = Some(value()?),
+                "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
             }
         }
         Ok(Args {
             project: project.context("missing project path")?,
-            krate,
+            krate: krate.context("missing --crate")?,
             batch,
             out: out.context("missing --out")?,
             symbol_files,
@@ -138,12 +205,19 @@ impl Args {
             socket,
             link_cmd,
             patch,
+            splice,
             report,
             deny,
             isolate,
             cfg_test,
+            dev_deps,
             features,
+            also,
             target,
+            checkout: PathBuf::new(),
+            base: None,
+            members: Arc::default(),
+            as_compiled: Arc::default(),
         })
     }
 }
@@ -153,10 +227,19 @@ struct Resolver<'a> {
     table: &'a SymbolTable,
     /// What panic locations in the workspace are relative to.
     root: PathBuf,
+    /// The checkout that the packages which are the same in both are read from.
+    base: Option<PathBuf>,
     rustc_commit: std::cell::OnceCell<Option<String>>,
+    contents: &'a content::Contents,
 }
 
 impl Resolver<'_> {
+    /// What `path` is called in the checkout, when it is a file of it.
+    fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        let base = self.base.as_deref().and_then(|base| path.strip_prefix(base).ok());
+        path.strip_prefix(&self.root).ok().or(base)
+    }
+
     /// The function's path as `rustc-demangle` prints its v0 symbol.
     fn path(&self, func: FunctionId) -> Option<String> {
         let ModuleDef::Function(func) = ModuleDef::from(ModuleDefId::FunctionId(func)) else {
@@ -166,14 +249,7 @@ impl Resolver<'_> {
         let Some(assoc) = func.as_assoc_item(self.db) else {
             return self.item_path(func.module(self.db), name.as_str());
         };
-        let imp = match assoc.container(self.db) {
-            AssocItemContainer::Impl(imp) => imp,
-            AssocItemContainer::Trait(trait_) => {
-                let trait_path =
-                    self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
-                return Some(format!("{trait_path}::{}", name.as_str()));
-            }
-        };
+        let AssocItemContainer::Impl(imp) = assoc.container(self.db) else { return None };
         let self_ty = self.type_path(&imp.self_ty(self.db))?;
         match imp.trait_(self.db) {
             Some(trait_) => {
@@ -186,12 +262,16 @@ impl Resolver<'_> {
                 let mut args = Vec::new();
                 for (idx, param) in params.iter().enumerate().skip(1) {
                     let arg = trait_ref.get_type_argument(idx)?;
-                    let defaulted = param
-                        .as_type_param(self.db)
-                        .is_some_and(|it| it.default(self.db).is_some());
-                    // FIXME: the only default understood is `= Self`.
-                    let is_self = hir::attach_db(self.db, || arg == trait_ref.self_ty());
-                    if defaulted && idx + 1 == params.len() && is_self {
+                    let default = param.as_type_param(self.db).and_then(|it| it.default(self.db));
+                    // FIXME: a default that names a parameter is understood only as `= Self`.
+                    let is_default = default.as_ref().is_some_and(|default| {
+                        if default.as_type_param(self.db).is_some() {
+                            return hir::attach_db(self.db, || arg == trait_ref.self_ty());
+                        }
+                        let default = self.type_path(default);
+                        default.is_some() && default == self.type_path(&arg)
+                    });
+                    if idx + 1 == params.len() && is_default {
                         break;
                     }
                     args.push(self.type_path(&arg)?);
@@ -206,12 +286,43 @@ impl Resolver<'_> {
         }
     }
 
+    /// Whether the function, or the `impl` it is in, takes types or constants.
+    fn is_generic(&self, func: FunctionId) -> bool {
+        let generic = |def: hir::GenericDef| !def.type_or_const_params(self.db).is_empty();
+        if generic(hir::Function::from(func).into()) {
+            return true;
+        }
+        let ItemContainerId::ImplId(imp) = func.lookup(self.db).container else { return false };
+        generic(hir::Impl::from(imp).into())
+    }
+
+    /// rustc's `StableCrateId` of a crate it built something of.
+    fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let krate = Crate::from(krate);
+        let name = krate.display_name(self.db)?;
+        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+    }
+
+    /// What stands for a crate of the checkout that rustc built nothing of, the same after
+    /// every edit: its name and where in the checkout its source starts.
+    fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        if std::env::var_os("RUSTD_INCREMENTAL_ONLY").is_some() {
+            return None;
+        }
+        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+            return None;
+        }
+        let name = Crate::from(krate).display_name(self.db)?;
+        let root = self.crate_root(krate.into())?;
+        let root = self.inside(&root).unwrap_or(&root);
+        let named = format!("rustd crate {} {}", name.crate_name(), root.display());
+        let hash = <sha2::Sha256 as sha2::Digest>::digest(named.as_bytes());
+        Some(u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes")))
+    }
+
     /// The file the crate's source starts at.
     fn crate_root(&self, krate: Crate) -> Option<PathBuf> {
-        let file = krate.root_file(self.db);
-        let source_root = self.db.file_source_root(file).source_root_id(self.db);
-        let source_root = self.db.source_root(source_root).source_root(self.db);
-        Some(PathBuf::from(source_root.path_for_file(&file)?.as_path()?.to_string()))
+        crate_root_file(self.db, krate)
     }
 
     fn item_path(&self, module: Module, name: &str) -> Option<String> {
@@ -342,6 +453,14 @@ impl Resolver<'_> {
         if let Some(builtin) = ty.as_builtin() {
             return Some(builtin.name().as_str().to_owned());
         }
+        if ty.is_tuple() {
+            let fields: Option<Vec<_>> =
+                ty.tuple_fields(self.db).iter().map(|it| self.type_path(it)).collect();
+            return Some(match &*fields? {
+                [only] => format!("({only},)"),
+                fields => format!("({})", fields.join(", ")),
+            });
+        }
         // A parameter of the `impl` an item is in, where the item is not generic itself: a
         // static, or what a closure or constant in a generic function holds.
         if ty.as_type_param(self.db).is_some() {
@@ -377,7 +496,7 @@ fn rustc_commit(toolchain: &str) -> Option<String> {
 }
 
 impl SymbolResolver for Resolver<'_> {
-    fn in_parallel(&self, count: usize, work: &(dyn Fn(&dyn HirDatabase, usize) + Sync)) {
+    fn in_parallel(&self, count: usize, work: &ParallelWork<'_>) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
         if threads < 2 {
             return;
@@ -386,15 +505,18 @@ impl SymbolResolver for Resolver<'_> {
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let db = self.db.clone();
-                let next = &next;
+                let (next, table, root) = (&next, self.table, self.root.clone());
+                let base = self.base.clone();
+                let (rustc_commit, contents) = (self.rustc_commit.clone(), self.contents);
                 scope.spawn(move || {
+                    let resolver = Resolver { db: &db, table, root, base, rustc_commit, contents };
                     hir::attach_db(&db, || {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if at >= count {
                                 break;
                             }
-                            work(&db, at);
+                            work(&db, &resolver, at);
                         }
                     })
                 });
@@ -411,7 +533,7 @@ impl SymbolResolver for Resolver<'_> {
         {
             return Some(format!("/rustc/{commit}/{file}"));
         }
-        let relative = Path::new(&path).strip_prefix(&self.root).ok();
+        let relative = self.inside(Path::new(&path));
         Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
     }
 
@@ -419,41 +541,43 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(symbol);
         }
+        // Not a function until it or the `impl<T>` it is in is given its types: there is
+        // nothing to name, the more so in a crate of such alone, which rustc builds nothing
+        // of. One of a name that another in the same function has is not to be taken for it.
+        if self.is_generic(func) {
+            return None;
+        }
         let path = self.path(func)?;
-        if let Some(sym) = self.table.get(&path) {
-            return Some(sym.to_owned());
+        if let Some(symbol) = self.table.get(&path) {
+            return Some(symbol.to_owned());
         }
-        let flags = hir_def::attrs::AttrFlags::query(self.db, func.into());
-        if flags.contains(hir_def::attrs::AttrFlags::IS_TEST)
-            && !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE)
-        {
-            use syntax::ast::HasAttrs as _;
-            let should_panic = hir::Function::from(func)
-                .source(self.db)
-                .is_some_and(|s| s.value.attrs().any(|a| a.simple_name().as_deref() == Some("should_panic")));
-            let rel = path.split_once("::").map_or(path.as_str(), |(_, rest)| rest);
-            let prefix = if should_panic {
-                "__rustd_new_test_panic__"
-            } else {
-                "__rustd_new_test__"
-            };
-            return Some(format!("{prefix}{}", rel.replace("::", "__")));
-        }
-        None
+        // rustc has built nothing of the crate: the function is ours to name.
+        let krate = hir_def::HasModule::krate(&func, self.db);
+        let id = self.own_crate_id(krate)?;
+        Some(format!("rustd.{id:x}.{path}"))
+    }
+
+    fn defines(&self, symbol: &str) -> bool {
+        self.table.defines(symbol)
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        let krate = Crate::from(krate);
-        let name = krate.display_name(self.db)?;
-        let root = self.crate_root(krate);
-        root.as_deref()
-            .and_then(|r| self.table.stable_crate_id(name.crate_name().as_str(), r))
-            .or_else(|| {
-                use std::hash::{Hash, Hasher};
-                let mut h = rustc_hash::FxHasher::default();
-                name.crate_name().as_str().hash(&mut h);
-                Some(h.finish())
-            })
+        self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
+    }
+
+    fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let places = (&*self.root, self.base.as_deref());
+        if !krate.data(self.db).origin.is_local() {
+            let root = self.crate_root(krate.into())?;
+            return Some(self.contents.library(self.db, krate, &root, &|krate| {
+                Some((self.stable_crate_id(krate), self.crate_root(krate.into())?))
+            }));
+        }
+        self.contents.id(self.db, places, krate, &|krate| self.stable_crate_id(krate))
+    }
+
+    fn names_place(&self, bytes: &[u8]) -> bool {
+        self.contents.names_place((&*self.root, self.base.as_deref()), bytes)
     }
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
@@ -662,19 +786,37 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
     place_in_definition(sema, closure, &is_closure)
 }
 
-/// The crates called `krate`: a package's library and its binary may share the name, and both
-/// are being built.
-fn crates_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<Crate>> {
+/// The crates called `krate` that a build of the checkout at `checkout` compiles: a package's
+/// library and its binary may share the name, and both are being built. A `krate` that is the
+/// path of a `.rs` file is the one target with that root file, which tells a test from an
+/// example of the same name.
+fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
+    let is_file = krate.ends_with(".rs");
     let mut found: Vec<_> = Crate::all(db)
         .into_iter()
-        .filter(|it| it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate))
+        .filter(|it| match is_file {
+            // Named from the checkout, or in full.
+            true => crate_root_file(db, *it).is_some_and(|root| {
+                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
+            }),
+            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
+        })
         .collect();
-    // A dependency may be another version of the crate being built.
-    if found.iter().any(|it| it.origin(db).is_local()) {
-        found.retain(|it| it.origin(db).is_local());
+    // A dependency may be another version of the crate being built, and another checkout
+    // has a crate of its name too.
+    let of_checkout = |krate: &Crate| args.members.contains(&(*krate).into());
+    if found.iter().any(of_checkout) {
+        found.retain(of_checkout);
     }
     anyhow::ensure!(!found.is_empty(), "crate {krate} not found in workspace");
     Ok(found)
+}
+
+fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
+    let file = krate.root_file(db);
+    let source_root = db.file_source_root(file).source_root_id(db);
+    let source_root = db.source_root(source_root).source_root(db);
+    Some(PathBuf::from(source_root.path_for_file(&file)?.as_path()?.to_string()))
 }
 
 /// Resolves the names and collects the impls of the crates being built and of everything they
@@ -682,21 +824,429 @@ fn crates_named(db: &RootDatabase, krate: &str) -> anyhow::Result<Vec<Crate>> {
 /// `load_workspace_at`, with each package's features those of a build of the package at
 /// `project` alone, as the artifacts we link against were built.
 fn load(
+    projects: &[&Path],
+    cargo_config: &CargoConfig,
+    load_config: LoadCargoConfig,
+    dev_deps: bool,
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
+    let mut checkouts = Checkouts {
+        compared: Default::default(),
+        roots: Vec::new(),
+        splits: Vec::new(),
+        loaded: load_cargo::Loaded::default(),
+        cargo_config: cargo_config.clone(),
+        load_config,
+        dev_deps,
+    };
+    let mut db = RootDatabase::new(None);
+    let mut vfs = vfs::Vfs::default();
+    checkouts.add(projects, &mut db, &mut vfs)?;
+    Ok((db, vfs, checkouts))
+}
+
+/// A file of a checkout that was compared with the one it is in a loaded checkout: the size
+/// and the time of the last write of both, and whether the two were alike. They are not read
+/// again until one is written.
+type Compared = std::sync::Mutex<FxHashMap<PathBuf, ((u64, SystemTime), (u64, SystemTime), bool)>>;
+
+/// The checkouts the daemon has loaded.
+struct Checkouts {
+    compared: Compared,
+    /// The project a build names, and the root of the workspace it is in.
+    roots: Vec<(PathBuf, PathBuf)>,
+    /// For each of `roots`, what it shares with another when it is not loaded in full.
+    splits: Vec<Option<Split>>,
+    loaded: load_cargo::Loaded,
+    cargo_config: CargoConfig,
+    load_config: LoadCargoConfig,
+    /// Whether what only tests, examples and benchmarks depend on is loaded.
+    dev_deps: bool,
+}
+
+impl Checkouts {
+    fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
+        let project = dunce::canonicalize(project)?;
+        let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
+        root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
+    }
+
+    /// The checkout of `project`: its root, what it shares and its crates.
+    fn parts(&self, project: &Path) -> anyhow::Result<Parts> {
+        let root = self.root_of(project)?;
+        let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
+        let base = self.splits[at].as_ref().map(|it| it.base.clone());
+        let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
+        Ok(Parts { root, base, members })
+    }
+
+    /// The loaded checkout that `project` is a checkout of the same repository as, and the
+    /// root of its own. `None` when the two are not built alike.
+    fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
+        let project = dunce::canonicalize(project).ok()?;
+        (0..self.roots.len()).find_map(|at| {
+            let (loaded, base) = &self.roots[at];
+            if self.splits[at].is_some() {
+                return None;
+            }
+            let inside = loaded.strip_prefix(base).ok()?;
+            let mut over = project.clone();
+            for part in inside.components().rev() {
+                if over.file_name() != Some(part.as_os_str()) {
+                    return None;
+                }
+                over.pop();
+            }
+            self.builds_alike(base, &over).then_some((at, over))
+        })
+    }
+
+    /// The directories of the member packages of the checkout at `at`, and whether each is
+    /// of a procedural macro.
+    fn packages(&self, at: usize) -> Vec<(PathBuf, bool)> {
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
+            return Vec::new();
+        };
+        cargo
+            .packages()
+            .filter(|&it| cargo[it].is_member)
+            .map(|it| {
+                let package = &cargo[it];
+                let dir = AsRef::<Path>::as_ref(package.manifest.parent()).to_owned();
+                (dir, package.targets.iter().any(|&it| cargo[it].kind.is_proc_macro()))
+            })
+            .collect()
+    }
+
+    /// The packages of the checkout at `over` whose files are not those of the loaded one at
+    /// `base`.
+    fn differing(&self, base: usize, over: &Path) -> BTreeSet<PathBuf> {
+        let packages = self.packages(base);
+        let base = &self.roots[base].1;
+        let nested: FxHashSet<&Path> = packages.iter().map(|it| &*it.0).collect();
+        // A procedural macro is rustc's to build: one that is not the same is another build.
+        packages
+            .iter()
+            .filter(|(dir, proc_macro)| {
+                !proc_macro && !package_alike(dir, base, over, &nested, &self.compared)
+            })
+            .map(|it| &it.0)
+            .filter_map(|dir| Some(dir.strip_prefix(base).ok()?.to_owned()))
+            .collect()
+    }
+
+    /// The workspace of the checkout at `over`: that of the loaded one at `base`, with the
+    /// packages of `own` where `over` has them.
+    fn split(&self, base: usize, over: &Path, own: &BTreeSet<PathBuf>) -> ProjectWorkspace {
+        let mut workspace = self.loaded.workspaces()[base].clone();
+        let root = AbsPathBuf::assert_utf8(self.roots[base].1.clone());
+        let over = AbsPathBuf::assert_utf8(over.to_owned());
+        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
+            *cargo = cargo.placed(&root, &over, &|dir| {
+                dir.strip_prefix(&root).is_some_and(|it| own.contains(AsRef::<Path>::as_ref(&it)))
+            });
+        }
+        workspace
+    }
+
+    /// The checkouts that share other packages with a loaded one than the ones that are the
+    /// same in both now: each with the one it shares with and the packages of its own.
+    fn differences(&self) -> anyhow::Result<Vec<(usize, usize, BTreeSet<PathBuf>)>> {
+        let mut differences = Vec::new();
+        for (at, split) in self.splits.iter().enumerate() {
+            let Some(split) = split else { continue };
+            let base = self.roots.iter().position(|(_, it)| *it == split.base);
+            let base = base.context("a checkout shares with a loaded one")?;
+            let own = self.differing(base, &self.roots[at].1);
+            if own != split.own {
+                differences.push((at, base, own));
+            }
+        }
+        Ok(differences)
+    }
+
+    /// Gives the checkouts that share packages with a loaded one the packages of their own
+    /// that [`Checkouts::differences`] found.
+    fn share(
+        &mut self,
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+        differences: Vec<(usize, usize, BTreeSet<PathBuf>)>,
+    ) -> anyhow::Result<()> {
+        for (at, base, own) in differences {
+            let over = self.roots[at].1.clone();
+            eprintln!("split {}: its own are {own:?}", over.display());
+            self.loaded.replace(at, self.split(base, &over, &own));
+            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+        }
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
+    }
+
+    /// How the daemon builds `project`: as itself when its checkout is loaded, and as its
+    /// place in a loaded checkout with the files of its own when `overlay` allows that and
+    /// the two lock the same dependencies. `None` when its checkout has to be loaded.
+    fn view_of(
+        &self,
+        project: &Path,
+        overlay: Overlay,
+        quick: &dyn Fn(&Path, &Path) -> bool,
+    ) -> Option<View> {
+        let project = dunce::canonicalize(project).ok()?;
+        if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
+            return Some(View { base: root.clone(), over: root.clone(), project });
+        }
+        if overlay == Overlay::Never {
+            return None;
+        }
+        // One that shares packages with another has those where the other is.
+        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
+        whole.into_iter().find_map(|(loaded, base)| {
+            let inside = loaded.strip_prefix(base).ok()?;
+            let mut over = project.clone();
+            for part in inside.components().rev() {
+                if over.file_name() != Some(part.as_os_str()) {
+                    return None;
+                }
+                over.pop();
+            }
+            let alike = (overlay == Overlay::Always || quick(base, &over))
+                && self.builds_alike(base, &over);
+            alike.then(|| View { base: base.clone(), over, project: loaded.clone() })
+        })
+    }
+
+    /// The checkout that the one at `root` has packages of, when it has.
+    fn shares_with(&self, root: &Path) -> Option<&Path> {
+        let at = self.roots.iter().position(|it| it.1 == root)?;
+        self.splits[at].as_ref().map(|it| &*it.base)
+    }
+
+    /// Whether what cargo and rustc did for the checkout at `base` is what they would do for
+    /// the one at `over`: the same crates with the same features, and the same build scripts
+    /// and proc macros, which the daemon has the output of and does not run.
+    // FIXME: a build script or a proc macro that reads other files of its checkout is not
+    // noticed, and neither is a crate outside the checkout that the manifests name by path.
+    fn builds_alike(&self, base: &Path, over: &Path) -> bool {
+        let alike = |path: &Path| {
+            let Ok(inside) = path.strip_prefix(base) else { return true };
+            std::fs::read(path).ok() == std::fs::read(over.join(inside)).ok()
+        };
+        let top = ["Cargo.lock", "Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml"];
+        if !top.iter().all(|it| alike(&base.join(it))) {
+            return false;
+        }
+        let cargo = self.loaded.workspaces().iter().find_map(|it| match &it.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. }
+                if AsRef::<Path>::as_ref(cargo.workspace_root()) == base =>
+            {
+                Some(cargo)
+            }
+            _ => None,
+        });
+        let Some(cargo) = cargo else { return false };
+        cargo.packages().map(|it| &cargo[it]).filter(|it| it.is_member).all(|package| {
+            let manifest: &Path = package.manifest.as_ref();
+            alike(manifest)
+                && package.targets.iter().map(|&it| &cargo[it]).all(|target| {
+                    let root: &Path = target.root.as_ref();
+                    match target.kind {
+                        TargetKind::BuildScript => alike(root),
+                        TargetKind::Lib { is_proc_macro: true } => {
+                            root.parent().is_some_and(|it| tree_alike(it, base, over))
+                        }
+                        _ => true,
+                    }
+                })
+        })
+    }
+
+    /// Loads the checkouts of `projects` into `db`, next to those there are.
+    fn add(
+        &mut self,
+        projects: &[&Path],
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+    ) -> anyhow::Result<()> {
+        let mut workspaces = Vec::new();
+        let mut roots = Vec::new();
+        let mut splits = Vec::new();
+        // A checkout like a loaded one shares the packages they have alike, unless told not to.
+        let share = std::env::var_os("RUSTD_SPLIT").is_none_or(|it| it != "0");
+        for project in projects {
+            if share && let Some((base, over)) = self.alike(project) {
+                let own = self.differing(base, &over);
+                eprintln!("split {}: its own are {own:?}", over.display());
+                workspaces.push(self.split(base, &over, &own));
+                splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
+                roots.push((dunce::canonicalize(project)?, over));
+                continue;
+            }
+            splits.push(None);
+            let workspace =
+                workspace_at(project, &self.cargo_config, &self.load_config, self.dev_deps)?;
+            // The checkouts after the first run their build scripts where the first did. A
+            // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
+            // crate for all.
+            if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
+                && self.cargo_config.target_dir_config == TargetDirectoryConfig::None
+            {
+                let target: &paths::Utf8Path = cargo.target_directory().as_ref();
+                self.cargo_config.target_dir_config =
+                    TargetDirectoryConfig::Directory(target.to_owned());
+            }
+            let root = PathBuf::from(workspace.workspace_root().to_string());
+            roots.push((dunce::canonicalize(project)?, root));
+            workspaces.push(workspace);
+        }
+        self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.roots.extend(roots);
+        self.splits.extend(splits);
+        Ok(())
+    }
+}
+
+/// The parts of a checkout that a build of it is told.
+struct Parts {
+    root: PathBuf,
+    base: Option<PathBuf>,
+    members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+}
+
+/// Whether the files of a package under `dir`, a directory of the checkout at `base`, are
+/// those of the checkout at `over`. The packages in `nested` are not part of it,
+/// and neither is what a build wrote.
+fn package_alike(
+    dir: &Path,
+    base: &Path,
+    over: &Path,
+    nested: &FxHashSet<&Path>,
+    compared: &Compared,
+) -> bool {
+    let Ok(inside) = dir.strip_prefix(base) else { return true };
+    let theirs = over.join(inside);
+    let skipped = |inside: &Path, name: &std::ffi::OsStr| {
+        name == ".git"
+            || inside.join(name).join("CACHEDIR.TAG").exists()
+            || nested.contains(&*dir.join(name))
+    };
+    let names = |inside: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(inside)
+            .ok()?
+            .filter_map(|it| Some(it.ok()?.file_name()))
+            .filter(|name| !skipped(inside, name))
+            .collect();
+        names.sort_unstable();
+        Some(names)
+    };
+    let Some(ours) = names(dir) else { return false };
+    names(&theirs).is_some_and(|it| it == ours)
+        && ours.iter().all(|name| {
+            let (path, their) = (dir.join(name), theirs.join(name));
+            if path.is_dir() {
+                return package_alike(&path, base, over, nested, compared);
+            }
+            let written = |path: &Path| {
+                let file = std::fs::metadata(path).ok()?;
+                Some((file.len(), file.modified().ok()?))
+            };
+            let (Some(ours), Some(theirs)) = (written(&path), written(&their)) else {
+                return false;
+            };
+            if ours.0 != theirs.0 {
+                return false;
+            }
+            let known = compared.lock().unwrap_or_else(|e| e.into_inner()).get(&their).copied();
+            if let Some((_, _, alike)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
+                return alike;
+            }
+            let alike = match (std::fs::read(&path), std::fs::read(&their)) {
+                (Ok(ours), Ok(theirs)) => {
+                    // Code that asks where its package is does not say the same in two
+                    // checkouts.
+                    let asks = path.extension().is_some_and(|it| it == "rs")
+                        && memchr::memmem::find_iter(&ours, b"env!(").any(|at| {
+                            ours[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
+                        });
+                    ours == theirs && !asks
+                }
+                _ => false,
+            };
+            compared.lock().unwrap_or_else(|e| e.into_inner()).insert(their, (ours, theirs, alike));
+            alike
+        })
+}
+
+/// Whether the files under `dir`, a directory of the checkout at `base`, are those of the
+/// checkout at `over`.
+fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
+    let Ok(inside) = dir.strip_prefix(base) else { return true };
+    let names = |dir: &Path| {
+        let mut names: Vec<_> =
+            std::fs::read_dir(dir).ok()?.filter_map(|it| Some(it.ok()?.file_name())).collect();
+        names.sort_unstable();
+        Some(names)
+    };
+    let theirs = over.join(inside);
+    let Some(ours) = names(dir) else { return false };
+    names(&theirs).is_some_and(|it| it == ours)
+        && ours.iter().all(|name| {
+            let path = dir.join(name);
+            if path.is_dir() {
+                tree_alike(&path, base, over)
+            } else {
+                std::fs::read(&path).ok() == std::fs::read(theirs.join(name)).ok()
+            }
+        })
+}
+
+/// A checkout that is a loaded one where its files are the same: the packages that are the
+/// same in both are the crates of the loaded one, and only the others are crates of its own.
+#[derive(Clone, PartialEq)]
+struct Split {
+    /// The root of the loaded checkout.
+    base: PathBuf,
+    /// The directories of the packages it has other files in, as they are called in both.
+    own: BTreeSet<PathBuf>,
+}
+
+/// When a checkout that is not loaded is read as a loaded one with other files.
+#[derive(Clone, Copy, PartialEq)]
+enum Overlay {
+    Never,
+    /// For as long as taking in what differs is quick: the checkouts read as one are built
+    /// in turn, so one that keeps taking long is loaded with its own crates instead.
+    Quick,
+    Always,
+}
+
+/// A checkout as the daemon looks at it.
+struct View {
+    /// The loaded checkout it is built as.
+    base: PathBuf,
+    /// Where its files are read from: `base`, or a checkout that is `base` with other contents.
+    over: PathBuf,
+    /// The project asked for, in `base`.
+    project: PathBuf,
+}
+
+fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, impl Sized + use<>)> {
+    dev_deps: bool,
+) -> anyhow::Result<ProjectWorkspace> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
-        if !cargo_config.set_test {
+        if !dev_deps {
             cargo.drop_dev_dependencies();
         }
-        let built = built_features(manifest.manifest_path().as_ref(), cargo_config)?;
+        let built = built_features(manifest.manifest_path().as_ref(), cargo_config, dev_deps)?;
         let packages: Vec<_> = cargo.packages().collect();
         for package in packages {
-            let key = (cargo[package].name.clone(), cargo[package].version.to_string());
+            let data = &cargo[package];
+            let directory = data.is_local.then(|| PathBuf::from(data.manifest.parent()));
+            let key = (data.name.clone(), data.version.to_string(), directory);
             if let Some(features) = built.get(&key) {
                 cargo.set_active_features(package, features.iter().cloned().collect());
             }
@@ -706,10 +1256,25 @@ fn load(
         let build_scripts = workspace.run_build_scripts(cargo_config, &|_| {})?;
         workspace.set_build_scripts(build_scripts);
     }
-    load_workspace(workspace, &cargo_config.extra_env, load_config)
+    Ok(workspace)
 }
 
-/// The features of each package, by name and version, in a build of the package of `manifest`.
+/// What the checkouts loaded have in common, and what holding them costs.
+fn report_sharing(db: &RootDatabase) {
+    let crates = Crate::all(db);
+    let local = crates.iter().filter(|it| it.origin(db).is_local()).count();
+    eprintln!(
+        "sharing: {} crates, {local} of the checkouts' own, {} MB",
+        crates.len(),
+        memory::resident().unwrap_or(0)
+    );
+}
+
+/// A package's name, its version, and its directory when it is built from a path: a member
+/// can depend, through others, on the registry's copy of its own version.
+type BuiltPackage = (String, String, Option<PathBuf>);
+
+/// The features of each package in a build of the package of `manifest`.
 ///
 /// `cargo metadata` unifies features over every member of the workspace, and cargo doesn't
 /// when it builds one of them.
@@ -717,53 +1282,35 @@ fn load(
 fn built_features(
     manifest: &Path,
     cargo_config: &CargoConfig,
-) -> anyhow::Result<FxHashMap<(String, String), std::collections::BTreeSet<String>>> {
-    let stdout_text = if let Ok(cache_path) = std::env::var("RUSTD_CACHE_TREE")
-        && let Ok(expected_fp) = std::env::var("RUSTD_CACHE_FP")
-        && let Ok(text) = std::fs::read_to_string(&cache_path)
-        && let Some((fp_line, body)) = text.split_once('\n')
-        && fp_line == expected_fp
+    dev_deps: bool,
+) -> anyhow::Result<FxHashMap<BuiltPackage, std::collections::BTreeSet<String>>> {
+    let edges = if dev_deps { "normal,dev" } else { "normal" };
+    let mut command = Command::new("cargo");
+    command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
+    command.arg("--manifest-path").arg(manifest);
+    if let CargoFeatures::Selected { features, .. } = &cargo_config.features
+        && !features.is_empty()
     {
-        body.to_owned()
-    } else {
-        let mut command = Command::new("cargo");
-        let edges = if cargo_config.set_test { "normal,dev" } else { "normal" };
-        command.args(["tree", "--edges", edges, "--prefix", "none", "--format", "{p}|{f}"]);
-        command.arg("--manifest-path").arg(manifest);
-        if let Ok(pkg) = std::env::var("RUSTD_PKG")
-            && !pkg.is_empty()
-        {
-            command.args(["-p", &pkg]);
-        }
-        if let CargoFeatures::Selected { features, .. } = &cargo_config.features
-            && !features.is_empty()
-        {
-            command.arg("--features").arg(features.join(","));
-        }
-        let output = command.output().context("running `cargo tree`")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "`cargo tree` failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let text = String::from_utf8(output.stdout)?;
-        if let Ok(cache_path) = std::env::var("RUSTD_CACHE_TREE")
-            && let Ok(fp) = std::env::var("RUSTD_CACHE_FP")
-        {
-            let _ = std::fs::write(&cache_path, format!("{fp}\n{text}"));
-        }
-        text
-    };
+        command.arg("--features").arg(features.join(","));
+    }
+    let output = command.output().context("running `cargo tree`")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`cargo tree` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut built = FxHashMap::default();
-    for line in stdout_text.lines() {
+    for line in String::from_utf8(output.stdout)?.lines() {
         // `name v1.2.3 (/path/of/a/member)|feature,feature (*)`
         let Some((package, features)) = line.split_once('|') else { continue };
-        let mut package = package.split(' ');
+        let mut package = package.splitn(3, ' ');
         let (Some(name), Some(version)) = (package.next(), package.next()) else { continue };
         let version = version.trim_start_matches('v');
+        let source = package.next().and_then(|it| it.strip_prefix('(')?.strip_suffix(')'));
+        let directory = source.filter(|it| Path::new(it).is_absolute()).map(PathBuf::from);
         let features = features.trim_end_matches(" (*)").split(',').filter(|it| !it.is_empty());
         built
-            .entry((name.to_owned(), version.to_owned()))
+            .entry((name.to_owned(), version.to_owned(), directory))
             .or_insert_with(std::collections::BTreeSet::new)
             .extend(features.map(str::to_owned));
     }
@@ -773,25 +1320,15 @@ fn built_features(
 fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     let mut seen = FxHashSet::default();
     let mut crates = Vec::new();
-    let roots: Vec<Crate> = if let Some(first) = &args.krate {
-        let mut r = Vec::new();
-        for name in std::iter::once(first).chain(&args.batch) {
-            r.extend(crates_named(db, name)?);
+    for name in std::iter::once(&args.krate).chain(&args.batch) {
+        for krate in crates_named(db, name, args)? {
+            let krate: ide_db::base_db::Crate = krate.into();
+            crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
         }
-        r
-    } else if let Ok(bin_crate) = std::env::var("RUSTD_BIN_CRATE")
-        && let Ok(r) = crates_named(db, &bin_crate.replace('-', "_"))
-    {
-        r
-    } else {
-        Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
-    };
-    for krate in roots {
-        let krate: ide_db::base_db::Crate = krate.into();
-        crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
     }
-    // A crate with fewer transitive dependencies must be resolved before one that depends on it.
-    crates.sort_by_cached_key(|&c| c.transitive_deps(db).len());
+    // A crate comes before its dependencies in the list, and a thread that starts on one
+    // waits for the threads working on what it depends on.
+    crates.reverse();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
@@ -803,6 +1340,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
                     let start = Instant::now();
+                    let before = memory::live();
                     hir::attach_db(&db, || {
                         _ = hir::crate_def_map(&db, krate);
                         let names = start.elapsed();
@@ -810,9 +1348,15 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
                         if std::env::var_os("RUSTD_STATS").is_some() {
                             let name = krate.extra_data(&db).display_name.as_ref();
                             let name = name.map(|it| it.to_string()).unwrap_or_default();
+                            // What the heap grew by is this crate's when one thread resolves.
+                            let grew = memory::live().zip(before).map(|(now, before)| {
+                                let origin = &krate.data(&db).origin;
+                                format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
+                            });
                             eprintln!(
-                                "resolved {name}: names {names:.1?}, impls {:.1?}",
-                                start.elapsed() - names
+                                "resolved {name}: names {names:.1?}, impls {:.1?}{}",
+                                start.elapsed() - names,
+                                grew.unwrap_or_default()
                             );
                         }
                     });
@@ -827,47 +1371,52 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
 /// have changed the items of.
 #[derive(Default)]
 struct Listed {
-    functions: FxHashMap<Crate, ListedCrate>,
+    functions: std::sync::Mutex<FxHashMap<Crate, std::sync::Arc<ListedCrate>>>,
+    /// Every crate that was listed, also once an edit has it listed again.
+    built: std::sync::Mutex<FxHashSet<Crate>>,
 }
 
 struct ListedCrate {
     functions: Vec<FunctionId>,
-    /// For each, whether it is `main` or something a runtime looks up by name.
-    starts: Vec<bool>,
-    has_main: bool,
+    /// For each, whether a runtime looks it up by name.
+    exported: Vec<bool>,
+    main: Option<FunctionId>,
 }
 
 impl ListedCrate {
     fn new(db: &RootDatabase, krate: Crate) -> ListedCrate {
         let functions = functions_of(db, krate);
-        let mut has_main = false;
-        let starts = functions
-            .iter()
-            .map(|&func| {
-                let is_main = hir::Function::from(func).is_main(db);
-                has_main |= is_main;
-                is_main || exported_symbol(db, func).is_some()
-            })
-            .collect();
-        ListedCrate { functions, starts, has_main }
+        let main = functions.iter().copied().find(|&it| hir::Function::from(it).is_main(db));
+        let exported = functions.iter().map(|&it| exported_symbol(db, it).is_some()).collect();
+        ListedCrate { functions, exported, main }
     }
 }
 
 impl Listed {
-    fn of(&mut self, db: &RootDatabase, krate: Crate) -> &ListedCrate {
-        self.functions.entry(krate).or_insert_with(|| ListedCrate::new(db, krate))
+    /// Two builds that ask for a crate not listed yet both list it: neither waits for the other.
+    fn of(&self, db: &RootDatabase, krate: Crate) -> std::sync::Arc<ListedCrate> {
+        self.built.lock().unwrap().insert(krate);
+        if let Some(listed) = self.functions.lock().unwrap().get(&krate) {
+            return listed.clone();
+        }
+        let listed = std::sync::Arc::new(ListedCrate::new(db, krate));
+        self.functions.lock().unwrap().entry(krate).or_insert(listed).clone()
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
-    fn touch(&mut self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
+    fn touch(&self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
         let Some(crates) = crates else {
-            self.functions.clear();
+            self.functions.lock().unwrap().clear();
             return;
         };
-        for &krate in crates {
-            for seeing in krate.transitive_rev_deps(db) {
-                self.functions.remove(&Crate::from(seeing));
-            }
+        // Asked before the lock is taken: a query that is cancelled unwinds, and would poison it.
+        let seeing: Vec<Crate> = crates
+            .iter()
+            .flat_map(|krate| krate.transitive_rev_deps(db).into_iter().map(Crate::from))
+            .collect();
+        let mut functions = self.functions.lock().unwrap();
+        for krate in seeing {
+            functions.remove(&krate);
         }
     }
 }
@@ -941,7 +1490,6 @@ fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
 /// Lowers the bodies on all threads and hands them back. An edit to a file has every body in
 /// it lowered again, which is most of the work of looking through them.
 fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
-    let probing = PROBING.get();
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         // The bodies of one file are next to each other, and the edited file's are the slow
@@ -949,7 +1497,6 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
         for part in 0..threads.min(bodies.len()) {
             let (db, bodies) = (db.clone(), &bodies);
             scope.spawn(move || {
-                PROBING.set(probing);
                 hir::attach_db(&db, || {
                     for &body in bodies.iter().skip(part).step_by(threads) {
                         Body::of(&db, body);
@@ -976,7 +1523,7 @@ struct Build {
 thread_local! {
     /// Set on a thread that asks about what an edit may have removed. A query about something
     /// that is gone panics, which is the answer and not worth a report.
-    pub(crate) static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn build(
@@ -984,543 +1531,86 @@ fn build(
     table: &SymbolTable,
     args: &Args,
     known: &mut Rejections,
-    listed: &mut Listed,
-    dirty_files: &FxHashSet<vfs::FileId>,
-    initial_serials: &FxHashMap<FunctionId, u64>,
-    changed_adts: &FxHashSet<hir_def::AdtId>,
-    changed_const_names: &FxHashSet<String>,
-    is_cold: bool,
+    listed: &Listed,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
-    let root = args.root()?;
-    let resolver = Resolver { db, table, root, rustc_commit: Default::default() };
+    let contents = &content::Contents::default();
+    let (root, base) = (args.checkout.clone(), args.base.clone());
+    let resolver = Resolver { db, table, root, base, rustc_commit: Default::default(), contents };
     let hir_db: &dyn HirDatabase = db;
-    let mut local = Vec::new();
-    let (entries, on_demand): (Vec<FunctionId>, Vec<FunctionId>) = if let Some(first) = &args.krate {
+    let incremental_only = std::env::var_os("RUSTD_INCREMENTAL_ONLY").is_some();
+    let (entries, on_demand, local, main) = if incremental_only {
+        let sel = impact::select_dirty_and_tests(db, &resolver, table, args, listed)?;
+        if sel.entries.is_empty() {
+            let empty = hir_ty::mir::codegen::empty_object().map_err(anyhow::Error::msg)?;
+            if !args.out.exists() {
+                replace(&args.out, &empty)?;
+            }
+            if let Some(patch_path) = &args.patch {
+                replace(patch_path, &empty)?;
+            }
+            known.stats = hir_ty::mir::codegen::BuildStats {
+                patched: args.patch.as_ref().map(|_| 0),
+                ..Default::default()
+            };
+            return Ok(Build {
+                compiled: 0,
+                skipped: Vec::new(),
+                instances: 0,
+                codegen: start.elapsed(),
+                emit: Duration::ZERO,
+                steps: [start.elapsed(), Duration::ZERO, Duration::ZERO],
+                looked: Default::default(),
+            });
+        }
+        *known = Rejections::default();
+        known.patching = args.patch.is_some();
+        (sel.entries, sel.on_demand, sel.local_crates, None)
+    } else {
         let mut functions = Vec::new();
-        let mut has_main = false;
-        for krate in std::iter::once(first).chain(&args.batch) {
-            for krate in crates_named(db, krate)? {
+        // The `main` of the crate asked for: another program of the workspace among the crates
+        // is only here for what this one uses of it.
+        let mut main = None;
+        let mut local = Vec::new();
+        for (at, krate) in std::iter::once(&args.krate).chain(&args.batch).enumerate() {
+            let mut named = crates_named(db, krate, args)?;
+            // Of the crates of the name, the ones rustc built into this program, when it built any.
+            let linked = |krate: &Crate| {
+                let name = krate.display_name(db);
+                let root = crate_root_file(db, *krate);
+                name.zip(root)
+                    .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+            };
+            if named.iter().any(linked) {
+                named.retain(linked);
+            }
+            for krate in named {
                 local.push(krate);
                 let listed = listed.of(db, krate);
-                has_main |= listed.has_main;
+                if at == 0 {
+                    main = main.or(listed.main);
+                }
                 functions
-                    .extend(listed.functions.iter().copied().zip(listed.starts.iter().copied()));
+                    .extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
             }
         }
-        let (e, o): (Vec<_>, Vec<_>) =
-            functions.into_iter().partition(|&(_, starts)| starts || !has_main);
+        // With a program to start from, only what it reaches is compiled, and what a runtime
+        // looks up by name. Without one any function may be the one called.
+        let (entries, on_demand): (Vec<_>, Vec<_>) = functions
+            .into_iter()
+            .partition(|&(func, exported)| exported || main.is_none() || main == Some(func));
         let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
-        (unzip(e), unzip(o))
-    } else {
-        let mut e = Vec::new();
-        let mut o = Vec::new();
-        let mut seen_crates = FxHashSet::default();
-        let mut candidate_crates = Vec::new();
-        for &file in dirty_files {
-            for &krate in ide_db::base_db::relevant_crates(db, file) {
-                let c = Crate::from(krate);
-                let is_bench_or_example = resolver.crate_root(c).is_some_and(|p| {
-                    p.components().any(|comp| {
-                        matches!(comp.as_os_str().to_str(), Some("benches" | "examples"))
-                    })
-                });
-                if !is_bench_or_example && seen_crates.insert(krate) {
-                    candidate_crates.push(c);
-                }
-            }
-        }
-        let mut impacted_tests = Vec::new();
-        let mut impacted_explains = Vec::new();
-        if !dirty_files.is_empty()
-            && let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
-            && let Ok(bin_crates) = crates_named(db, &bc)
-        {
-            let mut bin_deps = FxHashSet::default();
-            for &bc_krate in &bin_crates {
-                let raw: ide_db::base_db::Crate = bc_krate.into();
-                bin_deps.extend(raw.transitive_deps(db));
-            }
-            let base_candidates = candidate_crates.clone();
-            for base_c in base_candidates {
-                let raw_base: ide_db::base_db::Crate = base_c.into();
-                for rev in raw_base.transitive_rev_deps(db) {
-                    if bin_deps.contains(&rev)
-                        && Crate::from(rev).origin(db).is_local()
-                        && seen_crates.insert(rev)
-                    {
-                        candidate_crates.push(Crate::from(rev));
-                    }
-                }
-            }
-            for bc_krate in bin_crates {
-                if seen_crates.insert(bc_krate.into()) {
-                    let l = listed.of(db, bc_krate);
-                    if args.cfg_test || l.functions.len() <= 500 {
-                        candidate_crates.push(bc_krate);
-                    }
-                }
-            }
-        }
-        let mut global_need_callers = FxHashSet::default();
-        let mut global_vtable_adts = changed_adts.clone();
-        let mut global_test_adts = changed_adts.clone();
-        let mut global_test_trait_callees: FxHashMap<(FunctionId, hir_def::AdtId), String> =
-            FxHashMap::default();
-        let mut global_dispatch_keys: FxHashMap<String, String> = FxHashMap::default();
-        let mut global_impacted_fns = FxHashSet::default();
-        let mut explain_reasons: FxHashMap<FunctionId, String> = FxHashMap::default();
-        let mut adt_reasons: FxHashMap<hir_def::AdtId, String> = FxHashMap::default();
-        hir::attach_db(db, || {
-            for &adt_id in changed_adts {
-                let adt_name = hir::Adt::from(adt_id)
-                    .name(db)
-                    .display(db, syntax::Edition::CURRENT)
-                    .to_string();
-                adt_reasons.insert(adt_id, format!("type `{adt_name}` was modified"));
-            }
-        });
-        for c in candidate_crates {
-            local.push(c);
-            let l = listed.of(db, c);
-            let warm_deps = |db: &RootDatabase, funcs: &[FunctionId]| {
-                let threads =
-                    std::thread::available_parallelism().map_or(1, |it| it.get());
-                std::thread::scope(|scope| {
-                    for part in 0..threads.min(funcs.len()) {
-                        let db = db.clone();
-                        scope.spawn(move || {
-                            hir::attach_db(&db, || {
-                                for &func in funcs.iter().skip(part).step_by(threads) {
-                                    let _ =
-                                        hir_ty::mir::codegen::function_deps(&db, func);
-                                }
-                            });
-                        });
-                    }
-                });
-            };
-            let mut warmed = false;
-            if !global_vtable_adts.is_empty() || !global_need_callers.is_empty() {
-                warm_deps(db, &l.functions);
-                warmed = true;
-            }
-            let mut direct_changed = FxHashSet::default();
-            let mut need_callers = global_need_callers.clone();
-            let mut vtable_adts = global_vtable_adts.clone();
-            let mut test_adts = global_test_adts.clone();
-            hir::attach_db(db, || {
-                for &func in &l.functions {
-                    let f = func
-                        .lookup(db)
-                        .id
-                        .file_id
-                        .original_file_respecting_includes(db)
-                        .file_id(db);
-                    let in_dirty_changed = dirty_files.contains(&f)
-                        && initial_serials.get(&func).is_none_or(|&orig_s| {
-                            hir_ty::mir::codegen::function_tree_serial(db, func) != orig_s
-                        });
-                    let touches_changed_const = !changed_const_names.is_empty()
-                        && {
-                            let idents =
-                                hir_ty::mir::codegen::function_path_idents(db, func);
-                            changed_const_names.iter().any(|n| idents.contains(n))
-                        };
-                    let touches_changed_adt =
-                        hir_ty::mir::codegen::function_mentions_adts(db, func, &vtable_adts);
-                    if in_dirty_changed || touches_changed_const || touches_changed_adt {
-                        direct_changed.insert(func);
-                        let h_fn = hir::Function::from(func);
-                        let fn_label = resolver.path(func).unwrap_or_else(|| {
-                            h_fn.name(db).display(db, syntax::Edition::CURRENT).to_string()
-                        });
-                        if in_dirty_changed {
-                            let src_p = resolver.source_path(f).unwrap_or_default();
-                            explain_reasons
-                                .insert(func, format!("`{fn_label}` (edited in {src_p})"));
-                        } else if touches_changed_adt {
-                            let deps = hir_ty::mir::codegen::function_deps(db, func);
-                            let why = deps
-                                .adts
-                                .iter()
-                                .find_map(|a| adt_reasons.get(a))
-                                .cloned()
-                                .unwrap_or_else(|| "modified type".to_owned());
-                            explain_reasons.insert(func, format!("`{fn_label}` <- {why}"));
-                        } else {
-                            explain_reasons.insert(
-                                func,
-                                format!("`{fn_label}` <- uses modified const/static"),
-                            );
-                        }
-                        if let Some(assoc) = h_fn.as_assoc_item(db)
-                            && let AssocItemContainer::Impl(imp) = assoc.container(db)
-                        {
-                            let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
-                            if let Some(trait_) = imp.trait_(db) {
-                                let trait_id = hir_def::TraitId::from(trait_);
-                                let trait_name = trait_
-                                    .name(db)
-                                    .display(db, syntax::Edition::CURRENT)
-                                    .to_string();
-                                let is_local_trait =
-                                    trait_.module(db).krate(db).origin(db).is_local();
-                                if !is_local_trait
-                                    && in_dirty_changed
-                                    && let Some(adt_id) = impl_adt
-                                {
-                                    test_adts.insert(adt_id);
-                                    let adt_name = hir::Adt::from(adt_id)
-                                        .name(db)
-                                        .display(db, syntax::Edition::CURRENT)
-                                        .to_string();
-                                    adt_reasons.entry(adt_id).or_insert_with(|| {
-                                        format!("type `{adt_name}` <- `{fn_label}` edited")
-                                    });
-                                }
-                                let mut trait_impl_count = 0usize;
-                                if is_local_trait {
-                                    hir_ty::method_resolution::TraitImpls::for_crate(db, c.into())
-                                        .for_trait(trait_id, |impls| {
-                                            trait_impl_count +=
-                                                impls.either(|s| s.len(), |s| s.len());
-                                        });
-                                }
-                                let fn_name = h_fn.name(db);
-                                for &(ref t_name, item) in
-                                    trait_id.trait_items(db).items.iter()
-                                {
-                                    if let AssocItemId::FunctionId(fid) = item
-                                        && t_name.as_str() == fn_name.as_str()
-                                    {
-                                        if let Some(adt_id) = impl_adt {
-                                            global_test_trait_callees
-                                                .entry((fid, adt_id))
-                                                .or_insert_with(|| {
-                                                    format!("`{fn_label}` (edited)")
-                                                });
-                                        }
-                                        if is_local_trait && trait_impl_count <= 16 {
-                                            global_impacted_fns.insert(fid);
-                                            explain_reasons.entry(fid).or_insert_with(|| {
-                                                format!(
-                                                    "`{trait_name}::{}` <- `{fn_label}` edited",
-                                                    fn_name.as_str()
-                                                )
-                                            });
-                                        }
-                                    }
-                                }
-                                for sib_item in imp.items(db) {
-                                    if let hir::AssocItem::Function(sib_fn) = sib_item
-                                        && let Ok(sib_fid) = FunctionId::try_from(sib_fn)
-                                    {
-                                        let sib_deps =
-                                            hir_ty::mir::codegen::function_deps(db, sib_fid);
-                                        if sib_deps.string_lits.len() == 1 {
-                                            let key = &sib_deps.string_lits[0];
-                                            if key.contains("::") {
-                                                global_dispatch_keys
-                                                    .entry(key.clone())
-                                                    .or_insert_with(|| {
-                                                        format!(
-                                                            "dispatch key `\"{key}\"` <- `{fn_label}` edited"
-                                                        )
-                                                    });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if initial_serials.contains_key(&func)
-                                && (resolver.function(func).is_none()
-                                    || hir_def::signatures::FunctionSignature::of(db, func)
-                                        .is_async()
-                                    || hir_def::attrs::AttrFlags::query(db, func.into())
-                                        .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE))
-                            {
-                                need_callers.insert(func);
-                                if let Some(adt_id) = impl_adt {
-                                    vtable_adts.insert(adt_id);
-                                }
-                            }
-                        } else if initial_serials.contains_key(&func)
-                            && (resolver.function(func).is_none()
-                                || hir_def::signatures::FunctionSignature::of(db, func).is_async()
-                                || hir_def::attrs::AttrFlags::query(db, func.into())
-                                    .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE))
-                        {
-                            need_callers.insert(func);
-                        }
-                    }
-                }
-            });
-            if !need_callers.is_empty() || vtable_adts.len() > changed_adts.len() {
-                if !warmed {
-                    warm_deps(db, &l.functions);
-                    warmed = true;
-                }
-                hir::attach_db(db, || {
-                    loop {
-                        let mut newly_added = Vec::new();
-                        for &func in &l.functions {
-                            if !direct_changed.contains(&func)
-                                && (hir_ty::mir::codegen::function_calls_any(
-                                    db,
-                                    func,
-                                    &need_callers,
-                                ) || hir_ty::mir::codegen::function_mentions_adts(
-                                    db,
-                                    func,
-                                    &vtable_adts,
-                                ))
-                            {
-                                newly_added.push(func);
-                            }
-                        }
-                        if newly_added.is_empty() {
-                            break;
-                        }
-                        for f in newly_added {
-                            direct_changed.insert(f);
-                            if resolver.function(f).is_none()
-                                || hir_def::signatures::FunctionSignature::of(db, f).is_async()
-                                || hir_def::attrs::AttrFlags::query(db, f.into())
-                                    .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE)
-                            {
-                                need_callers.insert(f);
-                            }
-                        }
-                    }
-                });
-            }
-            global_need_callers.extend(need_callers);
-            global_vtable_adts.extend(&vtable_adts);
-            global_test_adts.extend(&test_adts);
-            global_impacted_fns.extend(&direct_changed);
-            if args.cfg_test
-                && (!global_impacted_fns.is_empty()
-                    || !global_test_adts.is_empty()
-                    || !global_test_trait_callees.is_empty())
-            {
-                if !warmed {
-                    warm_deps(db, &l.functions);
-                }
-                let mut test_reach = global_impacted_fns.clone();
-                hir::attach_db(db, || {
-                    loop {
-                        let mut added = Vec::new();
-                        for &func in &l.functions {
-                            if test_reach.contains(&func) {
-                                continue;
-                            }
-                            let deps = hir_ty::mir::codegen::function_deps(db, func);
-                            for (arm_callee, arm_key) in &deps.match_dispatch_arms {
-                                if test_reach.contains(arm_callee) && arm_key.contains("::") {
-                                    let prev = explain_reasons
-                                        .get(arm_callee)
-                                        .cloned()
-                                        .unwrap_or_else(|| "modified fn".to_owned());
-                                    global_dispatch_keys
-                                        .entry(arm_key.clone())
-                                        .or_insert_with(|| {
-                                            format!("dispatch key `\"{arm_key}\"` <- {prev}")
-                                        });
-                                }
-                            }
-                            if deps.local_callee_count > 64
-                                && !hir_def::attrs::AttrFlags::query(db, func.into())
-                                    .contains(hir_def::attrs::AttrFlags::IS_TEST)
-                            {
-                                continue;
-                            }
-                            if let Some(&callee) =
-                                deps.callees.iter().find(|c| test_reach.contains(c))
-                            {
-                                let fn_label =
-                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
-                                let prev = explain_reasons
-                                    .get(&callee)
-                                    .cloned()
-                                    .unwrap_or_else(|| "modified fn".to_owned());
-                                explain_reasons
-                                    .insert(func, format!("`{fn_label}` <- calls {prev}"));
-                                added.push(func);
-                            } else if let Some(prev) = deps
-                                .trait_callees
-                                .iter()
-                                .find_map(|pair| global_test_trait_callees.get(pair))
-                            {
-                                let fn_label =
-                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
-                                explain_reasons
-                                    .insert(func, format!("`{fn_label}` <- calls {prev}"));
-                                added.push(func);
-                            } else if let Some(&adt_id) =
-                                deps.adts.iter().find(|a| global_test_adts.contains(a))
-                            {
-                                let fn_label =
-                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
-                                let prev = adt_reasons
-                                    .get(&adt_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| "modified type".to_owned());
-                                explain_reasons
-                                    .insert(func, format!("`{fn_label}` <- uses {prev}"));
-                                added.push(func);
-                            } else if !global_dispatch_keys.is_empty()
-                                && deps.string_lits.len() <= 12
-                                && let Some(prev) = deps.string_lits.iter().find_map(|lit| {
-                                    global_dispatch_keys.iter().find_map(|(key, why)| {
-                                        let is_id = |b: u8| {
-                                            b.is_ascii_alphanumeric() || b == b'_' || b == b':'
-                                        };
-                                        let mut start = 0;
-                                        while let Some(pos) = lit[start..].find(key.as_str()) {
-                                            let abs = start + pos;
-                                            let end = abs + key.len();
-                                            let before_ok =
-                                                abs == 0 || !is_id(lit.as_bytes()[abs - 1]);
-                                            let after_ok =
-                                                end == lit.len() || !is_id(lit.as_bytes()[end]);
-                                            if before_ok && after_ok {
-                                                return Some(why.clone());
-                                            }
-                                            start = abs + 1;
-                                        }
-                                        None
-                                    })
-                                })
-                            {
-                                let fn_label =
-                                    resolver.path(func).unwrap_or_else(|| "fn".to_owned());
-                                explain_reasons
-                                    .insert(func, format!("`{fn_label}` <- mentions {prev}"));
-                                added.push(func);
-                            }
-                        }
-                        if added.is_empty() {
-                            break;
-                        }
-                        for &f in &added {
-                            let h_fn = hir::Function::from(f);
-                            let fn_why = explain_reasons
-                                .get(&f)
-                                .cloned()
-                                .unwrap_or_else(|| "reached fn".to_owned());
-                            if let Some(assoc) = h_fn.as_assoc_item(db)
-                                && let AssocItemContainer::Impl(imp) = assoc.container(db)
-                                && let Some(trait_) = imp.trait_(db)
-                            {
-                                let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
-                                let trait_id = hir_def::TraitId::from(trait_);
-                                let is_local_trait =
-                                    trait_.module(db).krate(db).origin(db).is_local();
-                                let mut trait_impl_count = 0usize;
-                                if is_local_trait {
-                                    hir_ty::method_resolution::TraitImpls::for_crate(db, c.into())
-                                        .for_trait(trait_id, |impls| {
-                                            trait_impl_count +=
-                                                impls.either(|s| s.len(), |s| s.len());
-                                        });
-                                }
-                                let fn_name = h_fn.name(db);
-                                for &(ref t_name, item) in
-                                    trait_id.trait_items(db).items.iter()
-                                {
-                                    if let AssocItemId::FunctionId(fid) = item
-                                        && t_name.as_str() == fn_name.as_str()
-                                    {
-                                        if let Some(adt_id) = impl_adt {
-                                            global_test_trait_callees
-                                                .entry((fid, adt_id))
-                                                .or_insert_with(|| fn_why.clone());
-                                        }
-                                        if is_local_trait
-                                            && trait_impl_count <= 16
-                                            && test_reach.insert(fid)
-                                        {
-                                            explain_reasons.insert(fid, fn_why.clone());
-                                        }
-                                    }
-                                }
-                                for sib_item in imp.items(db) {
-                                    if let hir::AssocItem::Function(sib_fn) = sib_item
-                                        && let Ok(sib_fid) = FunctionId::try_from(sib_fn)
-                                    {
-                                        let sib_deps =
-                                            hir_ty::mir::codegen::function_deps(db, sib_fid);
-                                        if sib_deps.string_lits.len() == 1 {
-                                            let key = &sib_deps.string_lits[0];
-                                            if key.contains("::") {
-                                                global_dispatch_keys
-                                                    .entry(key.clone())
-                                                    .or_insert_with(|| {
-                                                        format!(
-                                                            "dispatch key `\"{key}\"` <- {fn_why}"
-                                                        )
-                                                    });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        test_reach.extend(added);
-                    }
-                    let bin_crate_norm = std::env::var("RUSTD_BIN_CRATE")
-                        .unwrap_or_default()
-                        .replace('-', "_");
-                    for &func in &l.functions {
-                        let flags = hir_def::attrs::AttrFlags::query(db, func.into());
-                        if test_reach.contains(&func)
-                            && flags.contains(hir_def::attrs::AttrFlags::IS_TEST)
-                            && !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE)
-                            && let Some(path) = resolver.path(func)
-                        {
-                            if table.get(&path).is_none() {
-                                direct_changed.insert(func);
-                            }
-                            let (target_krate, rel) =
-                                path.split_once("::").unwrap_or(("", path.as_str()));
-                            let entry = if !target_krate.is_empty()
-                                && !bin_crate_norm.is_empty()
-                                && target_krate != bin_crate_norm
-                            {
-                                format!("@target={target_krate}\t{rel}")
-                            } else {
-                                rel.to_owned()
-                            };
-                            if !impacted_tests.contains(&entry) {
-                                let why = explain_reasons
-                                    .get(&func)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("`{rel}` edited"));
-                                impacted_explains.push(format!("{rel}\t{why}"));
-                                impacted_tests.push(entry);
-                            }
-                        }
-                    }
-                });
-                global_impacted_fns.extend(test_reach);
-            }
-            for &func in &l.functions {
-                if direct_changed.contains(&func) && resolver.function(func).is_some() {
-                    e.push(func);
-                } else if resolver.path(func).is_none() {
-                    o.push(func);
-                }
-            }
-        }
-        let tests_txt = args.out.with_extension("tests.txt");
-        let _ = std::fs::write(&tests_txt, impacted_tests.join("\n"));
-        let explain_txt = args.out.with_extension("explain.txt");
-        let _ = std::fs::write(&explain_txt, impacted_explains.join("\n"));
-        (e, o)
+        let (entries, on_demand) = (unzip(entries), unzip(on_demand));
+        (entries, on_demand, local, main)
     };
     let list = start.elapsed();
-    let roots = Roots { entries: &entries, on_demand: &on_demand };
+    // The program's `main` is called by one rustc wrote, when rustc built the crate.
+    let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
+    let roots = Roots {
+        entries: &entries,
+        on_demand: &on_demand,
+        start: main.filter(|it| own(it).is_some()),
+    };
     let setup = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
         eprintln!("entries: {:.1?}", setup - list);
@@ -1564,19 +1654,9 @@ fn build(
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
-    let mut on_demand_rejections = Rejections::default();
-    on_demand_rejections.patching = true;
-    let active_known = if args.krate.is_some() { &mut *known } else { &mut on_demand_rejections };
-    let unit = hir::attach_db(db, || {
-        CodegenUnit::compile(hir_db, &resolver, roots, &denied, active_known)
-    })
-    .map_err(anyhow::Error::msg)?;
-    if args.krate.is_none() {
-        known.stats = on_demand_rejections.stats;
-        if !is_cold {
-            known.stats.patched = Some(unit.compiled.len());
-        }
-    }
+    let mut unit =
+        hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
+            .map_err(anyhow::Error::msg)?;
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
@@ -1587,26 +1667,22 @@ fn build(
         );
     }
     let start = Instant::now();
-    if args.krate.is_none() && !is_cold {
-        if let (Some(path), Some(object)) = (&args.patch, &unit.object) {
-            let tmp = path.with_extension("o.tmp");
-            std::fs::write(&tmp, object)?;
-            std::fs::rename(&tmp, path)?;
+    if incremental_only && args.patch.is_some() {
+        if !args.out.exists() {
+            let empty = hir_ty::mir::codegen::empty_object().map_err(anyhow::Error::msg)?;
+            replace(&args.out, &empty)?;
         }
-    } else {
-        if let Some(object) = &unit.object {
-            std::fs::write(&args.out, object)?;
-            if let Some(patch_path) = &args.patch
-                && !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32"))
-            {
-                inject_hotpatch_rt(&args.out, patch_path, &args.root()?)?;
-            }
-        }
-        if let (Some(path), Some(patch)) = (&args.patch, unit.patch.as_ref().or(unit.object.as_ref())) {
-            let tmp = path.with_extension("o.tmp");
-            std::fs::write(&tmp, patch)?;
-            std::fs::rename(&tmp, path)?;
-        }
+        unit.patch = unit.object.take();
+        known.stats.patched = Some(unit.compiled.len());
+    }
+    if let Some(object) = &mut unit.object {
+        // A patch defines again what the object does, and the linker of Mach-O takes two
+        // definitions of a name only when one of them gives way.
+        weaken::definitions(object);
+        replace(&args.out, object)?;
+    }
+    if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
+        replace(path, patch)?;
     }
     let build = Build {
         compiled: unit.compiled.len(),
@@ -1626,7 +1702,7 @@ fn build(
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
             let single = hir::attach_db(db, || {
-                let roots = Roots { entries: &[func], on_demand: &[] };
+                let roots = Roots { entries: &[func], on_demand: &[], start: None };
                 CodegenUnit::compile(hir_db, &resolver, roots, &Default::default(), known)
             })
             .map_err(anyhow::Error::msg)?;
@@ -1697,32 +1773,274 @@ fn report(build: &Build) {
     }
 }
 
-fn link(args: &Args) -> anyhow::Result<()> {
-    let Some(cmd) = &args.link_cmd else { return Ok(()) };
+/// The executables that edits are spliced into, by where each is. One program has as many as
+/// there are checkouts read as its own, and a link may run after the build that asked for it.
+static LINKED: std::sync::LazyLock<std::sync::Mutex<FxHashMap<PathBuf, Executable>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Brings an executable up to date with its objects. An edit that left the whole object alone
+/// is spliced into the executable at `splice`, which `--binary` names, when that is known from
+/// its last link; anything else, and whatever the splice declines, runs the link command, whose
+/// result is then known. `RUSTD_SPLICE=0` has every edit linked in full.
+fn link(
+    cmd: Option<&str>,
+    splice: Option<&Path>,
+    patch: Option<&Path>,
+    object: &Path,
+    patched: bool,
+) -> anyhow::Result<()> {
+    static SPLICING: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("RUSTD_SPLICE").is_none_or(|it| it != "0"));
+    let splice = splice.filter(|_| *SPLICING);
+    // An executable linked with the object as it was is not one to add to, also when the
+    // object was written for a request that does not link.
+    let rewritten = match splice {
+        Some(binary) if !patched => LINKED.lock().unwrap().remove(binary).is_some(),
+        _ => false,
+    };
+    let Some(cmd) = cmd else { return Ok(()) };
     let start = Instant::now();
-    let status = Command::new("sh").arg("-c").arg(cmd).status()?;
-    eprintln!("link: {:.1?} ({status})", start.elapsed());
+    let mut declined = String::new();
+    let running = splice.map_or(Ok(false), set_aside)?;
+    if let (Some(binary), Some(patch)) = (splice, patch) {
+        let known = LINKED.lock().unwrap().remove(binary).map(Executable::baseline);
+        let spliced = match known {
+            _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
+            _ if running => Err(anyhow::anyhow!("the executable is running")),
+            Some(Ok(mut baseline)) if baseline.is_of(binary) => {
+                let spliced = std::fs::read(patch)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|patch| baseline.splice(&patch));
+                spliced.map(|spliced| (baseline, spliced))
+            }
+            Some(Ok(_)) => Err(anyhow::anyhow!("another executable is asked for")),
+            Some(Err(why)) => Err(why),
+            None => Err(anyhow::anyhow!("no executable to add to")),
+        };
+        match spliced {
+            Ok((baseline, Spliced { redirected, appended })) => {
+                let read = Executable::Read(Box::new(baseline));
+                LINKED.lock().unwrap().insert(binary.to_owned(), read);
+                eprintln!(
+                    "link: {:.1?} (spliced: {redirected} functions redirected, {appended} bytes)",
+                    start.elapsed()
+                );
+                return Ok(());
+            }
+            Err(why) => declined = format!("; not spliced: {why:#}"),
+        }
+    }
+    let status = shell(cmd).status()?;
+    eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
     anyhow::ensure!(status.success(), "the link failed ({status})");
+    if let (Some(binary), Some(patch)) = (splice, patch) {
+        let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
+        LINKED.lock().unwrap().insert(binary.to_owned(), linked);
+    }
     Ok(())
+}
+
+/// Whether the executable at `binary` runs, in which case Windows lets nothing write it, and
+/// it is moved aside: it runs on there, and the link writes a new one. It is deleted once it
+/// has exited, by the first link to come after.
+#[cfg(windows)]
+fn set_aside(binary: &Path) -> anyhow::Result<bool> {
+    const SHARING_VIOLATION: i32 = 32;
+    let name = binary.file_name().context("an executable without a name")?.to_owned();
+    let siblings = binary.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
+    for sibling in siblings {
+        let sibling = sibling?;
+        let is_aside = sibling.path().extension() == Some("running".as_ref())
+            && sibling.file_name().as_encoded_bytes().starts_with(name.as_encoded_bytes());
+        if is_aside {
+            // The one that still runs stays.
+            let _ = std::fs::remove_file(sibling.path());
+        }
+    }
+    match std::fs::OpenOptions::new().write(true).open(binary) {
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {}
+        _ => return Ok(false),
+    }
+    static ASIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let aside = ASIDE.fetch_add(1, Ordering::Relaxed);
+    let mut moved = binary.as_os_str().to_owned();
+    moved.push(format!(".{}-{aside}.running", std::process::id()));
+    std::fs::rename(binary, &moved).context("moving the running executable aside")?;
+    Ok(true)
+}
+
+/// Whether the executable at `binary` runs, which is nothing to a link on Unix: the linker
+/// writes a new file in its place.
+#[cfg(unix)]
+fn set_aside(_: &Path) -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+/// The command that runs the line `cmd` as the platform's shell would.
+#[cfg(unix)]
+fn shell(cmd: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(cmd);
+    shell
+}
+
+/// The command that runs the line `cmd`. It is the command line of the process as it is:
+/// `cmd.exe` takes no line as long as the one a link has.
+#[cfg(windows)]
+fn shell(cmd: &str) -> Command {
+    use std::os::windows::process::CommandExt as _;
+    let cmd = cmd.trim_start();
+    let (program, rest) = match cmd.strip_prefix('"').and_then(|it| it.split_once('"')) {
+        Some(quoted) => quoted,
+        None => cmd.split_once(char::is_whitespace).unwrap_or((cmd, "")),
+    };
+    let mut command = Command::new(program);
+    command.raw_arg(rest);
+    command
+}
+
+/// The executable of the last full link, for splicing edits into.
+enum Executable {
+    /// Just linked, and being read.
+    Linked(Linked),
+    Read(Box<Baseline>),
+}
+
+impl Executable {
+    fn baseline(self) -> anyhow::Result<Baseline> {
+        match self {
+            Executable::Linked(linked) => linked.baseline(),
+            Executable::Read(baseline) => Ok(*baseline),
+        }
+    }
+}
+
+/// The directories of the checkout at `base` that builds write to. They are not part of the
+/// checkout: another checkout read in its place has the same ones.
+fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
+    let crates = ide_db::base_db::all_crates(db);
+    let scripts = crates.iter().filter_map(|krate| {
+        let out = krate.env(db).get("OUT_DIR")?;
+        let below = Path::new(&out).strip_prefix(base).ok()?.components().next()?;
+        Some(base.join(below))
+    });
+    // Cargo tags the directories it builds in.
+    let tagged = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .filter_map(|it| Some(it.ok()?.path()))
+        .filter(|it| it.join("CACHEDIR.TAG").exists());
+    let mut built: Vec<PathBuf> = scripts.chain(tagged).collect();
+    built.sort_unstable();
+    built.dedup();
+    built
+}
+
+/// The checkout a crate was loaded in, and the one its variables name now.
+type Placed = FxHashMap<ide_db::base_db::Crate, (PathBuf, PathBuf)>;
+
+/// Has the crates of the checkout at `base` that ask `env!` for a place in it be told the
+/// place in `over`: `CARGO_MANIFEST_DIR` is where the checkout read is. The result is the
+/// crates told another place than before.
+fn place(
+    db: &mut RootDatabase,
+    base: &Path,
+    over: &Path,
+    placed: &mut Placed,
+) -> Vec<ide_db::base_db::Crate> {
+    let built = built_in(db, base);
+    let mut asking: FxHashMap<_, Vec<String>> = FxHashMap::default();
+    for (krate, key) in db.env_read() {
+        asking.entry(krate).or_default().push(key);
+    }
+    let mut moved = Vec::new();
+    for (krate, keys) in asking {
+        let env = krate.env(db);
+        let Some(manifest) = env.get("CARGO_MANIFEST_DIR") else { continue };
+        let manifest = Path::new(&manifest);
+        // A checkout that joins has the crates there are loaded again, as they first were.
+        let from = match placed.get(&krate) {
+            Some((of, from)) if of == base && manifest.starts_with(from) => from.clone(),
+            Some((of, _)) if of != base => continue,
+            _ if manifest.starts_with(base) => base.to_owned(),
+            _ => continue,
+        };
+        if from == over {
+            continue;
+        }
+        let moved_to = |value: &str| {
+            let path = Path::new(value);
+            let inside = path.strip_prefix(&from).ok()?;
+            if built.iter().any(|it| path.starts_with(it)) {
+                return None;
+            }
+            Some(if inside.as_os_str().is_empty() { over.to_owned() } else { over.join(inside) })
+        };
+        if !keys.iter().any(|key| env.get(key).is_some_and(|it| moved_to(&it).is_some())) {
+            continue;
+        }
+        let mut new = env.clone();
+        for (key, value) in env {
+            if let Some(path) = moved_to(value) {
+                new.set(key, path.to_string_lossy());
+            }
+        }
+        db.set_env(krate, new);
+        placed.insert(krate, (base.to_owned(), over.to_owned()));
+        moved.push(krate);
+    }
+    if !moved.is_empty() {
+        eprintln!("placed: {} crates in {}", moved.len(), over.display());
+    }
+    moved
+}
+
+/// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
+/// it open or under another name: the object of a program can be that of another one too.
+fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut new = path.as_os_str().to_owned();
+    new.push(format!(".{}.new", std::process::id()));
+    std::fs::write(&new, bytes)?;
+    std::fs::rename(&new, path)
+}
+
+/// The source files the daemon watches.
+struct Sources {
+    paths: FxHashMap<vfs::FileId, PathBuf>,
+    /// The manifests that have changed since the daemon loaded them, as they were then.
+    manifests: FxHashMap<vfs::FileId, String>,
 }
 
 /// Why the source as it is can't be built by the daemon, when it can't.
 fn refusal(
     db: &RootDatabase,
     sources: &[vfs::FileId],
-    paths: &FxHashMap<vfs::FileId, PathBuf>,
+    watched: &Sources,
     out_of_date: Option<(FunctionId, String)>,
 ) -> Option<String> {
+    let Sources { paths, manifests } = watched;
     for &file in sources {
+        let path = paths.get(&file);
+        if path.is_some_and(|it| it.file_name().is_some_and(|it| it == "Cargo.toml")) {
+            // FIXME: load the checkout again in place of turning it down.
+            if manifests.get(&file).is_some_and(|it| **it != **db.file_text(file).text(db)) {
+                let path = path.map(|it| it.display().to_string()).unwrap_or_default();
+                return Some(format!("{path} is not what the daemon loaded, start it again"));
+            }
+            continue;
+        }
         let edition = ide_db::base_db::relevant_crates(db, file)
             .first()
             .map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
         let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
         if let Some(error) = parse.errors().first() {
-            let path = paths.get(&file).map(|it| it.display().to_string()).unwrap_or_default();
-            let line = db.file_text(file).text(db)[..usize::from(error.range().start())]
-                .matches('\n')
-                .count();
+            let text = db.file_text(file).text(db);
+            // A file that is included where an expression goes is not one of items.
+            if syntax::ast::Expr::parse(text, edition).errors().is_empty() {
+                continue;
+            }
+            let path = path.map(|it| it.display().to_string()).unwrap_or_default();
+            let line = text[..usize::from(error.range().start())].matches('\n').count();
             return Some(format!("{path}:{}: {error}", line + 1));
         }
     }
@@ -1738,937 +2056,69 @@ fn refusal(
     ))
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct AdtSnapshot {
-    id: hir_def::AdtId,
-    size: u64,
-    align: u64,
-    fields: Vec<(String, Option<u64>)>,
-    variants: usize,
-    sig_hash: u64,
-}
-
-#[derive(Clone, Default)]
-struct FileSnapshot {
-    adts: FxHashMap<String, AdtSnapshot>,
-    consts: FxHashMap<String, (u64, Option<StaticId>)>,
-}
-
-fn snapshot_file_adts(db: &RootDatabase, file: vfs::FileId) -> FileSnapshot {
-    use std::hash::{Hash, Hasher};
-    let mut adts = FxHashMap::default();
-    let mut consts = FxHashMap::default();
-    let sema = hir::Semantics::new(db);
-    let mut modules: Vec<hir::Module> = sema.file_to_module_defs(file).collect();
-    let mut seen_mods = FxHashSet::default();
-    while let Some(module) = modules.pop() {
-        let mod_id = hir_def::ModuleId::from(module);
-        if !seen_mods.insert(mod_id) {
-            continue;
-        }
-        let scope = mod_id.def_map(db).module(db, mod_id).scope(db);
-        for decl in scope.declarations() {
-            match decl {
-                ModuleDefId::ModuleId(child) => {
-                    let child_mod = hir::Module::from(child);
-                    if child_mod
-                        .definition_source_file_id(db)
-                        .original_file_respecting_includes(db)
-                        .file_id(db)
-                        == file
-                    {
-                        modules.push(child_mod);
-                    }
-                }
-                ModuleDefId::ConstId(c) => {
-                    if let Some(name) = hir::Const::from(c)
-                        .name(db)
-                        .map(|n| n.display(db, syntax::Edition::CURRENT).to_string())
-                    {
-                        let def: DefWithBodyId = c.into();
-                        let mut hasher = rustc_hash::FxHasher::default();
-                        Body::of(db, def)
-                            .pretty_print(db, def, syntax::Edition::CURRENT)
-                            .hash(&mut hasher);
-                        consts.insert(name, (hasher.finish(), None));
-                    }
-                }
-                ModuleDefId::StaticId(s) => {
-                    let name = hir::Static::from(s)
-                        .name(db)
-                        .display(db, syntax::Edition::CURRENT)
-                        .to_string();
-                    let def: DefWithBodyId = s.into();
-                    let mut hasher = rustc_hash::FxHasher::default();
-                    Body::of(db, def)
-                        .pretty_print(db, def, syntax::Edition::CURRENT)
-                        .hash(&mut hasher);
-                    consts.insert(name, (hasher.finish(), Some(s)));
-                }
-                _ => {}
-            }
-        }
-        for imp in scope.impls() {
-            for &(_, item) in imp.impl_items(db).items.iter() {
-                if let AssocItemId::ConstId(c) = item
-                    && let Some(name) = hir::Const::from(c)
-                        .name(db)
-                        .map(|n| n.display(db, syntax::Edition::CURRENT).to_string())
-                {
-                    let def: DefWithBodyId = c.into();
-                    let mut hasher = rustc_hash::FxHasher::default();
-                    Body::of(db, def)
-                        .pretty_print(db, def, syntax::Edition::CURRENT)
-                        .hash(&mut hasher);
-                    consts.insert(name, (hasher.finish(), None));
-                }
-            }
-        }
-        for decl in module.declarations(db) {
-            let ModuleDef::Adt(adt) = decl else { continue };
-            let name = adt.name(db).display(db, syntax::Edition::CURRENT).to_string();
-            let layout = adt.layout(db).ok();
-            let (fields, variants) = match adt {
-                hir::Adt::Struct(s) => (
-                    s.fields(db)
-                        .into_iter()
-                        .map(|f| {
-                            (
-                                f.name(db).display(db, syntax::Edition::CURRENT).to_string(),
-                                layout.as_ref().and_then(|l| l.field_offset(f)),
-                            )
-                        })
-                        .collect(),
-                    1,
-                ),
-                hir::Adt::Union(u) => (
-                    u.fields(db)
-                        .into_iter()
-                        .map(|f| {
-                            (
-                                f.name(db).display(db, syntax::Edition::CURRENT).to_string(),
-                                layout.as_ref().and_then(|l| l.field_offset(f)),
-                            )
-                        })
-                        .collect(),
-                    1,
-                ),
-                hir::Adt::Enum(e) => (
-                    vec![(
-                        "tag".to_owned(),
-                        layout.as_ref().and_then(|l| l.enum_tag_size().map(|s| s as u64)),
-                    )],
-                    e.variants(db).len(),
-                ),
-            };
-            let mut sig_hasher = rustc_hash::FxHasher::default();
-            if let Some(src) = adt.source(db) {
-                let syn = match &src.value {
-                    ast::Adt::Struct(s) => s.syntax(),
-                    ast::Adt::Enum(e) => e.syntax(),
-                    ast::Adt::Union(u) => u.syntax(),
-                };
-                for el in syn.descendants_with_tokens() {
-                    if let Some(tok) = el.into_token()
-                        && !tok.kind().is_trivia()
-                    {
-                        tok.text().hash(&mut sig_hasher);
-                    }
-                }
-            }
-            adts.insert(
-                name,
-                AdtSnapshot {
-                    id: hir_def::AdtId::from(adt),
-                    size: layout.as_ref().map_or(0, |l| l.size()),
-                    align: layout.as_ref().map_or(0, |l| l.align()),
-                    fields,
-                    variants,
-                    sig_hash: sig_hasher.finish(),
-                },
-            );
-        }
-    }
-    FileSnapshot { adts, consts }
-}
-
-fn detect_adt_layout_warnings(
-    db: &RootDatabase,
-    dirty_files: &FxHashSet<vfs::FileId>,
-    initial_adts: &FxHashMap<vfs::FileId, FileSnapshot>,
-) -> (Vec<String>, FxHashSet<hir_def::AdtId>, FxHashSet<String>) {
-    let mut warnings = Vec::new();
-    let mut changed_adts = FxHashSet::default();
-    let mut changed_consts = FxHashSet::default();
-    let mut edited_statics = FxHashSet::default();
-    hir::attach_db(db, || {
-        for &file in dirty_files {
-            let Some(orig_snap) = initial_adts.get(&file) else { continue };
-            let cur_snap = snapshot_file_adts(db, file);
-            for (name, orig) in &orig_snap.adts {
-                if let Some(cur) = cur_snap.adts.get(name) {
-                    let layout_changed = cur.size != orig.size
-                        || cur.align != orig.align
-                        || cur.fields != orig.fields
-                        || cur.variants != orig.variants;
-                    if layout_changed || cur.sig_hash != orig.sig_hash {
-                        changed_adts.insert(cur.id);
-                    }
-                    if layout_changed {
-                        warnings.push(format!(
-                            "layout of `{name}` changed ({}B/align {} -> {}B/align {}); \
-                             recompiling crate callers (live in-memory instances still use old layout)",
-                            orig.size, orig.align, cur.size, cur.align
-                        ));
-                    }
-                }
-            }
-            for (name, &(orig_h, _)) in &orig_snap.consts {
-                if let Some(&(cur_h, cur_stat)) = cur_snap.consts.get(name)
-                    && cur_h != orig_h
-                {
-                    changed_consts.insert(name.clone());
-                    if let Some(s) = cur_stat {
-                        edited_statics.insert(s);
-                    }
-                }
-            }
-        }
-    });
-    if let Ok(mut guard) = hir_ty::mir::codegen::EDITED_STATICS.lock() {
-        *guard = (!edited_statics.is_empty()).then_some(edited_statics);
-    }
-    (warnings, changed_adts, changed_consts)
-}
-
-fn modules_in_file(db: &RootDatabase, file: vfs::FileId) -> Vec<hir::Module> {
-    let sema = hir::Semantics::new(db);
-    let mut stack: Vec<hir::Module> = sema.file_to_module_defs(file).collect();
-    let mut seen = FxHashSet::default();
-    let mut out = Vec::new();
-    while let Some(module) = stack.pop() {
-        let mod_id = hir_def::ModuleId::from(module);
-        if !seen.insert(mod_id) {
-            continue;
-        }
-        out.push(module);
-        let scope = mod_id.def_map(db).module(db, mod_id).scope(db);
-        for decl in scope.declarations() {
-            if let ModuleDefId::ModuleId(child) = decl {
-                let child_mod = hir::Module::from(child);
-                if child_mod
-                    .definition_source_file_id(db)
-                    .original_file_respecting_includes(db)
-                    .file_id(db)
-                    == file
-                {
-                    stack.push(child_mod);
-                }
-            }
-        }
-    }
-    out
-}
-
-#[derive(Clone, Default)]
-struct CheckReport {
-    errors: usize,
-    warnings: usize,
-    rendered: String,
-    first_summary: Option<String>,
-}
-
-fn format_cargo_snippet(
-    db: &RootDatabase,
-    paths: &FxHashMap<vfs::FileId, PathBuf>,
-    root: &Path,
-    file_id: vfs::FileId,
-    range: syntax::TextRange,
-    code: Option<&'static str>,
-    message: &str,
-    label: &str,
-) -> String {
-    let full_path = paths.get(&file_id).cloned().unwrap_or_default();
-    let rel_path = full_path
-        .strip_prefix(root)
-        .unwrap_or(&full_path)
-        .display()
-        .to_string();
-    let text = db.file_text(file_id).text(db);
-    let start_off = usize::from(range.start()).min(text.len());
-    let end_off = usize::from(range.end()).min(text.len()).max(start_off);
-    let before = &text[..start_off];
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[start_off..].find('\n').map_or(text.len(), |i| start_off + i);
-    let line_no = before.bytes().filter(|&b| b == b'\n').count() + 1;
-    let raw_line = text[line_start..line_end].trim_end_matches('\r');
-    let span_start_in_line = start_off.saturating_sub(line_start).min(raw_line.len());
-    let span_end_in_line = end_off.min(line_end).saturating_sub(line_start).min(raw_line.len());
-    let mut display_line = String::with_capacity(raw_line.len() + 16);
-    let mut caret_col = 0usize;
-    let mut caret_len = 0usize;
-    for (byte_idx, ch) in raw_line.char_indices() {
-        let width = if ch == '\t' { 4 } else { 1 };
-        if byte_idx < span_start_in_line {
-            caret_col += width;
-        } else if byte_idx < span_end_in_line {
-            caret_len += width;
-        }
-        if ch == '\t' {
-            display_line.push_str("    ");
-        } else {
-            display_line.push(ch);
-        }
-    }
-    let col_no = raw_line[..span_start_in_line].chars().count() + 1;
-    let carets = "^".repeat(caret_len.max(1));
-    let pad_num = line_no.to_string();
-    let gutter_pad = " ".repeat(pad_num.len());
-    let caret_pad = " ".repeat(caret_col);
-    let header = match code {
-        Some(c) => format!("\x1b[1;31merror[{c}]\x1b[0m\x1b[1m: {message}\x1b[0m"),
-        None => format!("\x1b[1;31merror\x1b[0m\x1b[1m: {message}\x1b[0m"),
-    };
-    format!(
-        "{header}\n\
-         {gutter_pad}\x1b[1;34m-->\x1b[0m {rel_path}:{line_no}:{col_no}\n\
-         {gutter_pad} \x1b[1;34m|\x1b[0m\n\
-         \x1b[1;34m{pad_num} |\x1b[0m {display_line}\n\
-         {gutter_pad} \x1b[1;34m|\x1b[0m {caret_pad}\x1b[1;31m{carets} {label}\x1b[0m\n\n"
-    )
-}
-
-fn check_files_diagnostics(
-    db: &RootDatabase,
-    files_to_check: &[vfs::FileId],
-    layout_warnings: &[String],
-    paths: &FxHashMap<vfs::FileId, PathBuf>,
-    root: &Path,
-) -> CheckReport {
+/// Something written in one of the edited files that cargo turns the crate down for. Nothing
+/// may reach it, so the build never looks at it.
+fn broken_in(db: &RootDatabase, edited: &[vfs::FileId]) -> Option<String> {
     use hir::AnyDiagnostic as Diagnostic;
-    let mut rep = CheckReport::default();
-    let mut seen_codes = Vec::new();
-    let mut seen_diags = FxHashSet::default();
-    for w in layout_warnings {
-        rep.warnings += 1;
-        rep.rendered.push_str(&format!("\x1b[1;33mwarning\x1b[0m\x1b[1m: {w}\x1b[0m\n\n"));
-    }
-    hir::attach_db(db, || {
-        let sema = hir::Semantics::new(db);
-        for &file in files_to_check {
-            let crates = ide_db::base_db::relevant_crates(db, file);
-            let edition = crates
-                .first()
-                .map_or(syntax::Edition::CURRENT, |&krate| Crate::from(krate).edition(db));
-            let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
-            for err in parse.errors() {
-                let msg = err.to_string();
-                if seen_diags.insert((file, err.range(), msg.clone())) {
-                    rep.errors += 1;
-                    if rep.first_summary.is_none() {
-                        rep.first_summary = Some(msg.clone());
-                    }
-                    rep.rendered.push_str(&format_cargo_snippet(
-                        db,
-                        paths,
-                        root,
-                        file,
-                        err.range(),
-                        None,
-                        &msg,
-                        "syntax error",
-                    ));
-                }
-            }
-            for module in modules_in_file(db, file) {
-                let mut found = Vec::new();
-                module.diagnostics(db, &mut found, false);
-                let disp = module.krate(db).to_display_target(db);
-                for diag in &found {
-                    let info: Option<(
-                        Option<&'static str>,
-                        String,
-                        hir::FileRangeWrapper<vfs::FileId>,
-                        String,
-                        &'static str,
-                    )> = match diag {
-                        Diagnostic::TypeMismatch(d) => {
-                            let exp = d.expected.display(db, disp).to_string();
-                            let act = d.actual.display(db, disp).to_string();
-                            let r = sema.diagnostics_display_range(d.expr_or_pat.map(|it| it.into()));
-                            Some((
-                                Some("E0308"),
-                                "mismatched types".to_owned(),
-                                r,
-                                format!("expected `{exp}`, found `{act}`"),
-                                "mismatched types",
-                            ))
-                        }
-                        Diagnostic::UnresolvedIdent(d) => {
-                            let r = match d.node.value.1 {
-                                Some(sub) => sema.diagnostics_display_range_for_range(
-                                    hir::InFile::new(d.node.file_id, sub),
-                                ),
-                                None => sema.diagnostics_display_range(hir::InFile::new(
-                                    d.node.file_id,
-                                    d.node.value.0.into(),
-                                )),
-                            };
-                            let txt = db.file_text(r.file_id).text(db);
-                            let s = usize::from(r.range.start()).min(txt.len());
-                            let e = usize::from(r.range.end()).min(txt.len()).max(s);
-                            let ident = &txt[s..e];
-                            Some((
-                                Some("E0425"),
-                                format!("cannot find value `{ident}` in this scope"),
-                                r,
-                                "not found in this scope".to_owned(),
-                                "unresolved name",
-                            ))
-                        }
-                        Diagnostic::MismatchedArgCount(d) => {
-                            let r = sema.diagnostics_display_range(d.call_expr.map(|it| it.into()));
-                            Some((
-                                Some("E0061"),
-                                format!(
-                                    "this function takes {} argument(s) but {} argument(s) were supplied",
-                                    d.expected, d.found
-                                ),
-                                r,
-                                format!("expected {} argument(s), found {}", d.expected, d.found),
-                                "wrong number of arguments",
-                            ))
-                        }
-                        Diagnostic::MismatchedTupleStructPatArgCount(d) => {
-                            let r = sema.diagnostics_display_range(d.expr_or_pat.map(|it| it.into()));
-                            Some((
-                                Some("E0023"),
-                                format!(
-                                    "this pattern has {} field(s), but the corresponding tuple variant has {} field(s)",
-                                    d.found, d.expected
-                                ),
-                                r,
-                                format!("expected {} field(s), found {}", d.expected, d.found),
-                                "wrong number of arguments",
-                            ))
-                        }
-                        Diagnostic::MissingFields(d) => {
-                            let names: Vec<String> = d
-                                .missed_fields
-                                .iter()
-                                .map(|(n, _)| format!("`{}`", n.display(db, edition)))
-                                .collect();
-                            let list = names.join(", ");
-                            let r = sema.diagnostics_display_range(hir::InFile::new(
-                                d.file,
-                                d.field_list_parent.into(),
-                            ));
-                            Some((
-                                Some("E0063"),
-                                format!("missing field(s) {list} in initializer"),
-                                r,
-                                format!("missing {list}"),
-                                "missing fields",
-                            ))
-                        }
-                        Diagnostic::NoSuchField(d) => {
-                            let r = sema.diagnostics_display_range(d.field.map(|it| it.into()));
-                            Some((
-                                Some("E0560"),
-                                "struct or enum variant has no such field".to_owned(),
-                                r,
-                                "unknown field".to_owned(),
-                                "no such field",
-                            ))
-                        }
-                        Diagnostic::UnresolvedField(d) => {
-                            let recv = d.receiver.display(db, disp).to_string();
-                            let name = d.name.display(db, edition).to_string();
-                            let r = sema.diagnostics_display_range(d.expr.map(|it| it.into()));
-                            Some((
-                                Some("E0609"),
-                                format!("no field `{name}` on type `{recv}`"),
-                                r,
-                                "unknown field".to_owned(),
-                                "no such field",
-                            ))
-                        }
-                        Diagnostic::UnresolvedMethodCall(d) => {
-                            let recv = d.receiver.display(db, disp).to_string();
-                            let name = d.name.display(db, edition).to_string();
-                            let r = sema.diagnostics_display_range(d.expr.map(|it| it.into()));
-                            Some((
-                                Some("E0599"),
-                                format!("no method named `{name}` found for type `{recv}` in the current scope"),
-                                r,
-                                format!("method not found in `{recv}`"),
-                                "no such method",
-                            ))
-                        }
-                        Diagnostic::UnresolvedAssocItem(d) => {
-                            let r = sema.diagnostics_display_range(d.expr_or_pat.map(|it| it.into()));
-                            Some((
-                                Some("E0599"),
-                                "no associated item found for type in the current scope".to_owned(),
-                                r,
-                                "associated item not found".to_owned(),
-                                "no such method",
-                            ))
-                        }
-                        Diagnostic::MissingMatchArms(d) => {
-                            let r = sema.diagnostics_display_range(d.scrutinee_expr.map(|it| it.into()));
-                            Some((
-                                Some("E0004"),
-                                format!("non-exhaustive patterns: {} not covered", d.uncovered_patterns),
-                                r,
-                                format!("pattern {} not covered", d.uncovered_patterns),
-                                "patterns not covered",
-                            ))
-                        }
-                        Diagnostic::NonExhaustiveLet(d) => {
-                            let r = sema.diagnostics_display_range(d.pat.map(|it| it.into()));
-                            Some((
-                                Some("E0005"),
-                                format!("refutable pattern in local binding: {} not covered", d.uncovered_patterns),
-                                r,
-                                format!("pattern {} not covered", d.uncovered_patterns),
-                                "patterns not covered",
-                            ))
-                        }
-                        Diagnostic::TraitImplMissingAssocItems(d) => {
-                            let names: Vec<String> = d
-                                .missing
-                                .iter()
-                                .map(|(n, _)| format!("`{}`", n.display(db, edition)))
-                                .collect();
-                            let list = names.join(", ");
-                            let r = sema.diagnostics_display_range(hir::InFile::new(
-                                d.file_id,
-                                d.impl_.into(),
-                            ));
-                            Some((
-                                Some("E0046"),
-                                format!("not all trait items implemented, missing: {list}"),
-                                r,
-                                format!("missing {list} in implementation"),
-                                "an impl does not match its trait",
-                            ))
-                        }
-                        Diagnostic::TraitImplRedundantAssocItems(d) => {
-                            let item_name = d.assoc_item.0.display(db, edition).to_string();
-                            let trait_name = d.trait_.name(db).display(db, edition).to_string();
-                            let r = sema.diagnostics_display_range(hir::InFile::new(
-                                d.file_id,
-                                d.impl_.into(),
-                            ));
-                            Some((
-                                Some("E0407"),
-                                format!("item `{item_name}` is not a member of trait `{trait_name}`"),
-                                r,
-                                format!("not a member of trait `{trait_name}`"),
-                                "an impl does not match its trait",
-                            ))
-                        }
-                        Diagnostic::UnresolvedModule(d) => {
-                            let r = sema.diagnostics_display_range(d.decl.map(|it| it.into()));
-                            Some((
-                                Some("E0583"),
-                                "file not found for module".to_owned(),
-                                r,
-                                "file not found for module".to_owned(),
-                                "a module without a file",
-                            ))
-                        }
-                        Diagnostic::UnresolvedImport(d) => {
-                            let r = sema.diagnostics_display_range(d.decl.map(|it| it.into()));
-                            Some((
-                                Some("E0432"),
-                                "unresolved import".to_owned(),
-                                r,
-                                "unresolved import".to_owned(),
-                                "unresolved import",
-                            ))
-                        }
-                        Diagnostic::UnresolvedMacroCall(d) if d.is_bang => {
-                            let name = d.path.display(db, edition).to_string();
-                            let r = sema.diagnostics_display_range_for_range(d.range);
-                            Some((
-                                None,
-                                format!("cannot find macro `{name}` in this scope"),
-                                r,
-                                "not found in this scope".to_owned(),
-                                "unresolved macro",
-                            ))
-                        }
-                        _ => None,
-                    };
-                    if let Some((code, msg, range, label, short_why)) = info
-                        && seen_diags.insert((range.file_id, range.range, msg.clone()))
-                    {
-                        rep.errors += 1;
-                        if let Some(c) = code
-                            && !seen_codes.contains(&c)
-                        {
-                            seen_codes.push(c);
-                        }
-                        if rep.first_summary.is_none() {
-                            let mod_name = module.name(db).map_or_else(
-                                || "the crate root".to_owned(),
-                                |it| format!("`{}`", it.display(db, syntax::Edition::CURRENT)),
-                            );
-                            rep.first_summary = Some(format!(
-                                "{mod_name} has errors, `cargo check` shows them: {short_why}"
-                            ));
-                        }
-                        rep.rendered.push_str(&format_cargo_snippet(
-                            db,
-                            paths,
-                            root,
-                            range.file_id,
-                            range.range,
-                            code,
-                            &msg,
-                            &label,
-                        ));
-                    }
-                }
-            }
-        }
-    });
-    if let Some(&first_code) = seen_codes.first() {
-        rep.rendered.push_str(&format!(
-            "\x1b[1mFor more information about this error, try `rustc --explain {first_code}`.\x1b[0m\n"
-        ));
-    }
-    rep
-}
-
-fn format_cargo_warning_snippet(
-    db: &RootDatabase,
-    paths: &FxHashMap<vfs::FileId, PathBuf>,
-    root: &Path,
-    file_id: vfs::FileId,
-    range: syntax::TextRange,
-    lint_name: &str,
-    message: &str,
-    label: &str,
-) -> String {
-    let full_path = paths.get(&file_id).cloned().unwrap_or_default();
-    let rel_path = full_path
-        .strip_prefix(root)
-        .unwrap_or(&full_path)
-        .display()
-        .to_string();
-    let text = db.file_text(file_id).text(db);
-    let start_off = usize::from(range.start()).min(text.len());
-    let end_off = usize::from(range.end()).min(text.len()).max(start_off);
-    let before = &text[..start_off];
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[start_off..].find('\n').map_or(text.len(), |i| start_off + i);
-    let line_no = before.bytes().filter(|&b| b == b'\n').count() + 1;
-    let raw_line = text[line_start..line_end].trim_end_matches('\r');
-    let span_start_in_line = start_off.saturating_sub(line_start).min(raw_line.len());
-    let span_end_in_line = end_off.min(line_end).saturating_sub(line_start).min(raw_line.len());
-    let mut display_line = String::with_capacity(raw_line.len() + 16);
-    let mut caret_col = 0usize;
-    let mut caret_len = 0usize;
-    for (byte_idx, ch) in raw_line.char_indices() {
-        let width = if ch == '\t' { 4 } else { 1 };
-        if byte_idx < span_start_in_line {
-            caret_col += width;
-        } else if byte_idx < span_end_in_line {
-            caret_len += width;
-        }
-        if ch == '\t' {
-            display_line.push_str("    ");
-        } else {
-            display_line.push(ch);
-        }
-    }
-    let col_no = raw_line[..span_start_in_line].chars().count() + 1;
-    let carets = "^".repeat(caret_len.max(1));
-    let pad_num = line_no.to_string();
-    let gutter_pad = " ".repeat(pad_num.len());
-    let caret_pad = " ".repeat(caret_col);
-    format!(
-        "\x1b[1;33mwarning\x1b[0m\x1b[1m: {message}\x1b[0m\n\
-         {gutter_pad}\x1b[1;34m-->\x1b[0m {rel_path}:{line_no}:{col_no}\n\
-         {gutter_pad} \x1b[1;34m|\x1b[0m\n\
-         \x1b[1;34m{pad_num} |\x1b[0m {display_line}\n\
-         {gutter_pad} \x1b[1;34m|\x1b[0m {caret_pad}\x1b[1;33m{carets} {label}\x1b[0m\n\
-         {gutter_pad} \x1b[1;34m|\x1b[0m\n\
-         {gutter_pad} \x1b[1;34m=\x1b[0m \x1b[1mnote\x1b[0m: `#[warn({lint_name})]` on by default\n\n"
-    )
-}
-
-fn clippy_files_diagnostics(
-    db: &RootDatabase,
-    files_to_check: &[vfs::FileId],
-    layout_warnings: &[String],
-    paths: &FxHashMap<vfs::FileId, PathBuf>,
-    root: &Path,
-) -> CheckReport {
-    use hir::AnyDiagnostic as Diagnostic;
-    let mut rep = check_files_diagnostics(db, files_to_check, layout_warnings, paths, root);
-    let mut seen_warns = FxHashSet::default();
-    hir::attach_db(db, || {
-        let sema = hir::Semantics::new(db);
-        for &file in files_to_check {
-            let crates = ide_db::base_db::relevant_crates(db, file);
-            let edition = crates
-                .first()
-                .map_or(syntax::Edition::CURRENT, |&krate| Crate::from(krate).edition(db));
-            for module in modules_in_file(db, file) {
-                let mut found = Vec::new();
-                module.diagnostics(db, &mut found, true);
-                for diag in &found {
-                    let info: Option<(&'static str, String, hir::FileRangeWrapper<vfs::FileId>, String)> =
-                        match diag {
-                            Diagnostic::UnusedMustUse(d) => {
-                                let r = sema.diagnostics_display_range(d.expr.map(|it| it.into()));
-                                let msg = match d.message {
-                                    Some(m) => format!("unused result that must be used: {m}"),
-                                    None => "unused result that must be used".to_owned(),
-                                };
-                                Some(("unused_must_use", msg, r, "must be used".to_owned()))
-                            }
-                            Diagnostic::RemoveTrailingReturn(d)
-                                if !d.return_expr.file_id.is_macro() =>
-                            {
-                                let r = sema.diagnostics_display_range(
-                                    d.return_expr.map(|it| it.into()),
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let broken = std::thread::scope(|scope| {
+        let checks: Vec<_> = (0..threads.min(edited.len()))
+            .map(|part| {
+                let db = db.clone();
+                scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        let sema = hir::Semantics::new(&db);
+                        let modules = edited
+                            .iter()
+                            .skip(part)
+                            .step_by(threads)
+                            .flat_map(|&file| sema.file_to_module_defs(file));
+                        for module in modules {
+                            let mut found = Vec::new();
+                            module.diagnostics(&db, &mut found, false);
+                            // Only what rust-analyzer is as sure of as rustc is: a wrong
+                            // refusal costs a cargo build.
+                            let why = found.iter().find_map(|it| match it {
+                                Diagnostic::TypeMismatch(_) => Some("mismatched types"),
+                                Diagnostic::UnresolvedIdent(_) => Some("unresolved name"),
+                                Diagnostic::MismatchedArgCount(_)
+                                | Diagnostic::MismatchedTupleStructPatArgCount(_) => {
+                                    Some("wrong number of arguments")
+                                }
+                                Diagnostic::MissingFields(_) => Some("missing fields"),
+                                Diagnostic::NoSuchField(_) | Diagnostic::UnresolvedField(_) => {
+                                    Some("no such field")
+                                }
+                                Diagnostic::UnresolvedMethodCall(_)
+                                | Diagnostic::UnresolvedAssocItem(_) => Some("no such method"),
+                                Diagnostic::MissingMatchArms(_)
+                                | Diagnostic::NonExhaustiveLet(_) => Some("patterns not covered"),
+                                Diagnostic::TraitImplMissingAssocItems(_)
+                                | Diagnostic::TraitImplRedundantAssocItems(_) => {
+                                    Some("an impl does not match its trait")
+                                }
+                                Diagnostic::UnresolvedModule(_) => Some("a module without a file"),
+                                Diagnostic::UnresolvedImport(_) => Some("unresolved import"),
+                                Diagnostic::UnresolvedMacroCall(_) => Some("unresolved macro"),
+                                _ => None,
+                            });
+                            if let Some(why) = why {
+                                let name = module.name(&db).map_or_else(
+                                    || "the crate root".to_owned(),
+                                    |it| format!("`{}`", it.display(&db, syntax::Edition::CURRENT)),
                                 );
-                                Some((
-                                    "clippy::needless_return",
-                                    "unneeded `return` statement".to_owned(),
-                                    r,
-                                    "help: remove `return`".to_owned(),
-                                ))
+                                return Some((name, why));
                             }
-                            Diagnostic::RemoveUnnecessaryElse(d)
-                                if !d.if_expr.file_id.is_macro() =>
-                            {
-                                let r =
-                                    sema.diagnostics_display_range(d.if_expr.map(|it| it.into()));
-                                Some((
-                                    "clippy::needless_else",
-                                    "this `else` block is empty and unnecessary".to_owned(),
-                                    r,
-                                    "help: remove the empty `else` block".to_owned(),
-                                ))
-                            }
-                            Diagnostic::ReplaceFilterMapNextWithFindMap(d)
-                                if !d.file.is_macro() =>
-                            {
-                                let r = sema.diagnostics_display_range(hir::InFile::new(
-                                    d.file,
-                                    d.next_expr.into(),
-                                ));
-                                Some((
-                                    "clippy::filter_map_next",
-                                    "called `filter_map(..).next()` on an `Iterator`".to_owned(),
-                                    r,
-                                    "help: use `.find_map(..)` instead".to_owned(),
-                                ))
-                            }
-                            Diagnostic::IncorrectCase(d) if !d.file.is_macro() => {
-                                let r = sema.diagnostics_display_range(hir::InFile::new(
-                                    d.file,
-                                    d.ident.into(),
-                                ));
-                                Some((
-                                    "non_snake_case",
-                                    format!(
-                                        "`{}` should have a {:?} case name: `{}`",
-                                        d.ident_text, d.expected_case, d.suggested_text
-                                    ),
-                                    r,
-                                    format!("help: convert the identifier to `{}`", d.suggested_text),
-                                ))
-                            }
-                            _ => None,
-                        };
-                    if let Some((lint, msg, range, label)) = info
-                        && seen_warns.insert((range.file_id, range.range, lint))
-                    {
-                        rep.warnings += 1;
-                        rep.rendered.push_str(&format_cargo_warning_snippet(
-                            db,
-                            paths,
-                            root,
-                            range.file_id,
-                            range.range,
-                            lint,
-                            &msg,
-                            &label,
-                        ));
-                    }
-                }
-            }
-
-            // Fast AST Clippy lint passes on the parsed syntax tree
-            let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
-            let tree = parse.tree();
-            for node in tree.syntax().descendants() {
-                if let Some(bin) = ast::BinExpr::cast(node.clone())
-                    && let (Some(lhs), Some(rhs), Some(op)) =
-                        (bin.lhs(), bin.rhs(), bin.op_kind())
-                {
-                    let lhs_txt = lhs.syntax().text().to_string();
-                    let rhs_txt = rhs.syntax().text().to_string();
-                    // 1. clippy::len_zero (`x.len() == 0`, `x.len() != 0`, `x.len() > 0`)
-                    let is_len_zero = (lhs_txt.ends_with(".len()")
-                        && rhs_txt == "0"
-                        && matches!(
-                            op,
-                            ast::BinaryOp::CmpOp(
-                                ast::CmpOp::Eq { .. }
-                                    | ast::CmpOp::Ord {
-                                        ordering: ast::Ordering::Greater,
-                                        strict: true
-                                    }
-                            )
-                        ))
-                        || (rhs_txt.ends_with(".len()")
-                            && lhs_txt == "0"
-                            && matches!(
-                                op,
-                                ast::BinaryOp::CmpOp(
-                                    ast::CmpOp::Eq { .. }
-                                        | ast::CmpOp::Ord {
-                                            ordering: ast::Ordering::Less,
-                                            strict: true
-                                        }
-                                )
-                            ));
-                    if is_len_zero
-                        && seen_warns.insert((file, bin.syntax().text_range(), "clippy::len_zero"))
-                    {
-                        rep.warnings += 1;
-                        rep.rendered.push_str(&format_cargo_warning_snippet(
-                            db,
-                            paths,
-                            root,
-                            file,
-                            bin.syntax().text_range(),
-                            "clippy::len_zero",
-                            "length comparison to zero",
-                            "help: using `is_empty` is clearer and more explicit",
-                        ));
-                    }
-                    // 2. clippy::bool_comparison (`x == true`, `x == false`, `x != true`, `x != false`)
-                    let is_bool_cmp = matches!(op, ast::BinaryOp::CmpOp(ast::CmpOp::Eq { .. }))
-                        && (matches!(rhs_txt.as_str(), "true" | "false")
-                            || matches!(lhs_txt.as_str(), "true" | "false"));
-                    if is_bool_cmp
-                        && seen_warns.insert((
-                            file,
-                            bin.syntax().text_range(),
-                            "clippy::bool_comparison",
-                        ))
-                    {
-                        rep.warnings += 1;
-                        rep.rendered.push_str(&format_cargo_warning_snippet(
-                            db,
-                            paths,
-                            root,
-                            file,
-                            bin.syntax().text_range(),
-                            "clippy::bool_comparison",
-                            "equality checks against true or false are unnecessary",
-                            "help: simplify the boolean expression",
-                        ));
-                    }
-                }
-                // 3. clippy::collapsible_if (`if a { if b { ... } }` with no else)
-                if let Some(if_expr) = ast::IfExpr::cast(node.clone())
-                    && if_expr.else_branch().is_none()
-                    && if_expr
-                        .syntax()
-                        .parent()
-                        .and_then(ast::ElseBranch::cast)
-                        .is_none()
-                    && let Some(then_blk) = if_expr.then_branch()
-                    && let Some(stmt_list) = then_blk.stmt_list()
-                    && stmt_list.statements().next().is_none()
-                    && let Some(ast::Expr::IfExpr(inner_if)) = stmt_list.tail_expr()
-                    && inner_if.else_branch().is_none()
-                    && seen_warns.insert((
-                        file,
-                        if_expr.syntax().text_range(),
-                        "clippy::collapsible_if",
-                    ))
-                {
-                    rep.warnings += 1;
-                    rep.rendered.push_str(&format_cargo_warning_snippet(
-                        db,
-                        paths,
-                        root,
-                        file,
-                        if_expr.syntax().text_range(),
-                        "clippy::collapsible_if",
-                        "this `if` statement can be collapsed",
-                        "help: collapse nested `if` block with `&&`",
-                    ));
-                }
-                // 4. clippy::dbg_macro (`dbg!(...)`)
-                if let Some(mc) = ast::MacroCall::cast(node.clone())
-                    && mc
-                        .path()
-                        .and_then(|p| p.segment())
-                        .and_then(|s| s.name_ref())
-                        .is_some_and(|n| n.text() == "dbg")
-                    && seen_warns.insert((file, mc.syntax().text_range(), "clippy::dbg_macro"))
-                {
-                    rep.warnings += 1;
-                    rep.rendered.push_str(&format_cargo_warning_snippet(
-                        db,
-                        paths,
-                        root,
-                        file,
-                        mc.syntax().text_range(),
-                        "clippy::dbg_macro",
-                        "the `dbg!` macro is intended as a debugging tool",
-                        "help: remove the `dbg!` macro before committing",
-                    ));
-                }
-                // 5. clippy::redundant_closure (`|x| f(x)`)
-                if let Some(clos) = ast::ClosureExpr::cast(node)
-                    && let Some(pl) = clos.param_list()
-                    && pl.params().count() == 1
-                    && let Some(param) = pl.params().next()
-                    && param.ty().is_none()
-                    && let Some(ast::Pat::IdentPat(ip)) = param.pat()
-                    && let Some(pname) = ip.name()
-                    && let Some(ast::Expr::CallExpr(call)) = clos.body()
-                    && let Some(ast::Expr::PathExpr(callee_path)) = call.expr()
-                    && let Some(al) = call.arg_list()
-                    && al.args().count() == 1
-                    && let Some(arg0) = al.args().next()
-                    && arg0.syntax().text() == pname.syntax().text()
-                    && seen_warns.insert((
-                        file,
-                        clos.syntax().text_range(),
-                        "clippy::redundant_closure",
-                    ))
-                {
-                    let fn_txt = callee_path.syntax().text().to_string();
-                    rep.warnings += 1;
-                    rep.rendered.push_str(&format_cargo_warning_snippet(
-                        db,
-                        paths,
-                        root,
-                        file,
-                        clos.syntax().text_range(),
-                        "clippy::redundant_closure",
-                        "redundant closure",
-                        &format!("help: replace the closure with the function itself: `{fn_txt}`"),
-                    ));
-                }
-            }
-        }
+                        }
+                        None
+                    })
+                })
+            })
+            .collect();
+        checks.into_iter().find_map(|it| it.join().ok().flatten())
     });
-    rep
+    let (module, why) = broken?;
+    Some(format!("{module} has errors, `cargo check` shows them: {why}"))
 }
 
 /// A file whose changes the daemon picks up.
@@ -2685,29 +2135,56 @@ struct WatchedFile {
 }
 
 impl WatchedFile {
-    fn new(file: Watched, path: &Path) -> Option<WatchedFile> {
-        // Everything but the sysroot and the registry: path dependencies live outside the project.
-        let immutable = path
-            .components()
-            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")));
-        if immutable {
+    /// `path` is what the file is known as, `on_disk` where it is read from.
+    /// Whether the file is never written again: everything is watched but the sysroot, the
+    /// registry and what a build made, as path dependencies live outside the project.
+    fn immutable(path: &Path) -> bool {
+        path.components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "rustlib" | "registry")))
+    }
+
+    fn new(file: Watched, path: &Path, on_disk: &Path) -> Option<WatchedFile> {
+        if WatchedFile::immutable(path) {
             return None;
         }
-        let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+        let mtime = std::fs::metadata(on_disk).ok()?.modified().ok()?;
         Some(WatchedFile { file, path: path.to_owned(), mtime })
     }
 
     fn sources(vfs: &Vfs) -> Vec<WatchedFile> {
         vfs.iter()
             .filter_map(|(id, path)| {
-                WatchedFile::new(Watched::Source(id), path.as_path()?.as_ref())
+                let path: &Path = path.as_path()?.as_ref();
+                WatchedFile::new(Watched::Source(id), path, path)
             })
             .collect()
+    }
+
+    /// Puts the files an `include!` named that were not loaded in their source roots, and
+    /// watches them: whether there were any.
+    fn include_sources(
+        files: &mut Vec<WatchedFile>,
+        tree: &mut tree::Tree,
+        db: &mut RootDatabase,
+    ) -> bool {
+        let added = tree.included(db);
+        for (file, path) in &added {
+            files.extend(WatchedFile::new(Watched::Source(*file), path, &db.on_disk(path)));
+        }
+        !added.is_empty()
     }
 
     /// Adds the files the last build included that are not watched yet. One is read again once
     /// its timestamp is taken, so a write between the build's read and now is not lost: the
     /// result is whether there was one.
+    fn unwatched(files: &[WatchedFile], db: &RootDatabase) -> bool {
+        let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
+        db.included_files()
+            .iter()
+            .map(AsRef::<Path>::as_ref)
+            .any(|it| !watched.contains(it) && !WatchedFile::immutable(it))
+    }
+
     fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
@@ -2717,7 +2194,10 @@ impl WatchedFile {
             .collect();
         let mut changed = false;
         for path in new {
-            if let Some(file) = WatchedFile::new(Watched::Included(path.clone()), path.as_ref()) {
+            let on_disk = db.on_disk(path.as_ref());
+            if let Some(file) =
+                WatchedFile::new(Watched::Included(path.clone()), path.as_ref(), &on_disk)
+            {
                 files.push(file);
                 changed |= db.reload_included_file(&path);
             }
@@ -2732,9 +2212,8 @@ impl WatchedFile {
 /// none of them: a symbol from another crate's rlib would not be there at link time.
 fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
     let (out, report) = (args.out.clone(), args.report.clone().context("a batch needs --report")?);
-    let first_krate = args.krate.clone().context("a batch needs --crate")?;
     let crates: Vec<_> =
-        std::iter::once(first_krate).chain(args.batch.iter().cloned()).collect();
+        std::iter::once(args.krate.clone()).chain(args.batch.iter().cloned()).collect();
     let rlib_of = |file: &Path| {
         let name = file.file_name()?.to_str()?.strip_prefix("lib")?;
         let name = name.rsplit_once('-').map_or(name, |(name, _)| name);
@@ -2750,7 +2229,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
         let table = &SymbolTable::load(&symbol_files, &args.root()?)?;
         let args = Args {
             project: args.project.clone(),
-            krate: Some(krate.clone()),
+            krate: krate.clone(),
             batch: Vec::new(),
             out: out.join(format!("{krate}.o")),
             symbol_files: Vec::new(),
@@ -2758,26 +2237,22 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             socket: None,
             link_cmd: None,
             patch: None,
+            splice: None,
             report: Some(report.join(format!("{krate}.tsv"))),
             deny: None,
             isolate: None,
             cfg_test: args.cfg_test,
+            dev_deps: args.dev_deps,
             features: args.features.clone(),
+            also: Vec::new(),
             target: args.target.clone(),
+            checkout: args.checkout.clone(),
+            base: args.base.clone(),
+            members: args.members.clone(),
+            as_compiled: args.as_compiled.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build(
-                db,
-                table,
-                &args,
-                &mut Rejections::default(),
-                &mut Listed::default(),
-                &FxHashSet::default(),
-                &FxHashMap::default(),
-                &FxHashSet::default(),
-                &FxHashSet::default(),
-                true,
-            )
+            build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
         }));
         let error = match built {
             Ok(Ok(_)) => continue,
@@ -2797,26 +2272,13 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
 }
 
 /// What a client asks of the daemon, as the one line it sends.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Request {
     /// Bring the objects and the linked program up to date with the files on disk.
     Sync,
     /// Bring the objects up to date and leave the linking to the client, which loads the
     /// patch object into a program that is running.
     Patch,
-    /// Switch active target package/binary in the shared workspace daemon and build/patch it.
-    Switch {
-        bin_crate: String,
-        out: PathBuf,
-        patch: PathBuf,
-        link_cmd: String,
-    },
-    /// Compact accumulated patches into the base binary via a full `wild` link and reset baseline.
-    Rebase,
-    /// Run incremental syntax and semantic diagnostics and write a cargo-style report.
-    Check,
-    /// Run incremental syntax, semantic, and Clippy lint diagnostics.
-    Clippy,
     /// Inject N synthetic faults into core functions and measure selector recall.
     Backtest(usize),
 }
@@ -2827,221 +2289,310 @@ impl Request {
             let n = rest.trim().parse::<usize>().unwrap_or(20).max(1);
             return Some(Request::Backtest(n));
         }
-        if let Some(rest) = line.strip_prefix("switch\t") {
-            let mut parts = rest.split('\t');
-            let bin_crate = parts.next()?.to_owned();
-            let out = PathBuf::from(parts.next()?);
-            let patch = PathBuf::from(parts.next()?);
-            let link_cmd = parts.next()?.to_owned();
-            return Some(Request::Switch { bin_crate, out, patch, link_cmd });
-        }
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
-            "rebase" => Some(Request::Rebase),
-            "check" => Some(Request::Check),
-            "clippy" => Some(Request::Clippy),
             _ => None,
         }
     }
 
-    fn line(&self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Request::Sync => "sync\n",
-            Request::Patch | Request::Switch { .. } => "patch\n",
-            Request::Rebase => "rebase\n",
-            Request::Check => "check\n",
-            Request::Clippy => "clippy\n",
-            Request::Backtest(_) => "backtest 20\n",
+            Request::Sync => "sync",
+            Request::Patch => "patch",
+            Request::Backtest(_) => "backtest",
         }
     }
 }
 
-fn run_backtest(
-    db: &RootDatabase,
-    table: &SymbolTable,
-    args: &Args,
-    listed: &mut Listed,
-    faults: usize,
-) -> anyhow::Result<(usize, usize, PathBuf)> {
-    let root = args.root()?;
-    let resolver = Resolver {
-        db,
-        table,
-        root,
-        rustc_commit: std::cell::OnceCell::new(),
-    };
-    let bin_crate = std::env::var("RUSTD_BIN_CRATE")
-        .unwrap_or_default()
-        .replace('-', "_");
-    let crates = if !bin_crate.is_empty()
-        && let Ok(c) = crates_named(db, &bin_crate)
-    {
-        c
-    } else {
-        Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
-    };
-    let mut all_funcs = Vec::new();
-    for c in crates {
-        let l = listed.of(db, c);
-        all_funcs.extend(l.functions.iter().copied());
+/// The program of the workspace a request is for, and where its objects go.
+#[derive(Clone)]
+struct Target {
+    /// The checkout it is a program of. `None` is the one the daemon was started in.
+    project: Option<PathBuf>,
+    krate: String,
+    out: PathBuf,
+    patch: Option<PathBuf>,
+    link_cmd: Option<String>,
+    splice: Option<PathBuf>,
+    /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
+    /// that program's own objects, so another has to be told where its copies are. Empty for
+    /// the files the daemon was started with.
+    symbol_files: Vec<PathBuf>,
+}
+
+impl Target {
+    fn is(&self, args: &Args) -> bool {
+        self.krate == args.krate && self.out == args.out
     }
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-    std::thread::scope(|scope| {
-        for part in 0..threads.min(all_funcs.len()) {
-            let db = db.clone();
-            let all_funcs = &all_funcs;
-            scope.spawn(move || {
-                hir::attach_db(&db, || {
-                    for &func in all_funcs.iter().skip(part).step_by(threads) {
-                        let _ = hir_ty::mir::codegen::function_deps(&db, func);
-                    }
-                });
-            });
-        }
-    });
 
-    let mut tests = Vec::new();
-    let mut core_fns = Vec::new();
-    hir::attach_db(db, || {
-        for &func in &all_funcs {
-            let flags = hir_def::attrs::AttrFlags::query(db, func.into());
-            if flags.contains(hir_def::attrs::AttrFlags::IS_TEST) {
-                if !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE) {
-                    tests.push(func);
-                }
-            } else {
-                core_fns.push(func);
+    /// The daemon's arguments, were it started for this program.
+    fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
+        let Target { project, krate, out, patch, link_cmd, splice, symbol_files } = self;
+        let project = project.unwrap_or_else(|| daemon.project.clone());
+        let Parts { root: checkout, base, members } = checkouts.parts(&project)?;
+        let symbol_files =
+            if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
+        let batch = std::iter::once(&daemon.krate)
+            .chain(&daemon.batch)
+            .filter(|&it| *it != krate)
+            .cloned()
+            .collect();
+        Ok(Args {
+            project,
+            checkout,
+            base,
+            members,
+            krate,
+            batch,
+            out,
+            patch,
+            link_cmd,
+            splice,
+            symbol_files,
+            ..daemon.clone()
+        })
+    }
+
+    /// From what follows the socket on the command line of a client.
+    fn from_flags(mut flags: impl Iterator<Item = String>) -> anyhow::Result<Option<Target>> {
+        let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
+        let (mut project, mut splice) = (None, None);
+        let mut symbol_files = Vec::new();
+        while let Some(flag) = flags.next() {
+            let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
+            match flag.as_str() {
+                "--crate" => krate = Some(value),
+                "--project" => project = Some(PathBuf::from(value)),
+                "--out" => out = Some(PathBuf::from(value)),
+                "--patch" => patch = Some(PathBuf::from(value)),
+                "--link-cmd" => link_cmd = Some(value),
+                "--binary" | "--splice" => splice = Some(PathBuf::from(value)),
+                "--symbols" => symbol_files.push(PathBuf::from(value)),
+                _ => bail!("unexpected argument {flag}"),
             }
         }
-    });
-
-    // Build reverse call/trait-callee adjacency lists in O(N)
-    let mut callers_of: FxHashMap<FunctionId, Vec<FunctionId>> = FxHashMap::default();
-    let mut trait_callers_of: FxHashMap<(FunctionId, hir_def::AdtId), Vec<FunctionId>> =
-        FxHashMap::default();
-    let is_test_set: FxHashSet<FunctionId> = tests.iter().copied().collect();
-    hir::attach_db(db, || {
-        for &f in &all_funcs {
-            let deps = hir_ty::mir::codegen::function_deps(db, f);
-            if deps.local_callee_count > 64 && !is_test_set.contains(&f) {
-                continue;
+        match (krate, out) {
+            (Some(krate), Some(out)) => {
+                Ok(Some(Target { project, krate, out, patch, link_cmd, splice, symbol_files }))
             }
-            for &c in &deps.callees {
-                callers_of.entry(c).or_default().push(f);
+            (None, None)
+                if patch.is_none()
+                    && link_cmd.is_none()
+                    && splice.is_none()
+                    && symbol_files.is_empty()
+                    && project.is_none() =>
+            {
+                Ok(None)
             }
-            for &pair in &deps.trait_callees {
-                trait_callers_of.entry(pair).or_default().push(f);
-            }
+            _ => bail!("a program is named by --crate and --out together"),
         }
-    });
+    }
 
-    let mut candidates = Vec::new();
-    let stride = (core_fns.len() / faults.saturating_mul(4).max(1)).max(1);
-    hir::attach_db(db, || {
-        for &cand in core_fns.iter().step_by(stride) {
-            if candidates.len() >= faults {
-                break;
+    /// The fields after the request's name on its line, each after a tab. Empty is absent.
+    fn parse(fields: &[&str]) -> Option<Target> {
+        let &[project, krate, out, patch, link_cmd, splice, ref symbol_files @ ..] = fields else {
+            return None;
+        };
+        let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
+        Some(Target {
+            project: given(project).map(PathBuf::from),
+            krate: krate.to_owned(),
+            out: PathBuf::from(out),
+            patch: given(patch).map(PathBuf::from),
+            link_cmd: given(link_cmd),
+            splice: given(splice).map(PathBuf::from),
+            symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
+        })
+    }
+
+    fn fields(&self) -> String {
+        let mut fields = format!(
+            "\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.krate,
+            self.out.display(),
+            self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.link_cmd.as_deref().unwrap_or_default(),
+            self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default()
+        );
+        for file in &self.symbol_files {
+            fields.push('\t');
+            fields.push_str(&file.display().to_string());
+        }
+        fields
+    }
+}
+
+/// What the daemon keeps for a program it builds. The code compiled for one program is there
+/// for the others: only the objects and what went into them are its own.
+struct Program {
+    args: Args,
+    table: Arc<SymbolTable>,
+    known: Rejections,
+    unbuilt: Unbuilt,
+    /// The object the last build was asked for.
+    wrote: Option<PathBuf>,
+    /// The object with all of the program, which a patch is the difference from.
+    whole: Option<PathBuf>,
+    /// How many of its builds a change to the source has interrupted since one finished.
+    interrupted: u32,
+    /// Whether its crates are others than the last build was of, which is then no patch.
+    moved: bool,
+}
+
+/// A request, the program it is for, and who waits for the answer.
+type Asked = (Request, Option<Target>, UnixStream);
+
+/// What the daemon waits for.
+enum Event {
+    Asked(Asked),
+    /// The build of a program is over, with what to tell its clients: nothing when a change
+    /// to the source interrupted it.
+    Built(usize, Box<Program>, Option<anyhow::Result<Result<String, String>>>),
+    /// The link of a program's last build failed, after the build was over.
+    Unlinked(usize),
+}
+
+/// Set while the builds under way are told to stop for a change to the source.
+static INTERRUPTING: AtomicBool = AtomicBool::new(false);
+
+/// Reading a loaded checkout from another place is long when the build takes more than this,
+/// or than `RUSTD_SLOW_SWITCH_MS`.
+const SLOW_SWITCH: Duration = Duration::from_secs(2);
+
+/// A checkout that is long to turn to or from this many times running is loaded instead.
+const SLOW_SWITCHES: u32 = 3;
+
+/// A build that is interrupted this many times is waited for the next time.
+const INTERRUPTIONS: u32 = 3;
+
+/// The clients of a program that is being built.
+struct Running {
+    clients: Vec<Asked>,
+    /// Whether a change to the source waits for the build: one that patches is short, and
+    /// has nothing to patch once it is interrupted.
+    kept: bool,
+}
+
+/// The builds under way and the requests that wait for them. A build reads the database on
+/// threads of its own, so requests for other programs are not kept waiting by it.
+struct Builds {
+    events: std::sync::mpsc::Receiver<Event>,
+    running: FxHashMap<usize, Running>,
+    /// Requests that could not be built with the ones before them.
+    waiting: std::collections::VecDeque<Asked>,
+    /// Whether the requests that wait can only be built once something else happens.
+    stuck: bool,
+}
+
+impl Builds {
+    /// Queues a request, or takes back the program of a build that is over and answers its
+    /// clients. Those of a build that was interrupted ask again, ahead of the others.
+    fn take(&mut self, event: Event, programs: &mut [Program]) -> anyhow::Result<()> {
+        self.stuck = false;
+        let (at, program, answer) = match event {
+            Event::Asked(asked) => {
+                self.waiting.push_back(asked);
+                return Ok(());
             }
-            let Some(path) = resolver.path(cand) else {
-                continue;
+            Event::Built(at, program, answer) => (at, program, answer),
+            Event::Unlinked(at) => {
+                programs[at].unbuilt.stale = true;
+                programs[at].wrote = None;
+                return Ok(());
+            }
+        };
+        let Some(Running { clients, .. }) = self.running.remove(&at) else { return Ok(()) };
+        programs[at] = *program;
+        let program = &mut programs[at];
+        let Some(answer) = answer else {
+            eprintln!("interrupted: {}", program.args.krate);
+            let patching = program.known.patching;
+            program.known = Rejections::default();
+            program.known.patching = patching;
+            program.unbuilt.stale = true;
+            (program.wrote, program.whole) = (None, None);
+            program.interrupted += 1;
+            clients.into_iter().rev().for_each(|it| self.waiting.push_front(it));
+            return Ok(());
+        };
+        (program.interrupted, program.moved) = (0, false);
+        let answer = answer?;
+        for (_, _, client) in clients {
+            // A client that hangs up before the answer is not the daemon's problem.
+            let _ = match &answer {
+                Ok(built) => writeln!(&client, "ok {built}"),
+                Err(why) => writeln!(&client, "error: {}", why.replace('\n', " ")),
             };
-            let mut reach = FxHashSet::default();
-            let mut queue = vec![cand];
-            reach.insert(cand);
-            while let Some(cur) = queue.pop() {
-                if let Some(callers) = callers_of.get(&cur) {
-                    for &caller in callers {
-                        if reach.insert(caller) {
-                            queue.push(caller);
-                        }
-                    }
-                }
-                let h_fn = hir::Function::from(cur);
-                if let Some(assoc) = h_fn.as_assoc_item(db)
-                    && let AssocItemContainer::Impl(imp) = assoc.container(db)
-                    && let Some(trait_) = imp.trait_(db)
-                {
-                    let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
-                    let trait_id = hir_def::TraitId::from(trait_);
-                    let fn_name = h_fn.name(db);
-                    for &(ref t_name, item) in trait_id.trait_items(db).items.iter() {
-                        if let AssocItemId::FunctionId(fid) = item
-                            && t_name.as_str() == fn_name.as_str()
-                            && let Some(adt_id) = impl_adt
-                            && let Some(t_callers) = trait_callers_of.get(&(fid, adt_id))
-                        {
-                            for &caller in t_callers {
-                                if reach.insert(caller) {
-                                    queue.push(caller);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let covering_tests: Vec<FunctionId> = tests
-                .iter()
-                .copied()
-                .filter(|t| reach.contains(t))
-                .collect();
-            if !covering_tests.is_empty() {
-                candidates.push((cand, path, covering_tests));
-            }
         }
-    });
+        Ok(())
+    }
 
-    let total = faults.min(candidates.len());
-    let step = 1;
-    let mut caught = 0usize;
-    let mut report_lines = Vec::new();
-    hir::attach_db(db, || {
-        for (idx, (cand, fn_path, covering)) in
-            candidates.iter().step_by(step).take(total).enumerate()
-        {
-            let file_id = cand
-                .lookup(db)
-                .id
-                .file_id
-                .original_file_respecting_includes(db)
-                .file_id(db);
-            let src_rel = resolver.source_path(file_id).unwrap_or_default();
-            let first_test = resolver
-                .path(covering[0])
-                .unwrap_or_else(|| "test".to_owned());
-            let first_rel = first_test
-                .split_once("::")
-                .map_or(first_test.as_str(), |(_, r)| r);
-            caught += 1;
-            report_lines.push(format!(
-                "  [fault {:>2}/{total}] PASS `{fn_path}` ({src_rel}) -> caught by {} selected test(s) (e.g. `{first_rel}`)",
-                idx + 1,
-                covering.len()
-            ));
+    /// Leaves no build under way, for the database to be written to: a write stops every
+    /// thread that reads it. The builds that are kept are waited for, the others interrupted.
+    fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
+        use ide_db::base_db::salsa::Database as _;
+        while self.running.values().any(|it| it.kept) {
+            let event = self.events.recv()?;
+            self.take(event, programs)?;
         }
-    });
-    let pct = if total > 0 {
-        (caught as f64 / total as f64) * 100.0
-    } else {
-        100.0
-    };
-    report_lines.push(format!(
-        "\nBacktest summary: {caught}/{total} ({pct:.1}%) faults caught by selected tests ({} misses)",
-        total.saturating_sub(caught)
-    ));
-    let report_path = args.out.with_extension("backtest.txt");
-    std::fs::write(&report_path, report_lines.join("\n") + "\n")?;
-    Ok((caught, total, report_path))
+        if self.running.is_empty() {
+            return Ok(());
+        }
+        INTERRUPTING.store(true, Ordering::SeqCst);
+        db.trigger_cancellation();
+        while !self.running.is_empty() {
+            let event = self.events.recv()?;
+            self.take(event, programs)?;
+        }
+        INTERRUPTING.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Where a build of a program goes. A checkout looked at as another has files of its own for
+/// the program they share.
+#[derive(Clone, PartialEq)]
+struct Outputs {
+    out: PathBuf,
+    patch: Option<PathBuf>,
+    link_cmd: Option<String>,
+    splice: Option<PathBuf>,
+}
+
+impl Outputs {
+    fn of(args: &Args) -> Outputs {
+        Outputs {
+            out: args.out.clone(),
+            patch: args.patch.clone(),
+            link_cmd: args.link_cmd.clone(),
+            splice: args.splice.clone(),
+        }
+    }
+}
+
+/// What a program's objects are behind by.
+#[derive(Default)]
+struct Unbuilt {
+    /// Files edited since the last build that was not refused.
+    edited: Vec<vfs::FileId>,
+    /// Whether there is anything to build even when no file has changed since.
+    stale: bool,
+    /// Whether the last build was for a request that does not link, which leaves the
+    /// executable to the next that does.
+    unlinked: bool,
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
 /// line: `ok unchanged`, or `ok patch=PATH ...` when the object at PATH holds the functions that
 /// differ from the first build's, or `ok object=PATH ...` when the whole object was written
 /// again.
-fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
+fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no daemon at {}", socket.display()))?;
-    stream.write_all(request.line().as_bytes())?;
+    let target = target.map(|it| it.fields()).unwrap_or_default();
+    stream.write_all(format!("{}{target}\n", request.name()).as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim_end();
@@ -3050,99 +2601,81 @@ fn ask(request: Request, socket: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inject_hotpatch_rt(base_o: &Path, patch_o: &Path, root: &Path) -> anyhow::Result<()> {
-    let rt_o = base_o.with_extension("rt.o");
-    let cave_o = base_o.with_extension("cave.o");
-    if let Ok(rt_m) = std::fs::metadata(&rt_o).and_then(|m| m.modified())
-        && cave_o.exists()
-        && let Ok(exe_m) = std::env::current_exe()
-            .and_then(|p| std::fs::metadata(p))
-            .and_then(|m| m.modified())
-        && rt_m >= exe_m
-    {
-        return Ok(());
-    }
-    let rt_src = include_str!("hotpatch_rt.rs");
-    let rt_rs = base_o.with_extension("rt.rs");
-    std::fs::write(&rt_rs, rt_src)?;
-    let abs_patch = std::env::current_dir()?.join(patch_o);
-    let status = Command::new("rustc")
-        .current_dir(root)
-        .args([
-            "--edition=2024",
-            "--crate-name=rustd_hotpatch_rt",
-            "--crate-type=rlib",
-            "--emit=obj",
-            "-O",
-        ])
-        .arg(&rt_rs)
-        .arg("-o")
-        .arg(&rt_o)
-        .env("RUSTD_DEFAULT_PATCH_PATH", &abs_patch)
-        .status()
-        .context("compiling hotpatch_rt.rs")?;
-    anyhow::ensure!(status.success(), "rustc failed on hotpatch_rt.rs ({status})");
-    let _ = std::fs::remove_file(&rt_rs);
-
-    let cave_rs = base_o.with_extension("cave.rs");
-    std::fs::write(
-        &cave_rs,
-        "#[repr(C, align(1))] pub struct Cave([u8; 81920]);\n\
-         #[used]\n\
-         #[unsafe(no_mangle)]\n\
-         #[cfg_attr(target_os = \"macos\", unsafe(link_section = \"__TEXT,__text\"))]\n\
-         #[cfg_attr(target_os = \"linux\", unsafe(link_section = \".text\"))]\n\
-         pub static __rustd_veneer_cave_end: Cave = Cave([0; 81920]);\n",
-    )?;
-    let cave_status = Command::new("rustc")
-        .current_dir(root)
-        .args([
-            "--edition=2024",
-            "--crate-name=rustd_veneer_cave",
-            "--crate-type=rlib",
-            "--emit=obj",
-            "-C",
-            "panic=abort",
-            "-O",
-        ])
-        .arg(&cave_rs)
-        .arg("-o")
-        .arg(&cave_o)
-        .status()
-        .context("compiling cave.rs")?;
-    anyhow::ensure!(cave_status.success(), "rustc failed on cave.rs ({cave_status})");
-    let _ = std::fs::remove_file(&cave_rs);
+/// Loads the checkout of `project` into the database of a daemon that is running, and
+/// watches its files.
+fn join(
+    project: &Path,
+    checkouts: &mut Checkouts,
+    db: &mut RootDatabase,
+    tree: &mut tree::Tree,
+    files: &mut Vec<WatchedFile>,
+) -> anyhow::Result<()> {
+    checkouts.add(&[project], db, tree.vfs())?;
+    watch_loaded(db, tree, files);
     Ok(())
 }
 
+/// Watches the source files that were loaded since the last were.
+fn watch_loaded(db: &mut RootDatabase, tree: &mut tree::Tree, files: &mut Vec<WatchedFile>) {
+    let watched: FxHashSet<vfs::FileId> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some(id),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let new: Vec<WatchedFile> = WatchedFile::sources(tree.vfs())
+        .into_iter()
+        .filter(|it| !matches!(it.file, Watched::Source(id) if watched.contains(&id)))
+        .collect();
+    let sources: Vec<_> = new
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, &*it.path)),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    tree.watch(db, &sources);
+    files.extend(new);
+}
+
 /// Waits for a build request on `listener`. The result is where to send the outcome.
-fn requested(listener: &UnixListener, watch: bool) -> anyhow::Result<Option<(Request, UnixStream)>> {
+fn requested(listener: &UnixListener) -> anyhow::Result<(Request, Option<Target>, UnixStream)> {
     loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false)?;
-                let mut request = String::new();
-                BufReader::new(&stream).read_line(&mut request)?;
-                if let Some(request) = Request::parse(request.trim_end()) {
-                    return Ok(Some((request, stream)));
-                }
-                let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
-            }
-            Err(e) if watch && e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
+        let (stream, _) = listener.accept()?;
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request)?;
+        let fields: Vec<&str> = request.trim_end_matches('\n').split('\t').collect();
+        let target = Target::parse(&fields[1..]);
+        if let Some(request) = Request::parse(fields[0])
+            && (fields.len() == 1 || target.is_some())
+        {
+            return Ok((request, target, stream));
         }
+        // A client that hangs up before the answer is not the daemon's problem.
+        let _ = writeln!(&stream, "error: unknown request {:?}", request.trim_end());
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("cache") {
+        return remote::command(std::env::args().skip(2));
+    }
+    if std::env::var_os("RUSTD_WRAPS_RUSTC").is_some() {
+        return stub::command(std::env::args_os().skip(1));
+    }
+    if std::env::args().nth(1).as_deref() == Some("deps") {
+        return deps::command(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("weaken") {
+        return weaken::command(std::env::args().skip(2));
+    }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
-        && Path::new(&socket).extension().is_some_and(|e| e == "sock")
+        && (Path::new(&socket).extension().is_some_and(|e| e == "sock")
+            || Path::new(&socket).exists())
     {
-        return ask(request, Path::new(&socket));
+        return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     if let Some(first) = std::env::args().nth(1)
         && cli::is_subcommand(&first)
@@ -3150,72 +2683,60 @@ fn main() -> anyhow::Result<()> {
         return cli::dispatch(&first, std::env::args().skip(2).collect());
     }
     let mut args = Args::parse()?;
-    if args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
-        hir_ty::mir::codegen::WASM32_TARGET.store(true, std::sync::atomic::Ordering::Relaxed);
+    // As cargo does: the flag, then the environment, then the host.
+    if args.target.is_none() {
+        args.target = std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
+    }
+    let emits = match &args.target {
+        Some(triple) => hir_ty::mir::codegen::Target::select(triple),
+        None => hir_ty::mir::codegen::Target::selected(),
+    };
+    let emits = emits.map_err(anyhow::Error::msg)?;
+    if args.target.is_some() {
+        eprintln!("target: {}", emits.triple());
+    }
+    let backend = Backend::from_env().map_err(anyhow::Error::msg)?;
+    if backend != Backend::Cranelift {
+        eprintln!("backend: {backend}");
     }
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
     let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
-    let (cache_fp, baseline_fp) = {
-        use std::hash::{Hash, Hasher};
-        let mut bh = rustc_hash::FxHasher::default();
-        for f in &symbol_files {
-            f.hash(&mut bh);
-            if let Ok(m) = std::fs::metadata(f) {
-                m.len().hash(&mut bh);
-                if let Ok(t) = m.modified()
-                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
-                {
-                    d.as_nanos().hash(&mut bh);
-                }
-            }
-        }
-        for mf in [&args.project, &root.join("Cargo.lock")] {
-            if let Ok(m) = std::fs::metadata(mf) {
-                m.len().hash(&mut bh);
-                if let Ok(t) = m.modified()
-                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
-                {
-                    d.as_nanos().hash(&mut bh);
-                }
-            }
-        }
-        args.cfg_test.hash(&mut bh);
-        args.target.hash(&mut bh);
-        args.features.hash(&mut bh);
-        std::env::var("RUSTD_PKG").ok().hash(&mut bh);
-        let b_fp = bh.finish();
-        let mut h = rustc_hash::FxHasher::default();
-        b_fp.hash(&mut h);
-        SymbolTable::files_fingerprint(&symbol_files).hash(&mut h);
-        (format!("{:016x}", h.finish()), format!("{:016x}", b_fp))
-    };
-    if !args.out.is_dir() {
-        unsafe {
-            std::env::set_var("RUSTD_CACHE_FP", &cache_fp);
-            std::env::set_var("RUSTD_CACHE_META", args.out.with_extension("meta.cache"));
-            std::env::set_var("RUSTD_CACHE_TREE", args.out.with_extension("tree.cache"));
-            std::env::set_var("RUSTD_CACHE_BS", args.out.with_extension("bs.cache"));
-        }
-    }
-    let mut baseline_cache_path =
-        (!args.out.is_dir()).then(|| args.out.with_extension("baseline.cache"));
-    let sym_cache_path = (!args.out.is_dir()).then(|| args.out.with_extension("symbols.cache"));
     let table = std::thread::spawn(move || {
         let start = Instant::now();
-        let table = SymbolTable::load_cached(&symbol_files, &root, sym_cache_path.as_deref());
+        let table = SymbolTable::load(&symbol_files, &root);
         if let Ok(table) = &table {
             eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
         }
         table
     });
 
+    // What other machines compiled is fetched next to the workspace too.
+    let shared = std::thread::spawn(|| {
+        let shared = remote::Shared::from_env();
+        if let Some(shared) = &shared {
+            shared.pull();
+        }
+        shared
+    });
+
     let start = Instant::now();
+    // The library is read as the toolchain that built the program has it: one the directory
+    // would pick now may be another, whose library has names the built one does not.
+    let built_with = args.symbol_files.iter().find_map(|file| {
+        let name = file.file_name()?.to_str()?;
+        let (toolchain, _) = file.to_str()?.split_once("/lib/rustlib/")?;
+        (name.starts_with("libstd-") && name.ends_with(".rlib")).then_some(toolchain)
+    });
+    let sysroot = match built_with.map(AbsPathBuf::try_from) {
+        Some(Ok(toolchain)) => RustLibSource::Path(toolchain),
+        _ => RustLibSource::Discover,
+    };
     let cargo_config = CargoConfig {
-        sysroot: Some(RustLibSource::Discover),
-        set_test: args.cfg_test,
+        sysroot: Some(sysroot),
         target: args.target.clone(),
+        set_test: args.cfg_test,
         features: CargoFeatures::Selected {
             features: args.features.clone(),
             no_default_features: false,
@@ -3229,149 +2750,20 @@ fn main() -> anyhow::Result<()> {
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let (mut db, vfs, _proc_macro) = load(&args.project, &cargo_config, &load_config)?;
+    let projects: Vec<&Path> =
+        std::iter::once(&args.project).chain(&args.also).map(PathBuf::as_path).collect();
+    let (mut db, vfs, mut checkouts) =
+        load(&projects, &cargo_config, load_config, args.cfg_test || args.dev_deps)?;
+    let Parts { root, base, members } = checkouts.parts(&args.project)?;
+    (args.checkout, args.base, args.members) = (root, base, members);
     eprintln!("load workspace: {:.1?}", start.elapsed());
+    memory::checkpoint("load");
 
     if args.out.is_dir() {
         return build_batch(&db, args);
     }
 
-    let mut resolved_deps = false;
-    if args.krate.is_some() || (args.socket.is_none() && !args.watch) {
-        let start = Instant::now();
-        let resolved = resolve_crates(&db, &args)?;
-        eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
-        resolved_deps = true;
-    }
-
-    anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
-    let report_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if !PROBING.get() {
-            report_panic(info);
-        }
-    }));
-    let mut known = Rejections::default();
-    known.patching = args.patch.is_some();
-    let mut listed = Listed::default();
-    let mut outlines = outline::Outlines::default();
-    let mut initial_texts: FxHashMap<vfs::FileId, triomphe::Arc<str>> = FxHashMap::default();
-    let mut initial_serials: FxHashMap<FunctionId, u64> = FxHashMap::default();
-    let mut initial_adts: FxHashMap<vfs::FileId, FileSnapshot> = FxHashMap::default();
-    let mut dirty_files: FxHashSet<vfs::FileId> = FxHashSet::default();
-    let mut table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
-    let cold = build(
-        &db,
-        &table,
-        &args,
-        &mut known,
-        &mut listed,
-        &dirty_files,
-        &initial_serials,
-        &FxHashSet::default(),
-        &FxHashSet::default(),
-        true,
-    )?;
-    eprint!("cold: ");
-    report(&cold);
-    report_stats(&known.stats);
-    let mut cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
-    let skip_cold_link = args.krate.is_none()
-        && cold_bin_path.as_ref().is_some_and(|bp| {
-            let base_p = bp.with_extension("base");
-            let rt_o = args.out.with_extension("rt.o");
-            if let (Ok(bm), Ok(rm)) = (
-                std::fs::metadata(&base_p).and_then(|m| m.modified()),
-                std::fs::metadata(&rt_o).and_then(|m| m.modified()),
-            ) {
-                bm >= rm && bp.exists()
-            } else {
-                false
-            }
-        });
-    if !skip_cold_link {
-        link(&args)?;
-    }
-    let mut bin_index = cold_bin_path
-        .as_ref()
-        .filter(|p| p.exists())
-        .and_then(|bin_path| {
-            table.filter_to_binary(bin_path);
-            incremental_link::BinaryIndex::from_cold_binary(bin_path)
-        });
-    hir::attach_db(&db, || known.out_of_date(&db));
-    if args.socket.is_none() && !args.watch {
-        return Ok(());
-    }
-
-    // The first change after a build of everything waits for what that build left behind.
-    // Paid here, the first edit does not.
-    {
-        use ide_db::base_db::salsa::{Database, Durability};
-        db.synthetic_write(Durability::LOW);
-    }
     let mut files = WatchedFile::sources(&vfs);
-    eprintln!("watching {} files", files.len());
-    let mut baseline_by_path: FxHashMap<PathBuf, String> = FxHashMap::default();
-    if let Some(bp) = &baseline_cache_path
-        && let Ok(bytes) = std::fs::read(bp)
-        && bytes.starts_with(b"RUSTDBAS")
-    {
-        let mut pos = 8usize;
-        let get_u32 = |pos: &mut usize| -> Option<u32> {
-            let v = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?);
-            *pos += 4;
-            Some(v)
-        };
-        let get_str = |pos: &mut usize| -> Option<String> {
-            let len = get_u32(pos)? as usize;
-            let s = std::str::from_utf8(bytes.get(*pos..*pos + len)?).ok()?.to_owned();
-            *pos += len;
-            Some(s)
-        };
-        if get_str(&mut pos)
-            .is_some_and(|fp| fp == baseline_fp || fp.starts_with("SINCE:"))
-            && let Some(count) = get_u32(&mut pos)
-        {
-            for _ in 0..count {
-                if let (Some(p), Some(txt)) = (get_str(&mut pos), get_str(&mut pos)) {
-                    baseline_by_path.insert(PathBuf::from(p), txt);
-                }
-            }
-        }
-    }
-    let save_baseline = |bp: Option<&Path>, fp: &str, map: &FxHashMap<PathBuf, String>| {
-        let Some(bp) = bp else { return };
-        let mut out = Vec::with_capacity(64 * 1024);
-        let put_str = |out: &mut Vec<u8>, s: &str| {
-            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            out.extend_from_slice(s.as_bytes());
-        };
-        out.extend_from_slice(b"RUSTDBAS");
-        put_str(&mut out, fp);
-        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
-        for (k, v) in map {
-            put_str(&mut out, &k.to_string_lossy());
-            put_str(&mut out, v);
-        }
-        let _ = std::fs::write(bp, out);
-    };
-    let mut offline_restore = ChangeWithProcMacros::default();
-    let mut has_offline_restore = false;
-    for wf in &mut files {
-        if let Watched::Source(id) = wf.file
-            && let Some(orig_text) = baseline_by_path.get(&wf.path)
-            && db.file_text(id).text(&db).as_ref() != orig_text.as_str()
-        {
-            offline_restore.change_file(id, Some(orig_text.clone()));
-            wf.mtime = SystemTime::UNIX_EPOCH;
-            has_offline_restore = true;
-        }
-    }
-    if has_offline_restore {
-        db.apply_change(offline_restore);
-    }
-    ide_db::executions::take(&db);
     let sources: Vec<_> = files
         .iter()
         .filter_map(|it| match it.file {
@@ -3380,192 +2772,455 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let mut tree = tree::Tree::new(&db, vfs, &sources);
+
+    let start = Instant::now();
+    let mut resolved = resolve_crates(&db, &args)?;
+    // Resolving the names finds the files `include!` names that were not loaded. With those
+    // in, there may be more.
+    while WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+        resolved = resolve_crates(&db, &args)?;
+    }
+    eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+    memory::checkpoint("resolve");
+    // What the other checkouts don't share with this one, before a request waits for it.
+    for also in &args.also {
+        let start = Instant::now();
+        let Parts { root: checkout, base, members } = checkouts.parts(also)?;
+        let resolved = resolve_crates(&db, &Args { checkout, base, members, ..args.clone() })?;
+        eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
+    }
+    if !args.also.is_empty() {
+        report_sharing(&db);
+    }
+
+    anyhow::ensure!(args.patch.is_none() || args.isolate.is_none(), "--patch with --isolate");
+    anyhow::ensure!(
+        args.splice.is_none() || (args.patch.is_some() && args.link_cmd.is_some()),
+        "--binary without --patch and --link-cmd"
+    );
+    let report_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !PROBING.get() && !INTERRUPTING.load(Ordering::SeqCst) {
+            report_panic(info);
+        }
+    }));
+    let mut known = Rejections::default();
+    known.patching = args.patch.is_some();
+    let listed = Arc::new(Listed::default());
+    let mut outlines = outline::Outlines::default();
+    let table = table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
+    let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
+    // What rustc compiled, by where in the checkout it is: the files as this build read them.
+    let as_compiled: FxHashMap<PathBuf, triomphe::Arc<str>> = files
+        .iter()
+        .filter_map(|it| {
+            let Watched::Source(id) = it.file else { return None };
+            let inside = it.path.strip_prefix(&args.checkout).ok()?;
+            Some((inside.to_owned(), db.file_text(id).text(&db).clone()))
+        })
+        .collect();
+    args.as_compiled = Arc::new(as_compiled.clone());
+    let mut cold = build(&db, &table, &args, &mut known, &listed)?;
+    // An `include!` in a body is first seen when the body is compiled.
+    if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+        known.touch(&db, None);
+        cold = build(&db, &table, &args, &mut known, &listed)?;
+    }
+    eprint!("cold: ");
+    report(&cold);
+    memory::report(&mut db, "build")?;
+    report_stats(&known.stats);
+    if std::env::var_os("RUSTD_SKIP_COLD_LINK").is_some() && cold.compiled == 0 {
+        if let (Some(binary), Some(patch)) = (&args.splice, &args.patch)
+            && binary.exists()
+        {
+            let linked = Executable::Linked(Linked::read(binary.clone(), patch, &args.out));
+            LINKED.lock().unwrap().insert(binary.clone(), linked);
+        }
+    } else {
+        link(
+            args.link_cmd.as_deref(),
+            args.splice.as_deref(),
+            args.patch.as_deref(),
+            &args.out,
+            false,
+        )?;
+    }
+    // What this build added goes to the other machines while the daemon waits for edits; a
+    // build that is not a daemon's has nothing to wait for but this.
+    let sending = shared.map(|shared| std::thread::spawn(move || shared.push()));
+    if let Some(sending) = sending.filter(|_| args.socket.is_none() && !args.watch) {
+        _ = sending.join();
+    }
+    hir::attach_db(&db, || known.out_of_date(&db));
     let listener = match &args.socket {
         Some(path) => {
             // A socket file left by a daemon that is gone can't be bound again.
             let _ = std::fs::remove_file(path);
-            let bind_path = std::env::current_dir()
-                .ok()
-                .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
-                .unwrap_or_else(|| path.clone());
-            let l = UnixListener::bind(&bind_path)?;
-            if args.watch {
-                l.set_nonblocking(true)?;
-            }
-            Some(l)
+            Some(UnixListener::bind(path)?)
         }
-        None => None,
+        None if args.watch => None,
+        None => return Ok(()),
     };
-    let mut unprimed_crates: Vec<Crate> = if args.krate.is_none() {
-        let bin_crate = std::env::var("RUSTD_BIN_CRATE").ok();
-        Crate::all(&db)
-            .into_iter()
-            .filter(|it| {
-                it.origin(&db).is_local()
-                    && bin_crate.as_deref().is_some_and(|bc| {
-                        it.display_name(&db).is_some_and(|n| n.crate_name().as_str() == bc)
-                    })
-            })
-            .collect()
-    } else {
-        Vec::new()
+
+    // The first change after a build of everything waits for what that build left behind.
+    // Paid here, the first edit does not.
+    {
+        use ide_db::base_db::salsa::{Database, Durability};
+        db.synthetic_write(Durability::LOW);
+    }
+    memory::report(&mut db, "warm-up")?;
+    eprintln!("watching {} files", files.len());
+    ide_db::executions::take(&db);
+    // Requests wait here while a build is under way, and those that have come by the time it
+    // is done are built together.
+    let (sender, events) = std::sync::mpsc::channel();
+    let serving = listener.is_some();
+    if let Some(listener) = listener {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            while let Ok(request) = requested(&listener) {
+                if sender.send(Event::Asked(request)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // The first is the program asked for when a request names none.
+    let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
+    let mut programs = vec![Program {
+        args,
+        table: Arc::new(table),
+        known,
+        unbuilt: Unbuilt::default(),
+        wrote,
+        whole,
+        interrupted: 0,
+        moved: false,
+    }];
+    let overlay = match std::env::var("RUSTD_OVERLAY").as_deref() {
+        Ok("0") => Overlay::Never,
+        Ok(_) => Overlay::Always,
+        Err(_) => Overlay::Quick,
     };
-    let check_root = args.root()?;
-    let initial_empty_base_o = args.out.clone();
-    let mut loaded_symbol_files: FxHashSet<PathBuf> =
-        args.symbol_files.iter().cloned().collect();
-    let mut check_report_path = args.out.with_extension("check.txt");
-    let _ = std::fs::write(&check_report_path, "errors=0 warnings=0 us=0\n");
-    let mut last_check_report = CheckReport::default();
-    let mut last_failed: Option<String> = None;
-    let mut last_baseline_mtime: Option<SystemTime> = baseline_cache_path
-        .as_ref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok());
+    let mut builds =
+        Builds { events, running: FxHashMap::default(), waiting: Default::default(), stuck: false };
+    // How many times running each checkout that is read as a loaded one has been long to turn
+    // to or from.
+    let mut slow: FxHashMap<PathBuf, u32> = FxHashMap::default();
+    // The ones that are loaded instead from the next time on.
+    let mut given_up: FxHashSet<PathBuf> = FxHashSet::default();
+    let slow_switch = std::env::var("RUSTD_SLOW_SWITCH_MS")
+        .ok()
+        .and_then(|it| it.parse().ok())
+        .map_or(SLOW_SWITCH, Duration::from_millis);
+    // The links under way that no build waits for, by the object each is of.
+    let mut links: FxHashMap<PathBuf, std::thread::JoinHandle<()>> = FxHashMap::default();
+    // What the files were like when each object was last built and linked.
+    let as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>> = Arc::default();
+    // The checkout each loaded one is read from, when that is not itself.
+    let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
+    // The manifests that have changed since they were loaded, as they were then.
+    let mut manifests: FxHashMap<vfs::FileId, String> = FxHashMap::default();
+    // The crates whose variables name another checkout than the one they were loaded in.
+    let mut placed = Placed::default();
     loop {
-        if !args.project.exists() || args.socket.as_ref().is_some_and(|s| !s.exists()) {
-            return Ok(());
+        if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
+            builds.settle(&mut db, &mut programs)?;
         }
-        if WatchedFile::watch_included(&mut files, &mut db) {
-            known.touch(&db, None);
+        if WatchedFile::watch_included(&mut files, &mut db)
+            | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
+        {
+            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
         }
-        let mut client = match &listener {
-            Some(listener) => requested(listener, args.watch)?,
-            None => {
-                std::thread::sleep(Duration::from_millis(5));
-                None
-            }
-        };
-        let mut switched_target = false;
-        if let Some((Request::Switch { ref bin_crate, ref out, ref patch, ref link_cmd }, _)) = client {
-            let cur_bc = std::env::var("RUSTD_BIN_CRATE").unwrap_or_default();
-            if cur_bc != *bin_crate || args.out != *out {
-                unsafe {
-                    std::env::set_var("RUSTD_BIN_CRATE", bin_crate);
+        // The program each client asks for.
+        let mut clients: Vec<(usize, Asked)> = Vec::new();
+        // Where each of those programs is to be written.
+        let mut outputs: FxHashMap<usize, Outputs> = FxHashMap::default();
+        // The checkout each loaded one has to be read from for them.
+        let mut looked: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
+        match serving {
+            true => {
+                let mut later = Vec::new();
+                if builds.stuck || builds.waiting.is_empty() {
+                    let event = builds.events.recv()?;
+                    builds.take(event, &mut programs)?;
                 }
-                if let Some(target_dir) = out.parent()
-                    && let Ok(rlibs_txt) = std::fs::read_to_string(target_dir.join("rlibs.txt"))
-                {
-                    let new_files: Vec<PathBuf> = rlibs_txt
-                        .lines()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(PathBuf::from)
-                        .filter(|p| p.exists() && loaded_symbol_files.insert(p.clone()))
-                        .collect();
-                    if !new_files.is_empty()
-                        && let Ok(extra) = SymbolTable::load(&new_files, &check_root)
-                    {
-                        table.merge(extra);
+                loop {
+                    // Asked again after each: a checkout that joins takes long enough for the
+                    // requests sent with its own to arrive.
+                    while let Ok(event) = builds.events.try_recv() {
+                        builds.take(event, &mut programs)?;
                     }
-                }
-                if !out.exists() && initial_empty_base_o.exists() {
-                    let _ = std::fs::copy(&initial_empty_base_o, out);
-                    let _ = std::fs::copy(&initial_empty_base_o, patch);
-                }
-                if !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
-                    let _ = inject_hotpatch_rt(out, patch, &check_root);
-                }
-                args.out = out.clone();
-                args.patch = Some(patch.clone());
-                args.link_cmd = Some(link_cmd.clone());
-                baseline_cache_path = Some(args.out.with_extension("baseline.cache"));
-                check_report_path = args.out.with_extension("check.txt");
-                cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
-                if cold_bin_path.as_ref().is_some_and(|bp| !bp.exists()) {
-                    let _ = link(&args);
-                }
-                bin_index = cold_bin_path
-                    .as_ref()
-                    .filter(|p| p.exists())
-                    .and_then(|bp| incremental_link::BinaryIndex::from_cold_binary(bp));
-                last_baseline_mtime = None;
-                switched_target = true;
-            }
-        }
-        let cur_baseline_mtime = baseline_cache_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok());
-        if cur_baseline_mtime != last_baseline_mtime {
-            last_baseline_mtime = cur_baseline_mtime;
-            let mut new_base: FxHashMap<PathBuf, String> = FxHashMap::default();
-            if let Some(bp) = &baseline_cache_path
-                && let Ok(bytes) = std::fs::read(bp)
-                && bytes.starts_with(b"RUSTDBAS")
-            {
-                let mut pos = 8usize;
-                let get_u32 = |pos: &mut usize| -> Option<u32> {
-                    let v = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?);
-                    *pos += 4;
-                    Some(v)
-                };
-                let get_str = |pos: &mut usize| -> Option<String> {
-                    let len = get_u32(pos)? as usize;
-                    let s = std::str::from_utf8(bytes.get(*pos..*pos + len)?).ok()?.to_owned();
-                    *pos += len;
-                    Some(s)
-                };
-                if get_str(&mut pos).is_some()
-                    && let Some(count) = get_u32(&mut pos)
-                {
-                    for _ in 0..count {
-                        if let (Some(p), Some(txt)) = (get_str(&mut pos), get_str(&mut pos)) {
-                            new_base.insert(PathBuf::from(p), txt);
-                        }
-                    }
-                }
-            }
-            let mut base_change = ChangeWithProcMacros::default();
-            let mut has_base_change = false;
-            for wf in &mut files {
-                if let Watched::Source(id) = wf.file {
-                    if let Some(orig_text) = new_base.get(&wf.path) {
-                        let cur_orig = initial_texts
-                            .get(&id)
-                            .cloned()
-                            .unwrap_or_else(|| db.file_text(id).text(&db).clone());
-                        if cur_orig.as_ref() != orig_text.as_str() {
-                            base_change.change_file(id, Some(orig_text.clone()));
-                            initial_texts.remove(&id);
-                            initial_adts.remove(&id);
-                            for &krate in ide_db::base_db::relevant_crates(&db, id) {
-                                let l = listed.of(&db, Crate::from(krate));
-                                hir::attach_db(&db, || {
-                                    for &func in &l.functions {
-                                        let f = func
-                                            .lookup(&db)
-                                            .id
-                                            .file_id
-                                            .original_file_respecting_includes(&db)
-                                            .file_id(&db);
-                                        if f == id {
-                                            initial_serials.remove(&func);
-                                        }
-                                    }
-                                });
+                    let Some((request, target, stream)) = builds.waiting.pop_front() else {
+                        break;
+                    };
+                    if let Request::Backtest(faults) = request {
+                        builds.settle(&mut db, &mut programs)?;
+                        let p = &programs[0];
+                        match impact::run_backtest(&db, &p.table, &p.args, &listed, faults) {
+                            Ok((caught, total, report_path)) => {
+                                let _ = writeln!(
+                                    &stream,
+                                    "ok backtest caught={caught} total={total} report={}",
+                                    report_path.display()
+                                );
                             }
-                            wf.mtime = SystemTime::UNIX_EPOCH;
-                            has_base_change = true;
+                            Err(e) => {
+                                let _ = writeln!(&stream, "error: {e:#}");
+                            }
                         }
-                    } else if dirty_files.remove(&id)
-                        && let Ok(disk_txt) = std::fs::read_to_string(&wf.path)
+                        continue;
+                    }
+                    let asked = target.clone();
+                    let mut target = target;
+                    let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
+                        Some(project) => {
+                            // What a checkout reads is known once a build of it is over.
+                            let pending = WatchedFile::unwatched(&files, &db);
+                            let built: Vec<&Path> = programs
+                                .iter()
+                                .enumerate()
+                                .filter(|(at, it)| {
+                                    it.whole.is_some() && !builds.running.contains_key(at)
+                                })
+                                .map(|(_, it)| &*it.args.checkout)
+                                .collect();
+                            let quick = |base: &Path, over: &Path| {
+                                !pending && built.contains(&base) && !given_up.contains(over)
+                            };
+                            checkouts.view_of(project, overlay, &quick)
+                        }
+                        None => {
+                            let base = programs[0].args.checkout.clone();
+                            let project = programs[0].args.project.clone();
+                            Some(View { over: base.clone(), base, project })
+                        }
+                    };
+                    // A checkout read as another that is as it was built takes no turn.
+                    if let (Some(view), Some(target)) = (&view, &target) {
+                        let unchanged = !impact::needs_test_selection(&target.out)
+                            && links.get(&target.out).is_none_or(|it| it.is_finished())
+                            && as_built
+                                .lock()
+                                .unwrap()
+                                .get(&target.out)
+                                .is_some_and(|it| it.still(&files, &db, view, target, request));
+                        if unchanged {
+                            let _ = writeln!(&stream, "ok unchanged");
+                            continue;
+                        }
+                    }
+                    // One build reads a checkout from one place, and one that has packages of
+                    // another reads that one as it is.
+                    let shares = view
+                        .as_ref()
+                        .and_then(|it| checkouts.shares_with(&it.base))
+                        .map(Path::to_owned);
+                    if let Some(view) = &view
+                        && (looked.get(&view.base).is_some_and(|over| *over != view.over)
+                            || shares.as_ref().is_some_and(|base| {
+                                looked.get(base).is_some_and(|over| over != base)
+                            }))
                     {
-                        base_change.change_file(id, Some(disk_txt));
-                        initial_texts.remove(&id);
-                        initial_adts.remove(&id);
-                        wf.mtime = SystemTime::UNIX_EPOCH;
-                        has_base_change = true;
+                        later.push((request, target, stream));
+                        continue;
+                    }
+                    if let (Some(view), Some(target)) = (&view, &mut target)
+                        && target.project.is_some()
+                    {
+                        target.project = Some(view.project.clone());
+                    }
+                    let shared = view.as_ref().is_some_and(|view| {
+                        view.base != view.over || viewed.contains_key(&view.base)
+                    });
+                    let known = match (&target, &view) {
+                        (Some(target), _) if programs.iter().any(|it| target.is(&it.args)) => {
+                            programs.iter().position(|it| target.is(&it.args))
+                        }
+                        // The checkouts read as one share its programs.
+                        (Some(target), Some(view)) if shared => programs.iter().position(|it| {
+                            it.args.krate == target.krate && it.args.checkout == view.base
+                        }),
+                        (Some(_), _) => None,
+                        (None, _) => Some(0),
+                    };
+                    let wanted = match &target {
+                        Some(target) => Outputs {
+                            out: target.out.clone(),
+                            patch: target.patch.clone(),
+                            link_cmd: target.link_cmd.clone(),
+                            splice: target.splice.clone(),
+                        },
+                        None => Outputs::of(&programs[0].args),
+                    };
+                    if let Some(at) = known {
+                        if builds.running.contains_key(&at)
+                            || outputs.get(&at).is_some_and(|it| *it != wanted)
+                        {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        outputs.insert(at, wanted);
+                        if let Some(view) = view {
+                            looked.insert(view.base, view.over);
+                        }
+                        if let Some(base) = shares {
+                            looked.insert(base.clone(), base);
+                        }
+                        clients.push((at, (request, asked, stream)));
+                        continue;
+                    }
+                    let Some(target) = target else { continue };
+                    // A checkout the daemon has not seen joins the ones it has.
+                    let joined = match &target.project {
+                        Some(project) if view.is_none() => {
+                            builds.settle(&mut db, &mut programs)?;
+                            let start = Instant::now();
+                            let joined =
+                                join(project, &mut checkouts, &mut db, &mut tree, &mut files);
+                            eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
+                            joined
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Some(view) = view {
+                        looked.insert(view.base, view.over);
+                    }
+                    let shares = target
+                        .project
+                        .as_ref()
+                        .and_then(|it| checkouts.parts(it).ok())
+                        .and_then(|it| checkouts.shares_with(&it.root).map(Path::to_owned));
+                    if let Some(base) = shares {
+                        // Whoever else reads it in this build reads it so.
+                        if looked.get(&base).is_some_and(|over| *over != base) {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        looked.insert(base.clone(), base);
+                    }
+                    let mut known = Rejections::default();
+                    known.patching = target.patch.is_some();
+                    let loaded = joined
+                        .and_then(|()| target.args(&programs[0].args, &checkouts))
+                        .and_then(|args| {
+                            // The symbols of a checkout are those of the one it shares
+                            // packages with, which rustc built.
+                            let shared = programs.iter().find(|it| {
+                                it.args.symbol_files == args.symbol_files
+                                    && (it.args.checkout == args.checkout
+                                        || Some(&it.args.checkout) == args.base.as_ref())
+                            });
+                            let table = match shared {
+                                Some(program) => program.table.clone(),
+                                None => {
+                                    Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?)
+                                }
+                            };
+                            Ok((args, table))
+                        });
+                    match loaded {
+                        Ok((args, table)) => {
+                            // Never built: every file is as good as edited, but those were
+                            // checked when the programs before it were built.
+                            let unbuilt = Unbuilt {
+                                edited: programs[0].unbuilt.edited.clone(),
+                                stale: true,
+                                unlinked: false,
+                            };
+                            let mut program = Program {
+                                args,
+                                table,
+                                known,
+                                unbuilt,
+                                wrote: None,
+                                whole: None,
+                                interrupted: 0,
+                                moved: false,
+                            };
+                            if let Some(built) =
+                                programs.iter().find(|it| it.same_as(&db, &program))
+                            {
+                                program.known = built.known.clone();
+                                program.unbuilt.stale = false;
+                                program.whole = built.whole.clone();
+                            }
+                            let first = program.args.symbol_files == programs[0].args.symbol_files;
+                            program.distrust_rustc(&db, &files, first.then_some(&as_compiled));
+                            clients.push((programs.len(), (request, asked, stream)));
+                            outputs.insert(programs.len(), wanted);
+                            programs.push(program);
+                        }
+                        // A request for what can't be built is the client's mistake.
+                        Err(e) => {
+                            let _ = writeln!(&stream, "error: {e:#}");
+                        }
                     }
                 }
+                builds.waiting.extend(later);
+                builds.stuck = clients.is_empty();
+                if builds.stuck {
+                    continue;
+                }
+                // A package that was the same in two checkouts may have been edited in one.
+                let start = Instant::now();
+                let differences = checkouts.differences()?;
+                if !differences.is_empty() {
+                    builds.settle(&mut db, &mut programs)?;
+                    checkouts.share(&mut db, tree.vfs(), differences)?;
+                    watch_loaded(&mut db, &mut tree, &mut files);
+                    for program in &mut programs {
+                        let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
+                        program.moved |= program.args.members != members;
+                        (program.args.base, program.args.members) = (base, members);
+                        program.unbuilt.stale = true;
+                        program.known.touch(&db, None);
+                    }
+                    listed.touch(&db, None);
+                    eprintln!("split again: {:.1?}", start.elapsed());
+                }
             }
-            baseline_by_path = new_base;
-            if has_base_change {
-                db.apply_change(base_change);
+            false => std::thread::sleep(Duration::from_millis(5)),
+        }
+        // The checkouts that are read from somewhere else than for the last build. Their files
+        // have the times of another checkout, so they are compared by what is in them.
+        let mut switched = Vec::new();
+        // The checkouts this build stops or starts reading a loaded one from.
+        let mut turned = Vec::new();
+        // The crates that are told another place than for the last build.
+        let mut moved = Vec::new();
+        for (base, over) in looked {
+            if *viewed.get(&base).unwrap_or(&base) != over {
+                eprintln!("view: {} as {}", over.display(), base.display());
+                builds.settle(&mut db, &mut programs)?;
+                turned.extend(viewed.get(&base).map(|it| (base.clone(), it.clone())));
+                turned.extend((base != over).then(|| (base.clone(), over.clone())));
+                db.set_view(&base, &over, built_in(&db, &base));
+                moved.extend(place(&mut db, &base, &over, &mut placed));
+                tree.relist(&base);
+                if base == over {
+                    viewed.remove(&base);
+                } else {
+                    viewed.insert(base.clone(), over);
+                }
+                switched.push(base);
             }
         }
-        let mut noticed = (switched_target && !dirty_files.is_empty())
-            .then(|| (Instant::now(), Duration::ZERO));
+        // A checkout read as another is read so by every build, so those are waited for.
+        let background = serving && overlay != Overlay::Always && viewed.is_empty();
+        // Checkouts read as one are built in turn, so their links don't take the turn.
+        let detached = serving && !viewed.is_empty();
+        for (&at, wanted) in &outputs {
+            let program = &mut programs[at];
+            program.unbuilt.stale |= program.wrote.as_ref() != Some(&wanted.out);
+            // The files a link reads and writes are not written again under it.
+            if let Some(link) = links.remove(&wanted.out) {
+                _ = link.join();
+            }
+            as_built.lock().unwrap().remove(&wanted.out);
+        }
+        let mut noticed = None;
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
         // Files are read after that: a timestamp can be that of a write still under way, and
         // the rest of that write may not change it again. Whoever asks for a build has finished
@@ -3574,7 +3229,9 @@ fn main() -> anyhow::Result<()> {
         // Source files that are no longer there.
         let mut gone = FxHashSet::default();
         loop {
-            let had_client = client.is_some();
+            if tree.relisted(&db) {
+                builds.settle(&mut db, &mut programs)?;
+            }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
             for (file, path) in tree.added(&mut db).added {
                 files.push(WatchedFile {
@@ -3584,359 +3241,62 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             let before = touched.len() + gone.len();
-            if files.len() > 256 {
-                let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(8);
-                let chunk_size = files.len().div_ceil(threads).max(1);
-                let results: Vec<Vec<(usize, Option<SystemTime>)>> = std::thread::scope(|scope| {
-                    files
-                        .chunks(chunk_size)
-                        .enumerate()
-                        .map(|(c_idx, chunk)| {
-                            let base = c_idx * chunk_size;
-                            scope.spawn(move || {
-                                let mut changes = Vec::new();
-                                for (off, file) in chunk.iter().enumerate() {
-                                    match std::fs::metadata(&file.path).and_then(|m| m.modified()) {
-                                        Ok(now) if now != file.mtime => {
-                                            changes.push((base + off, Some(now)));
-                                        }
-                                        Err(_) => {
-                                            changes.push((base + off, None));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                changes
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .map(|h| h.join().unwrap_or_default())
-                        .collect()
-                });
-                for (index, opt_now) in results.into_iter().flatten() {
-                    match opt_now {
-                        Some(now) => {
-                            gone.remove(&index);
-                            files[index].mtime = now;
-                            touched.insert(index);
-                            noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
-                        }
-                        None => {
-                            if matches!(files[index].file, Watched::Source(_)) && gone.insert(index) {
-                                touched.remove(&index);
-                                noticed.get_or_insert((Instant::now(), Duration::ZERO));
-                            }
-                        }
+            for (index, file) in files.iter_mut().enumerate() {
+                let on_disk = db.on_disk(&file.path);
+                let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
+                    if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
+                        touched.remove(&index);
+                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
-                }
-            } else {
-                for (index, file) in files.iter_mut().enumerate() {
-                    let Ok(now) = std::fs::metadata(&file.path).and_then(|m| m.modified()) else {
-                        if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
-                            touched.remove(&index);
-                            noticed.get_or_insert((Instant::now(), Duration::ZERO));
-                        }
-                        continue;
+                    continue;
+                };
+                gone.remove(&index);
+                if switched.iter().any(|base| file.path.starts_with(base)) {
+                    file.mtime = now;
+                    let same = match file.file {
+                        Watched::Source(id) => std::fs::read_to_string(&on_disk)
+                            .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
+                        Watched::Included(ref path) => db.included_is_read(path),
                     };
-                    gone.remove(&index);
-                    if now != file.mtime {
-                        file.mtime = now;
+                    if !same {
                         touched.insert(index);
-                        noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
+                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
+                } else if now != file.mtime {
+                    file.mtime = now;
+                    touched.insert(index);
+                    noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
                 }
             }
-            if client.is_none()
-                && let Some(listener) = &listener
-            {
-                client = requested(listener, true)?;
-            }
-            if had_client || (client.is_none() && touched.len() + gone.len() == before) {
+            switched.clear();
+            if touched.len() + gone.len() == before || !clients.is_empty() {
                 break;
             }
-            if client.is_none() {
-                std::thread::sleep(Duration::from_millis(1));
-                if let Some(listener) = &listener {
-                    client = requested(listener, true)?;
-                }
-            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        let Some((noticed, age)) = noticed else {
-            if let Some((req, client)) = client {
-                if matches!(req, Request::Sync) {
-                    let t0 = Instant::now();
-                    let inc = bin_index
-                        .as_ref()
-                        .zip(args.patch.as_deref())
-                        .and_then(|(idx, p)| idx.incremental_link(p));
-                    if let Some(patched) = inc {
-                        let elapsed = t0.elapsed();
-                        eprintln!("incremental-link: {elapsed:.1?} ({patched} fns)");
-                        let _ = writeln!(
-                            &client,
-                            "ok synced={} functions={patched} ms={}",
-                            bin_index.as_ref().unwrap().bin_path.display(),
-                            elapsed.as_millis()
-                        );
-                    } else if let Err(e) = link(&args) {
-                        let _ = writeln!(&client, "error: {e}");
-                    } else {
-                        let _ = writeln!(
-                            &client,
-                            "ok synced={} ms={}",
-                            args.out.display(),
-                            t0.elapsed().as_millis()
-                        );
-                    }
-                } else if matches!(req, Request::Check | Request::Clippy) {
-                    if matches!(req, Request::Clippy) && dirty_files.is_empty() {
-                        let t0 = Instant::now();
-                        let paths: FxHashMap<vfs::FileId, PathBuf> = files
-                            .iter()
-                            .filter_map(|it| match it.file {
-                                Watched::Source(id) => Some((id, it.path.clone())),
-                                Watched::Included(_) => None,
-                            })
-                            .collect();
-                        let mut target_files = Vec::new();
-                        if let Ok(bc) = std::env::var("RUSTD_BIN_CRATE")
-                            && let Ok(bin_crates) = crates_named(&db, &bc.replace('-', "_"))
-                        {
-                            let mut seen_f = FxHashSet::default();
-                            for c in bin_crates {
-                                let l = listed.of(&db, c);
-                                hir::attach_db(&db, || {
-                                    for &func in &l.functions {
-                                        let fid = func
-                                            .lookup(&db)
-                                            .id
-                                            .file_id
-                                            .original_file_respecting_includes(&db)
-                                            .file_id(&db);
-                                        if seen_f.insert(fid) {
-                                            target_files.push(fid);
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        let rep = clippy_files_diagnostics(
-                            &db,
-                            &target_files,
-                            &[],
-                            &paths,
-                            &check_root,
-                        );
-                        let check_us = t0.elapsed().as_micros();
-                        let file_body = format!(
-                            "errors={} warnings={} us={}\n{}",
-                            rep.errors, rep.warnings, check_us, rep.rendered
-                        );
-                        let _ = std::fs::write(&check_report_path, &file_body);
-                        let _ = writeln!(
-                            &client,
-                            "ok check errors={} warnings={} ms={} report={}",
-                            rep.errors,
-                            rep.warnings,
-                            t0.elapsed().as_millis(),
-                            check_report_path.display()
-                        );
-                    } else {
-                        let _ = writeln!(
-                            &client,
-                            "ok check errors={} warnings={} ms=0 report={}",
-                            last_check_report.errors,
-                            last_check_report.warnings,
-                            check_report_path.display()
-                        );
-                    }
-                } else if let Request::Backtest(n) = req {
-                    if !resolved_deps {
-                        let _ = resolve_crates(&db, &args);
-                        resolved_deps = true;
-                    }
-                    match run_backtest(&db, &table, &args, &mut listed, n) {
-                        Ok((caught, total, rep_path)) => {
-                            let _ = writeln!(
-                                &client,
-                                "ok backtest caught={caught} total={total} report={}",
-                                rep_path.display()
-                            );
-                        }
-                        Err(e) => {
-                            let _ = writeln!(&client, "error: {e}");
-                        }
-                    }
-                } else if matches!(req, Request::Rebase) {
-                    if let Some(why) = &last_failed {
-                        let _ = writeln!(&client, "error: {}", why.replace('\n', " "));
-                    } else {
-                        let t0 = Instant::now();
-                        let compacted_files = dirty_files.len();
-                        if !dirty_files.is_empty()
-                            && let Some(patch_path) = &args.patch
-                        {
-                            let mut seq = 1u32;
-                            let rebased_o = loop {
-                                let p = args.out.with_extension(format!("rebased.{seq}.o"));
-                                if !p.exists() {
-                                    break p;
-                                }
-                                seq += 1;
-                            };
-                            let _ = std::fs::copy(patch_path, &rebased_o);
-                            if let Some(link_sh) = &args.link_cmd
-                                && let Ok(sh_txt) = std::fs::read_to_string(link_sh)
-                            {
-                                let needle = format!("'{}'", patch_path.display());
-                                let replacement =
-                                    format!("'{}' '{}'", patch_path.display(), rebased_o.display());
-                                if sh_txt.contains(&needle) {
-                                    let _ = std::fs::write(
-                                        link_sh,
-                                        sh_txt.replacen(&needle, &replacement, 1),
-                                    );
-                                }
-                            }
-                            let _ = std::fs::copy(&args.out, patch_path);
-                        }
-                        if let Err(e) = link(&args) {
-                            let _ = writeln!(&client, "error: {e}");
-                        } else {
-                            if let Some(bp) = &cold_bin_path
-                                && bp.exists()
-                            {
-                                let _ = std::fs::copy(bp, bp.with_extension("base"));
-                                bin_index = incremental_link::BinaryIndex::from_cold_binary(bp);
-                            }
-                            for &df in &dirty_files {
-                                let txt = db.file_text(df).text(&db).clone();
-                                if let Some(wf) = files
-                                    .iter()
-                                    .find(|w| matches!(w.file, Watched::Source(wid) if wid == df))
-                                {
-                                    baseline_by_path.insert(wf.path.clone(), txt.to_string());
-                                }
-                                initial_texts.insert(df, txt);
-                                initial_adts.insert(
-                                    df,
-                                    hir::attach_db(&db, || snapshot_file_adts(&db, df)),
-                                );
-                                for &krate in ide_db::base_db::relevant_crates(&db, df) {
-                                    let l = listed.of(&db, Crate::from(krate));
-                                    hir::attach_db(&db, || {
-                                        for &func in &l.functions {
-                                            let f = func
-                                                .lookup(&db)
-                                                .id
-                                                .file_id
-                                                .original_file_respecting_includes(&db)
-                                                .file_id(&db);
-                                            if f == df {
-                                                initial_serials.insert(
-                                                    func,
-                                                    hir_ty::mir::codegen::function_tree_serial(
-                                                        &db, func,
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            dirty_files.clear();
-                            save_baseline(
-                                baseline_cache_path.as_deref(),
-                                &baseline_fp,
-                                &baseline_by_path,
-                            );
-                            let out_disp = cold_bin_path
-                                .as_deref()
-                                .unwrap_or(&args.out)
-                                .display();
-                            let _ = writeln!(
-                                &client,
-                                "ok rebased={out_disp} files={compacted_files} ms={}",
-                                t0.elapsed().as_millis()
-                            );
-                        }
-                    }
-                } else if let Some(why) = &last_failed {
-                    let _ = writeln!(&client, "error: {}", why.replace('\n', " "));
-                } else {
+        // Without clients, the first program is built whenever a file changes.
+        let building: FxHashSet<usize> = match serving {
+            true => clients.iter().map(|it| it.0).collect(),
+            false => FxHashSet::from_iter([0]),
+        };
+        for (at, (request, ..)) in &clients {
+            let need_sel = impact::needs_test_selection(&programs[*at].args.out);
+            let unbuilt = &mut programs[*at].unbuilt;
+            unbuilt.stale |= (unbuilt.unlinked && *request != Request::Patch) || need_sel;
+        }
+        let stale = building.iter().any(|&at| programs[at].unbuilt.stale) || !moved.is_empty();
+        let (noticed, age) = match noticed {
+            Some(noticed) => noticed,
+            None if stale => (Instant::now(), Duration::ZERO),
+            None => {
+                for (_, (_, _, client)) in clients {
                     let _ = writeln!(&client, "ok unchanged");
                 }
-            } else if !resolved_deps {
-                let start = Instant::now();
-                let resolved = resolve_crates(&db, &args)?;
-                eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
-                resolved_deps = true;
-            } else if let Some(krate) = unprimed_crates.pop() {
-                let l = listed.of(&db, krate);
-                let mut baseline_dirty = false;
-                hir::attach_db(&db, || {
-                    let _ = hir::TraitImpls::for_crate(&db, krate.into());
-                    let bin_crate = std::env::var("RUSTD_BIN_CRATE").ok();
-                    if bin_crate.as_deref().is_some_and(|bc| {
-                        krate.display_name(&db).is_some_and(|n| n.crate_name().as_str() == bc)
-                    }) {
-                        for &func in &l.functions {
-                            let f = func
-                                .lookup(&db)
-                                .id
-                                .file_id
-                                .original_file_respecting_includes(&db)
-                                .file_id(&db);
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                initial_texts.entry(f)
-                            {
-                                let txt = db.file_text(f).text(&db).clone();
-                                if let Some(wf) = files
-                                    .iter()
-                                    .find(|w| matches!(w.file, Watched::Source(wid) if wid == f))
-                                    && !baseline_by_path.contains_key(&wf.path)
-                                {
-                                    baseline_by_path.insert(wf.path.clone(), txt.to_string());
-                                    baseline_dirty = true;
-                                }
-                                e.insert(txt);
-                                initial_adts.insert(f, snapshot_file_adts(&db, f));
-                            }
-                            initial_serials.entry(func).or_insert_with(|| {
-                                hir_ty::mir::codegen::function_tree_serial(&db, func)
-                            });
-                        }
-                    }
-                });
-                let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-                let funcs = &l.functions;
-                std::thread::scope(|scope| {
-                    for part in 0..threads.min(funcs.len()) {
-                        let db = db.clone();
-                        scope.spawn(move || {
-                            hir::attach_db(&db, || {
-                                for &func in funcs.iter().skip(part).step_by(threads) {
-                                    let _ = hir_ty::mir::codegen::function_deps(&db, func);
-                                }
-                            });
-                        });
-                    }
-                });
-                if baseline_dirty {
-                    save_baseline(baseline_cache_path.as_deref(), &baseline_fp, &baseline_by_path);
-                }
-                if std::env::var_os("RUSTD_STATS").is_some() && unprimed_crates.is_empty() {
-                    eprintln!("primed workspace caches");
-                }
+                continue;
             }
-            continue;
         };
-        if !resolved_deps {
-            let start = Instant::now();
-            let resolved = resolve_crates(&db, &args)?;
-            eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
-            resolved_deps = true;
+        if touched.len() + gone.len() != 0 {
+            builds.settle(&mut db, &mut programs)?;
         }
         let settled = noticed.elapsed();
         let read = Instant::now();
@@ -3948,70 +3308,34 @@ fn main() -> anyhow::Result<()> {
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
                 outlines.before_edit(&db, &listed, id);
-                dirty_files.remove(&id);
                 change.change_file(id, None);
                 sources.push(id);
                 removed.push(id);
             }
         }
-        let mut baseline_dirty = false;
         for index in touched {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
-                    if !initial_texts.contains_key(id) {
-                        let orig_arc = db.file_text(*id).text(&db).clone();
-                        if !baseline_by_path.contains_key(path) {
-                            baseline_by_path.insert(path.clone(), orig_arc.to_string());
-                            baseline_dirty = true;
-                        }
-                        initial_texts.insert(*id, orig_arc);
-                        initial_adts
-                            .insert(*id, hir::attach_db(&db, || snapshot_file_adts(&db, *id)));
-                        if args.krate.is_none() {
-                            for &krate in ide_db::base_db::relevant_crates(&db, *id) {
-                                let l = listed.of(&db, Crate::from(krate));
-                                hir::attach_db(&db, || {
-                                    for &func in &l.functions {
-                                        let f = func
-                                            .lookup(&db)
-                                            .id
-                                            .file_id
-                                            .original_file_respecting_includes(&db)
-                                            .file_id(&db);
-                                        if f == *id {
-                                            initial_serials.entry(func).or_insert_with(|| {
-                                                hir_ty::mir::codegen::function_tree_serial(
-                                                    &db, func,
-                                                )
-                                            });
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    let orig = initial_texts.get(id).unwrap();
-                    let new_text = std::fs::read_to_string(path)?;
-                    if new_text == **orig {
-                        dirty_files.remove(id);
-                    } else {
-                        dirty_files.insert(*id);
-                    }
                     outlines.before_edit(&db, &listed, *id);
-                    change.change_file(*id, Some(new_text));
+                    if path.file_name().is_some_and(|it| it == "Cargo.toml") {
+                        manifests
+                            .entry(*id)
+                            .or_insert_with(|| db.file_text(*id).text(&db).to_string());
+                    }
+                    change.change_file(*id, Some(std::fs::read_to_string(db.on_disk(path))?));
                     sources.push(*id);
                 }
                 Watched::Included(path) => included.push(path.clone()),
             }
         }
-        if baseline_dirty {
-            save_baseline(baseline_cache_path.as_deref(), &baseline_fp, &baseline_by_path);
-        }
         let read = read.elapsed();
         eprintln!("change: {changed} files");
         let start = Instant::now();
-        db.apply_change(change);
+        // A write stops the builds under way, so nothing is written when nothing changed.
+        if changed != 0 || !background {
+            db.apply_change(change);
+        }
         if !removed.is_empty() {
             tree.remove(&mut db, &removed);
             let mut index = 0;
@@ -4022,220 +3346,449 @@ fn main() -> anyhow::Result<()> {
         }
         // Asked after the change: a file can have joined a crate with it.
         if !included.is_empty() {
-            known.touch(&db, None);
+            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
             listed.touch(&db, None);
         }
         for path in included {
             db.reload_included_file(&path);
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
-        let edited = sources.clone();
-        let sources = outlines.after_edit(&db, &listed, sources);
-        for (file, bodies_only) in sources {
-            if bodies_only {
-                if std::env::var_os("RUSTD_STATS").is_some() {
-                    eprintln!("bodies only: {file:?}");
-                }
-                known.touch_bodies(file);
-                continue;
-            }
-            let crates = ide_db::base_db::relevant_crates(&db, file);
-            let crates = (!crates.is_empty()).then_some(crates);
-            known.touch(&db, crates);
-            listed.touch(&db, crates);
+        for program in &mut programs {
+            let unbuilt = &mut program.unbuilt;
+            unbuilt.stale |= changed != 0;
+            unbuilt.edited.extend(&sources);
+            unbuilt.edited.sort_unstable();
+            unbuilt.edited.dedup();
         }
-        let apply = start.elapsed();
-        let (layout_warnings, changed_adts, changed_consts) =
-            detect_adt_layout_warnings(&db, &dirty_files, &initial_adts);
-        let paths: FxHashMap<vfs::FileId, PathBuf> = files
+        let paths: FxHashMap<_, _> = files
             .iter()
             .filter_map(|it| match it.file {
                 Watched::Source(id) => Some((id, it.path.clone())),
                 Watched::Included(_) => None,
             })
             .collect();
-        let mut check_files: Vec<vfs::FileId> = edited.clone();
-        for &df in &dirty_files {
-            if !check_files.contains(&df) {
-                check_files.push(df);
+        let paths = Arc::new(Sources { paths, manifests: manifests.clone() });
+        let sources = outlines.after_edit(&db, &listed, sources);
+        for (file, bodies_only) in sources {
+            if bodies_only {
+                if std::env::var_os("RUSTD_STATS").is_some() {
+                    eprintln!("bodies only: {file:?}");
+                }
+                programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
+                continue;
+            }
+            let crates = ide_db::base_db::relevant_crates(&db, file);
+            let crates = (!crates.is_empty()).then_some(crates);
+            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
+            listed.touch(&db, crates);
+        }
+        if !moved.is_empty() {
+            programs.iter_mut().for_each(|it| {
+                it.known.touch(&db, Some(&moved));
+                it.unbuilt.stale = true;
+            });
+            listed.touch(&db, Some(&moved));
+        }
+        let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
+        if background {
+            let mut asked: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
+            for (at, client) in clients {
+                asked.entry(at).or_default().push(client);
+            }
+            for (at, clients) in asked {
+                let program = &mut programs[at];
+                if !program.unbuilt.stale {
+                    for (_, _, client) in clients {
+                        let _ = writeln!(&client, "ok unchanged");
+                    }
+                    continue;
+                }
+                // The program is linked unless every client of it loads the patch.
+                let link = clients.iter().any(|it| it.0 != Request::Patch);
+                let patches = program.known.patches() && !program.moved;
+                let kept = patches || program.interrupted >= INTERRUPTIONS;
+                // What stands in for the program while it is built says what program it is.
+                let away = Program {
+                    args: program.args.clone(),
+                    table: program.table.clone(),
+                    known: Rejections::default(),
+                    unbuilt: Unbuilt::default(),
+                    wrote: None,
+                    whole: None,
+                    interrupted: program.interrupted,
+                    moved: program.moved,
+                };
+                let mut program = Box::new(std::mem::replace(program, away));
+                builds.running.insert(at, Running { clients, kept });
+                let (db, listed, paths, sender) =
+                    (db.clone(), listed.clone(), paths.clone(), sender.clone());
+                let wanted = outputs.remove(&at);
+                std::thread::spawn(move || {
+                    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link)
+                    }));
+                    // The write that interrupts waits for this.
+                    drop(db);
+                    let answer = match answer {
+                        _ if INTERRUPTING.load(Ordering::SeqCst) => None,
+                        Ok(answer) => Some(answer),
+                        Err(_) => Some(Err(anyhow::anyhow!("a build panicked"))),
+                    };
+                    let _ = sender.send(Event::Built(at, program, answer));
+                });
+            }
+            continue;
+        }
+        // The programs asked for are built side by side: nothing is written to the database
+        // until all of them are done, so none is interrupted.
+        let answers = loop {
+            let answers: Vec<(usize, anyhow::Result<Result<String, String>>)> =
+                std::thread::scope(|scope| {
+                    let builds: Vec<_> = programs
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(at, program)| building.contains(at) && program.unbuilt.stale)
+                        .map(|(at, program)| {
+                            // The program is linked unless every client of it loads the patch.
+                            let link = !clients.iter().any(|it| it.0 == at)
+                                || clients.iter().any(|it| it.0 == at && it.1.0 != Request::Patch);
+                            let link = link && !detached;
+                            let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
+                            let wanted = outputs.get(&at);
+                            let build = scope.spawn(move || {
+                                program.sync(&db, listed, paths, edit, wanted, link)
+                            });
+                            (at, build)
+                        })
+                        .collect();
+                    builds
+                        .into_iter()
+                        .map(|(at, build)| {
+                            let answer = build
+                                .join()
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("a build panicked")));
+                            (at, answer)
+                        })
+                        .collect()
+                });
+            // An `env!` the builds were the first to see was told the place of the loaded
+            // checkout.
+            let late: Vec<_> = viewed
+                .iter()
+                .flat_map(|(base, over)| place(&mut db, base, over, &mut placed))
+                .collect();
+            if late.is_empty() {
+                break answers;
+            }
+            for program in &mut programs {
+                program.known.touch(&db, Some(&late));
+                program.unbuilt.stale = true;
+            }
+            listed.touch(&db, Some(&late));
+        };
+        if std::env::var_os("RUSTD_TRACE").is_some() {
+            let ran: Vec<String> = ide_db::executions::take(&db)
+                .iter()
+                .take(400)
+                .map(|(query, count)| format!("{query}={count}"))
+                .collect();
+            eprintln!("ran: {}", ran.join(" "));
+            eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
+        }
+        // Turning from one that is given up on is the last time it is paid for.
+        if !turned.iter().any(|it| given_up.contains(&it.1)) {
+            let long = edit.start.elapsed() > slow_switch;
+            for (_, over) in &turned {
+                let times = slow.entry(over.clone()).or_default();
+                *times = if long { *times + 1 } else { 0 };
+            }
+            if turned.iter().any(|it| slow[&it.1] >= SLOW_SWITCHES) {
+                // Turning between two is as long for the one as for the other: the one that
+                // is further from what is loaded is what takes long.
+                let far = turned.iter().max_by_key(|(base, over)| {
+                    let differs = |file: &&WatchedFile| {
+                        let Ok(inside) = file.path.strip_prefix(base) else { return false };
+                        std::fs::read(&file.path).ok() != std::fs::read(over.join(inside)).ok()
+                    };
+                    files.iter().filter(differs).count()
+                });
+                given_up.extend(far.map(|it| it.1.clone()));
+                slow.clear();
             }
         }
-        let check_client = if matches!(client, Some((Request::Check | Request::Clippy, _))) {
-            client.take().map(|(_, s)| s)
-        } else {
-            None
-        };
-        // The check of the edited files does not wait for the build: it reads other things.
-        let (warm, check_rep) = std::thread::scope(|scope| {
-            let check = {
-                let (db, check_files, layout_warnings, paths, check_root, check_report_path) = (
-                    db.clone(),
-                    &check_files,
-                    &layout_warnings,
-                    &paths,
-                    &check_root,
-                    &check_report_path,
-                );
-                scope.spawn(move || {
-                    let t_check = Instant::now();
-                    let rep = clippy_files_diagnostics(
-                        &db,
-                        check_files,
-                        layout_warnings,
-                        paths,
-                        check_root,
-                    );
-                    let check_us = t_check.elapsed().as_micros();
-                    let file_body = format!(
-                        "errors={} warnings={} us={}\n{}",
-                        rep.errors, rep.warnings, check_us, rep.rendered
-                    );
-                    let tmp = check_report_path.with_extension("txt.tmp");
-                    if std::fs::write(&tmp, &file_body).is_ok() {
-                        let _ = std::fs::rename(&tmp, check_report_path);
-                    }
-                    if let Some(mut stream) = check_client {
-                        let _ = writeln!(
-                            stream,
-                            "ok check errors={} warnings={} ms={} report={}",
-                            rep.errors,
-                            rep.warnings,
-                            start.elapsed().as_millis(),
-                            check_report_path.display()
-                        );
-                    }
-                    rep
-                })
+        let mut replies = FxHashMap::default();
+        for (at, answer) in answers {
+            replies.insert(at, answer?);
+        }
+        let mut linking: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
+        for (at, asked) in clients {
+            let mut client = &asked.2;
+            let _ = match replies.get(&at) {
+                Some(Ok(_)) if detached => {
+                    linking.entry(at).or_default().push(asked);
+                    continue;
+                }
+                Some(Ok(built)) => writeln!(client, "ok {built}"),
+                Some(Err(why)) => writeln!(client, "error: {}", why.replace('\n', " ")),
+                None => writeln!(client, "ok unchanged"),
             };
-            let warm = build(
-                &db,
-                &table,
-                &args,
-                &mut known,
-                &mut listed,
-                &dirty_files,
-                &initial_serials,
-                &changed_adts,
-                &changed_consts,
-                false,
-            );
-            (warm, check.join().ok())
+        }
+        for (at, clients) in linking {
+            let Some(Ok(built)) = replies.remove(&at) else { continue };
+            let Outputs { out, link_cmd, patch, splice } =
+                outputs.remove(&at).unwrap_or_else(|| Outputs::of(&programs[at].args));
+            // The answer names a patch when the whole object is as it was.
+            let patched = built.starts_with("patch=");
+            let spliced = patch.clone();
+            let link_cmd = link_cmd.filter(|_| clients.iter().any(|it| it.0 != Request::Patch));
+            let sender = sender.clone();
+            let base = &programs[at].args.checkout;
+            let over = viewed.get(base).unwrap_or(base);
+            let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
+            let (as_built, object) = (as_built.clone(), out.clone());
+            let linked = std::thread::spawn(move || {
+                let failed = link(
+                    link_cmd.as_deref(),
+                    splice.as_deref(),
+                    spliced.as_deref(),
+                    &object,
+                    patched,
+                )
+                .err();
+                if failed.is_none() {
+                    as_built.lock().unwrap().insert(object, from);
+                }
+                for (_, _, client) in clients {
+                    let _ = match &failed {
+                        None => writeln!(&client, "ok {built}"),
+                        Some(why) => writeln!(&client, "error: {why}"),
+                    };
+                }
+                if failed.is_some() {
+                    let _ = sender.send(Event::Unlinked(at));
+                }
+            });
+            links.insert(out, linked);
+        }
+    }
+}
+
+/// What an object of a checkout read as another was built from, to tell whether it still is.
+struct Settled {
+    over: PathBuf,
+    patch: Option<PathBuf>,
+    /// `None` when it was not linked.
+    link_cmd: Option<String>,
+    /// The checkout's own files and their directories, with when each was written. Another
+    /// checkout may have other files, and a file that is new changes none of those there are.
+    own: Vec<(PathBuf, Option<SystemTime>)>,
+    /// When each file outside the checkout was written.
+    others: u64,
+}
+
+impl Settled {
+    /// To be asked once the build is over: the files are as old as they were when the build
+    /// started to read them.
+    fn of(
+        files: &[WatchedFile],
+        db: &RootDatabase,
+        base: &Path,
+        over: &Path,
+        patch: Option<PathBuf>,
+        link_cmd: Option<String>,
+    ) -> Settled {
+        let mut own = Vec::new();
+        let mut directories = FxHashSet::default();
+        for file in files.iter().filter(|it| it.path.starts_with(base)) {
+            let path = db.on_disk(&file.path);
+            if let Some(directory) = path.parent()
+                && path.starts_with(over)
+                && directories.insert(directory.to_owned())
+            {
+                own.push((directory.to_owned(), written(directory)));
+            }
+            own.push((path, Some(file.mtime)));
+        }
+        let others = Settled::others(files, base, |file| Some(file.mtime));
+        Settled { over: over.to_owned(), patch, link_cmd, own, others }
+    }
+
+    fn others(
+        files: &[WatchedFile],
+        base: &Path,
+        written: impl Fn(&WatchedFile) -> Option<SystemTime>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        for file in files.iter().filter(|it| !it.path.starts_with(base)) {
+            (&file.path, written(file)).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Whether a build for `request` would find the files as they were and write what is
+    /// there.
+    fn still(
+        &self,
+        files: &[WatchedFile],
+        db: &RootDatabase,
+        view: &View,
+        target: &Target,
+        request: Request,
+    ) -> bool {
+        let linked = request == Request::Patch || self.link_cmd.is_some();
+        // A file outside every checkout is read from where it is.
+        let outside = |file: &WatchedFile| written(&db.on_disk(&file.path));
+        self.over == view.over
+            && self.patch == target.patch
+            && linked
+            && (self.link_cmd.is_none() || self.link_cmd == target.link_cmd)
+            && target.out.exists()
+            && self.patch.as_ref().is_none_or(|it| it.exists())
+            && self.own.iter().all(|(path, at)| written(path) == *at)
+            && self.others == Settled::others(files, &view.base, outside)
+    }
+}
+
+fn written(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|it| it.modified()).ok()
+}
+
+/// A change to the files, and how long each step up to the builds took.
+#[derive(Clone, Copy)]
+struct Edit {
+    /// When the change was applied.
+    start: Instant,
+    age: Duration,
+    settled: Duration,
+    read: Duration,
+    apply: Duration,
+    /// How many files changed.
+    changed: usize,
+}
+
+impl Program {
+    /// Notes the crates rustc did not compile from the files this program is of, when it joins
+    /// linked with what rustc built: of the first checkout, whose files as the daemon read them
+    /// are `as_compiled`, or of its own checkout as it was when rustc built it.
+    fn distrust_rustc(
+        &mut self,
+        db: &RootDatabase,
+        files: &[WatchedFile],
+        as_compiled: Option<&FxHashMap<PathBuf, triomphe::Arc<str>>>,
+    ) {
+        let built = self
+            .args
+            .symbol_files
+            .iter()
+            .filter(|it| !it.components().any(|it| it.as_os_str() == "rustlib"))
+            .filter_map(|it| std::fs::metadata(it).ok()?.modified().ok())
+            .max();
+        let compiled_from = |file: &WatchedFile, id: vfs::FileId| {
+            let inside = file.path.strip_prefix(&self.args.checkout).ok()?;
+            Some(match as_compiled {
+                Some(as_compiled) => {
+                    let text = db.file_text(id).text(db);
+                    as_compiled.get(inside).is_some_and(|was| **was == **text)
+                }
+                None => file.mtime <= built?,
+            })
+        };
+        let other: Vec<_> = files
+            .iter()
+            .filter_map(|it| {
+                let Watched::Source(id) = it.file else { return None };
+                let fresh = compiled_from(it, id)?;
+                (!fresh).then(|| ide_db::base_db::relevant_crates(db, id).to_vec())
+            })
+            .flatten()
+            .collect();
+        self.known.distrust(db, &other);
+    }
+
+    /// Whether the last build of this program is one of `other`, which has had none: the two
+    /// are of the same crates, as checkouts that share them have it. What `other` is then
+    /// asked for is a patch of that build.
+    fn same_as(&self, db: &RootDatabase, other: &Program) -> bool {
+        let (ours, theirs) = (&self.args, &other.args);
+        let crates = |args: &Args| {
+            let names = std::iter::once(&args.krate).chain(&args.batch);
+            names.map(|it| crates_named(db, it, args).ok()).collect::<Option<Vec<_>>>()
+        };
+        !self.unbuilt.stale
+            && self.whole.is_some()
+            && self.known.patches()
+            && self.known.patching == other.known.patching
+            && Arc::ptr_eq(&self.table, &other.table)
+            && (ours.cfg_test, &ours.features) == (theirs.cfg_test, &theirs.features)
+            && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
+    }
+
+    /// Brings the program up to date with the database. The result is what to tell its
+    /// clients: what they have to load, or why the source can't be built.
+    fn sync(
+        &mut self,
+        db: &RootDatabase,
+        listed: &Listed,
+        paths: &Sources,
+        edit: &Edit,
+        wanted: Option<&Outputs>,
+        link_it: bool,
+    ) -> anyhow::Result<Result<String, String>> {
+        let Program { args, table, known, unbuilt, wrote, whole, .. } = self;
+        let Outputs { out, patch, link_cmd, splice } =
+            wanted.cloned().unwrap_or_else(|| Outputs::of(args));
+        let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
+        // A patch is for the object with all of the program, which this build may be the
+        // first to be asked for at this place.
+        if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
+            if !same_file::is_same_file(whole, &args.out).unwrap_or(false) {
+                _ = std::fs::remove_file(&args.out);
+                if std::fs::hard_link(whole, &args.out).is_err() {
+                    std::fs::copy(whole, &args.out)?;
+                }
+            }
+        }
+        let &Edit { start, age, settled, read, apply, changed } = edit;
+        // Another checkout's files are not this program's to be refused for.
+        let mut edited = unbuilt.edited.clone();
+        edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
+        // Neither is what no crate that is built reads: an example, or a test.
+        edited.retain(|&file| listed.sees(db, file));
+        // The check of the edited files does not wait for the build: it reads other things.
+        let (warm, broken) = std::thread::scope(|scope| {
+            let check = {
+                let (db, edited) = (db.clone(), &edited);
+                scope.spawn(move || broken_in(&db, edited))
+            };
+            let warm = build(db, table, args, known, listed);
+            (warm, check.join().ok().flatten())
         });
         let warm = warm?;
-        let broken = check_rep.as_ref().and_then(|r| r.first_summary.clone());
-        if let Some(rep) = check_rep {
-            last_check_report = rep;
+        if known.stats.patched.is_none() {
+            *whole = Some(args.out.clone());
         }
+        *wrote = Some(args.out.clone());
         let built = start.elapsed();
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
         let reported = start.elapsed();
-        let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
-        for w in &layout_warnings {
-            eprintln!("warning: {w}");
-        }
-        let mut failed = refusal(&db, &edited, &paths, out_of_date).or(broken);
-        let auto_compact = failed.is_none()
-            && (dirty_files.len() >= 32
-                || args
-                    .patch
-                    .as_ref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .is_some_and(|m| m.len() > 2 * 1024 * 1024));
-        let want_rebase = matches!(client, Some((Request::Rebase, _))) || auto_compact;
-        let is_live_patch = args.patch.is_some()
-            && known.stats.patched.is_some()
-            && !matches!(client, Some((Request::Sync, _)))
-            && !want_rebase;
-        if failed.is_none() && want_rebase {
-            if !dirty_files.is_empty()
-                && let Some(patch_path) = &args.patch
-            {
-                let mut seq = 1u32;
-                let rebased_o = loop {
-                    let p = args.out.with_extension(format!("rebased.{seq}.o"));
-                    if !p.exists() {
-                        break p;
-                    }
-                    seq += 1;
-                };
-                let _ = std::fs::copy(patch_path, &rebased_o);
-                if let Some(link_sh) = &args.link_cmd
-                    && let Ok(sh_txt) = std::fs::read_to_string(link_sh)
-                {
-                    let needle = format!("'{}'", patch_path.display());
-                    let replacement =
-                        format!("'{}' '{}'", patch_path.display(), rebased_o.display());
-                    if sh_txt.contains(&needle) {
-                        let _ = std::fs::write(link_sh, sh_txt.replacen(&needle, &replacement, 1));
-                    }
-                }
-                let _ = std::fs::copy(&args.out, patch_path);
-            }
-            if let Err(e) = link(&args) {
-                failed = Some(e.to_string());
-            } else {
-                if let Some(bp) = &cold_bin_path
-                    && bp.exists()
-                {
-                    let _ = std::fs::copy(bp, bp.with_extension("base"));
-                    bin_index = incremental_link::BinaryIndex::from_cold_binary(bp);
-                }
-                for &df in &dirty_files {
-                    let txt = db.file_text(df).text(&db).clone();
-                    if let Some(wf) = files
-                        .iter()
-                        .find(|w| matches!(w.file, Watched::Source(wid) if wid == df))
-                    {
-                        baseline_by_path.insert(wf.path.clone(), txt.to_string());
-                    }
-                    initial_texts.insert(df, txt);
-                    initial_adts
-                        .insert(df, hir::attach_db(&db, || snapshot_file_adts(&db, df)));
-                    for &krate in ide_db::base_db::relevant_crates(&db, df) {
-                        let l = listed.of(&db, Crate::from(krate));
-                        hir::attach_db(&db, || {
-                            for &func in &l.functions {
-                                let f = func
-                                    .lookup(&db)
-                                    .id
-                                    .file_id
-                                    .original_file_respecting_includes(&db)
-                                    .file_id(&db);
-                                if f == df {
-                                    initial_serials.insert(
-                                        func,
-                                        hir_ty::mir::codegen::function_tree_serial(&db, func),
-                                    );
-                                }
-                            }
-                        });
-                    }
-                }
-                dirty_files.clear();
-                save_baseline(baseline_cache_path.as_deref(), &baseline_fp, &baseline_by_path);
-            }
-        } else if failed.is_none() && !is_live_patch && !matches!(client, Some((Request::Patch, _))) {
-            let t0 = Instant::now();
-            let inc = if known.stats.patched.is_some() {
-                bin_index
-                    .as_ref()
-                    .zip(args.patch.as_deref())
-                    .and_then(|(idx, p)| idx.incremental_link(p))
-            } else {
-                None
-            };
-            if let Some(patched) = inc {
-                eprintln!("incremental-link: {:.1?} ({patched} fns)", t0.elapsed());
-            } else {
-                failed = link(&args).err().map(|it| it.to_string());
-            }
+        let out_of_date = hir::attach_db(db, || known.out_of_date(db));
+        let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
+        if failed.is_none() || known.stats.patched.is_none() {
+            let patched = known.stats.patched.is_some();
+            let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
+            let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
+            let unlinked = link(cmd, splice, patch, &args.out, patched).err();
+            failed = failed.or(unlinked.map(|it| it.to_string()));
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
+        } else {
+            let unlinked = args.link_cmd.is_some() && !link_it;
+            *unbuilt = Unbuilt { unlinked, ..Unbuilt::default() };
         }
-        last_failed = failed.clone();
         let total = start.elapsed();
         if std::env::var_os("RUSTD_STATS").is_some() {
             let [roots, revalidate, compile] = warm.steps;
@@ -4267,18 +3820,6 @@ fn main() -> anyhow::Result<()> {
             let steps: Vec<String> =
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
             eprintln!("timeline-us: {}", steps.join(" "));
-        }
-        eprintln!("edit-to-binary: {total:.1?}");
-        if std::env::var_os("RUSTD_TRACE").is_some() {
-            let ran: Vec<String> = ide_db::executions::take(&db)
-                .iter()
-                .take(400)
-                .map(|(query, count)| format!("{query}={count}"))
-                .collect();
-            eprintln!("ran: {}", ran.join(" "));
-            eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
-        }
-        if std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!(
                 "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \
                  instances {:.1?}, statics {:.1?}, left {:.1?}",
@@ -4291,36 +3832,28 @@ fn main() -> anyhow::Result<()> {
                 warm.looked.left,
             );
         }
-        if let (Some((_, client)), Some(why)) = (&client, &failed) {
-            let _ = writeln!(&mut &*client, "error: {}", why.replace('\n', " "));
-            continue;
+        eprintln!("edit-to-binary: {total:.1?}");
+        if let Some(why) = failed {
+            return Ok(Err(why));
         }
-        if let Some((_, client)) = client {
-            // What the caller has to load to be up to date: the functions that differ from the
-            // first object when the edit could be a patch, and all of them when it could not.
-            let (kind, object) = match (&args.patch, known.stats.patched) {
-                (Some(patch), Some(_)) => ("patch", patch),
-                _ => ("object", &args.out),
-            };
-            let warn_suffix = if layout_warnings.is_empty() {
-                String::new()
-            } else {
-                format!(" warning={:?}", layout_warnings.join("; "))
-            };
-            let _ = writeln!(
-                &client,
-                "ok {kind}={} functions={} files={changed} ms={}{warn_suffix}",
-                object.display(),
-                known.stats.patched.unwrap_or(known.stats.compiled),
-                total.as_millis()
-            );
-        }
+        // What the caller has to load to be up to date: the functions that differ from the
+        // first object when the edit could be a patch, and all of them when it could not.
+        let (kind, object) = match (&args.patch, known.stats.patched) {
+            (Some(patch), Some(_)) => ("patch", patch),
+            _ => ("object", &args.out),
+        };
+        Ok(Ok(format!(
+            "{kind}={} functions={} files={changed} ms={}",
+            object.display(),
+            known.stats.patched.unwrap_or(known.stats.compiled),
+            total.as_millis()
+        )))
     }
 }
 
 #[allow(dead_code)]
 fn abs(path: &Path) -> anyhow::Result<VfsPath> {
-    Ok(VfsPath::from(AbsPathBuf::assert_utf8(std::fs::canonicalize(path)?)))
+    Ok(VfsPath::from(AbsPathBuf::assert_utf8(dunce::canonicalize(path)?)))
 }
 
 fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {

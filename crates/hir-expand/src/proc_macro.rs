@@ -136,6 +136,15 @@ impl ProcMacros {
 }
 
 impl CrateProcMacros {
+    pub fn new(macros: ProcMacroLoadResult) -> Self {
+        CrateProcMacros(macros.map(Vec::into_boxed_slice))
+    }
+
+    /// The macros of the crate, when they loaded.
+    pub fn macros(&self) -> Option<&[ProcMacro]> {
+        self.0.as_deref().ok()
+    }
+
     fn get(&self, idx: u32, err_span: Span) -> Result<&ProcMacro, ExpandError> {
         let proc_macros = match &self.0 {
             Ok(proc_macros) => proc_macros,

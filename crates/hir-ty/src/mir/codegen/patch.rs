@@ -5,7 +5,10 @@
 //! defines under a name of the base replaces it there, for the linker takes the first
 //! definition it sees. Whatever the patch can't express starts a full build over.
 
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
@@ -18,10 +21,11 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
     SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance, compiled_root,
-    compiled_static,
+    compiled_static, declaration_location,
     fragment::{DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
-    instance_serial, left_to_rustc, root_serial, source_location, static_serial, target,
+    instance_serial, is_thread_local, left_to_rustc, root_serial, source_location, static_serial,
+    target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -36,8 +40,12 @@ impl Mark {
     fn new(db: &dyn HirDatabase, serial: u64, requests: &Requests) -> Mark {
         let mut hasher = rustc_hash::FxHasher::default();
         for request in &requests.datas {
-            if let DataRequest::Location(Some((owner, span))) = request {
-                source_location(db, *owner, *span).hash(&mut hasher);
+            match request {
+                DataRequest::Location(Some((owner, span))) => {
+                    source_location(db, *owner, *span).hash(&mut hasher)
+                }
+                DataRequest::Declaration(func) => declaration_location(db, *func).hash(&mut hasher),
+                _ => {}
             }
         }
         Mark { serial, locations: hasher.finish() }
@@ -73,6 +81,7 @@ fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)).ok()
 }
 
+#[derive(Clone)]
 pub(super) struct BaseInstance {
     pub(super) env: StoredParamEnvAndCrate,
     pub(super) symbol: String,
@@ -88,6 +97,7 @@ pub(super) struct BaseInstance {
 }
 
 /// An instance the functions left to rustc reach that the base has no code for.
+#[derive(Clone)]
 struct TheirInstance {
     instance: Instance,
     env: StoredParamEnvAndCrate,
@@ -96,6 +106,7 @@ struct TheirInstance {
 }
 
 /// A static the functions left to rustc reach that is rustc's.
+#[derive(Clone)]
 struct TheirStatic {
     id: StaticId,
     serial: Option<u64>,
@@ -105,7 +116,7 @@ struct TheirStatic {
 
 /// What the walk for [`TheirStatics`] went through, apart from the functions it starts at.
 /// What it finds only changes with the code of one of these.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TheirWalk {
     instances: Vec<TheirInstance>,
     statics: Vec<TheirStatic>,
@@ -158,6 +169,7 @@ impl TheirWalk {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct BaseStatic {
     pub(super) symbol: String,
     pub(super) writable: bool,
@@ -171,7 +183,7 @@ pub(super) struct BaseStatic {
 }
 
 /// What a function left to rustc keeps the rest of the build from doing.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Left {
     /// Its code, when the function compiles and something else keeps it from the object.
     /// A full build looks at it again once that changes.
@@ -191,7 +203,7 @@ impl Left {
 
 /// The functions left to rustc as rustc compiled them: its copies are not built again while
 /// the daemon runs, so one is only good for as long as its function is what it was then.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::mir) struct Frozen {
     left: Option<FxHashMap<FunctionId, Left>>,
     /// The crates that have seen an edit since.
@@ -199,9 +211,16 @@ pub(in crate::mir) struct Frozen {
     /// The files that have seen an edit to the bodies of functions alone, which can change
     /// no function written elsewhere.
     edited_bodies: FxHashSet<FileId>,
+    /// The crates rustc compiled from other source than the daemon first saw them with: no
+    /// copy of a function of theirs is good.
+    distrusted: FxHashSet<Crate>,
 }
 
 impl Frozen {
+    pub(in crate::mir) fn distrust(&mut self, crates: impl IntoIterator<Item = Crate>) {
+        self.distrusted.extend(crates);
+    }
+
     pub(in crate::mir) fn edit_bodies(&mut self, file: FileId) {
         self.edited_bodies.insert(file);
     }
@@ -220,12 +239,16 @@ impl Frozen {
             let theirs = base.skipped.iter().filter(|it| !matches!(it.1, CodegenError::NoSymbol));
             theirs.map(|(root, why)| (*root, why))
         };
+        let distrusted = |root: FunctionId| self.distrusted.contains(&root.krate(db));
         let Some(left) = &self.left else {
+            let other =
+                now().find(|it| distrusted(it.0)).map(|(root, why)| (root, why.to_string()));
             self.left = Some(now().map(|(root, _)| (root, Left::of(db, root))).collect());
-            return None;
+            return other;
         };
         now().find_map(|(root, why)| {
             let fresh = match left.get(&root) {
+                _ if distrusted(root) => false,
                 // Nothing to tell a change by: any edit that it can see may be one.
                 Some(Left { code: None, .. }) => {
                     !self.edited.contains(&root.krate(db))
@@ -240,6 +263,7 @@ impl Frozen {
 }
 
 /// The last object built in full, as far as patching it goes.
+#[derive(Clone)]
 pub(super) struct Base {
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
@@ -255,6 +279,13 @@ pub(super) struct Base {
     their_walk: TheirWalk,
     pub(super) instances: FxHashMap<Instance, BaseInstance>,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
+    /// The symbols of the functions built from entries of the store, by their stable names.
+    /// No edit reaches what those are compiled from.
+    pub(super) found: FxHashMap<Arc<str>, String>,
+    /// Some of `found` is code of the checkout, which an edit does reach, and nothing here
+    /// tells what of it: the first edit takes a full build without any.
+    hydrated: bool,
+    outdated: bool,
     /// The instances that did not compile when the base was built. What called them was left
     /// to rustc, and stays there for as long as the base does.
     rejected: Vec<(Instance, StoredParamEnvAndCrate)>,
@@ -266,7 +297,7 @@ pub(super) struct Base {
 /// crate depends on nothing but the files of that crate and of the ones it depends on. Of a
 /// file where only the bodies of functions changed, and none of them is one that the rest of
 /// the program sees into, it depends on no more than the bodies it comes from.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Touched {
     /// The crates that see a file that changed.
     crates: FxHashSet<Crate>,
@@ -297,6 +328,7 @@ impl Touched {
         for stale in found {
             self.roots.extend(&stale.roots);
             self.instances.extend(stale.instances.iter().cloned());
+            self.statics.extend(&stale.statics);
             for (node, _) in &stale.broken {
                 match node {
                     Node::Instance(instance) => _ = self.instances.insert(instance.clone()),
@@ -316,10 +348,12 @@ impl Touched {
 }
 
 /// What a look at a part of the base found changed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Stale {
     roots: Vec<FunctionId>,
     instances: Vec<Instance>,
+    /// The statics with another value, which a patch defines again under their name.
+    statics: Vec<StaticId>,
     /// What a patch can't replace, and why. That only matters for what the program still
     /// reaches.
     broken: Vec<(Node, &'static str)>,
@@ -367,14 +401,18 @@ pub(super) struct Patch {
 }
 
 /// An object that defines nothing.
-pub(super) fn empty_object() -> Result<Vec<u8>> {
-    if super::is_wasm32() {
-        return super::wasm::WasmObjectBuilder::default()
-            .finish(&cranelift_module::ModuleDeclarations::default(), false, true);
-    }
+pub fn empty_object() -> Result<Vec<u8>> {
     let builder =
         ObjectBuilder::new(target()?.clone(), "rustd", cranelift_module::default_libcall_names())?;
-    ObjectModule::new(builder).finish().emit().map_err(|e| CodegenError::Backend(e.to_string()))
+    let object = ObjectModule::new(builder)
+        .finish()
+        .emit()
+        .map_err(|e| CodegenError::Backend(e.to_string()))?;
+    if super::Target::current().writes_wasm_objects() {
+        return super::wasm_object::from_elf(&object, &Default::default())
+            .map_err(CodegenError::Backend);
+    }
+    Ok(object)
 }
 
 impl Base {
@@ -495,14 +533,33 @@ impl Base {
             their_walk,
             instances,
             statics,
+            found: cg
+                .found
+                .iter()
+                .map(|(name, id)| {
+                    (name.clone(), decls.get_function_decl(*id).linkage_name(*id).into_owned())
+                })
+                .collect(),
+            hydrated: cg
+                .found
+                .iter()
+                .any(|(name, _)| super::stable::StableNames::of_checkout(name)),
+            outdated: false,
             bodies: cg.bodies,
         })
+    }
+
+    /// Whether an edit changed code that the base has from the store, which no patch can
+    /// replace.
+    pub(super) fn outdated(&self) -> bool {
+        self.outdated
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         let Some(crates) = crates else {
             self.touched.any = true;
+            self.outdated |= self.hydrated;
             return;
         };
         for &krate in crates {
@@ -510,12 +567,16 @@ impl Base {
                 self.touched.crates.extend(krate.transitive_rev_deps(db));
             }
         }
+        self.outdated |=
+            self.hydrated && self.crates.iter().any(|it| self.touched.crates.contains(it));
     }
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
-    pub(super) fn touch_bodies(&mut self, file: FileId) {
+    pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
         self.touched.bodies.insert(file);
+        self.outdated |= self.hydrated
+            && base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it));
     }
 
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.
@@ -534,7 +595,7 @@ impl Base {
         if !changed && !check_all {
             return;
         }
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let now = probe(|| TheirStatics::walk(db, left_to_rustc(&self.skipped)));
         match now {
             Some((now, walked)) if now == self.their_statics => {
@@ -552,7 +613,7 @@ impl Base {
     /// What one part in `parts` of the base no longer is what it was. Looking is most of the
     /// work of a patch, and the parts can be looked at on a thread each.
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
         let every = |len: usize| (part..len).step_by(parts);
         // A check of the skipping below: looks at what no edit can have changed too, and says
@@ -573,7 +634,7 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
-            let asked = std::time::Instant::now();
+            let asked = stdx::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
                 Some(Mark::new(db, root_serial(db, root), &compiled.requests))
@@ -599,7 +660,7 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
-            let asked = std::time::Instant::now();
+            let asked = stdx::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
                 compiled.as_ref().ok().map(|it| {
@@ -646,7 +707,13 @@ impl Base {
                 continue;
             }
             stale.their_walk_changed |= was.theirs;
-            stale.broken.push((Node::Static(id), "a static of the base changed"));
+            // rustc's code has rustc's copy, and a thread's copy is laid out by the linker.
+            let writable = probe(|| compiled_static(db, id).as_ref().ok().map(|it| it.writable));
+            if writable == Some(Some(was.writable)) && !was.theirs && !is_thread_local(db, id) {
+                stale.statics.push(id);
+            } else {
+                stale.broken.push((Node::Static(id), "a static of the base changed"));
+            }
         }
         stale.steps.statics = start.elapsed() - stale.steps.roots - stale.steps.instances;
         for i in every(self.skipped.len()) {
@@ -737,7 +804,7 @@ impl Base {
                 let compiled = compiled_instance(db, instance.clone(), known.env.clone());
                 compiled.as_ref().ok().map(|it| &it.requests)
             }),
-            Node::Static(_) => None,
+            Node::Static(id) => compiled_static(db, *id).as_ref().ok().map(|it| &it.requests),
         };
         requests.is_some_and(|requests| node.is_asked_for_by(requests))
     }
@@ -770,7 +837,7 @@ impl Base {
         own_statics: OwnStatics,
         stale: Vec<Stale>,
     ) -> Result<std::result::Result<Patch, &'static str>> {
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         if roots.entries != self.entries {
             return Ok(Err("the roots compiled whether called or not changed"));
         }
@@ -784,6 +851,7 @@ impl Base {
 
         let mut changed_roots = Vec::new();
         let mut changed_instances = Vec::new();
+        let mut changed_statics = Vec::new();
         let mut broken = Vec::new();
         for part in stale {
             if let Some(why) = part.declined {
@@ -791,6 +859,7 @@ impl Base {
             }
             changed_roots.extend(part.roots);
             changed_instances.extend(part.instances);
+            changed_statics.extend(part.statics);
             broken.extend(part.broken);
         }
         // What the edit took away is still in the base, where nothing refers to it any more.
@@ -799,6 +868,7 @@ impl Base {
                 .iter()
                 .map(|&root| Node::Root(root))
                 .chain(changed_instances.iter().cloned().map(Node::Instance))
+                .chain(changed_statics.iter().map(|&id| Node::Static(id)))
                 .collect(),
             broken: broken.iter().map(|it| it.0.clone()).collect(),
         };
@@ -806,10 +876,18 @@ impl Base {
             return Ok(Err(why));
         }
         changed_instances.retain(|it| self.reaches(db, &Node::Instance(it.clone()), &unchanged));
+        changed_statics.retain(|&it| self.reaches(db, &Node::Static(it), &unchanged));
         let verify = start.elapsed();
 
-        let mut cg =
-            ObjectCodegen::new(db, symbols, &known.rejected, own_statics, on_demand, Some(self))?;
+        let mut cg = ObjectCodegen::new(
+            db,
+            symbols,
+            &known.rejected,
+            own_statics,
+            on_demand,
+            Some(self),
+            false,
+        )?;
         cg.phases.compile = verify;
         // What nothing reached any more can be reached again by the code compiled now.
         cg.replaced = unchanged;
@@ -827,6 +905,11 @@ impl Base {
             )?;
             cg.instances.insert(instance.clone(), id);
             cg.pending.push((instance.clone(), was.env.clone(), id));
+        }
+        for &id in &changed_statics {
+            if cg.static_data(id).is_err() {
+                return Ok(Err("a static of the base no longer has a value"));
+            }
         }
         let mut queued: FxHashSet<FunctionId> = known_roots().collect();
         let mut queue = changed_roots;
@@ -864,7 +947,7 @@ impl Base {
             }
         }
         let (bodies, mut phases) = (cg.bodies, cg.phases);
-        let start = std::time::Instant::now();
+        let start = stdx::time::Instant::now();
         let object = cg.finish()?;
         phases.object = start.elapsed();
         Ok(Ok(Patch { object, bodies, phases }))

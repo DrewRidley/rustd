@@ -16,6 +16,7 @@ import json, os, re, shlex, statistics, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["RUSTD_STATS"] = "1"
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs
 
 MARK = "rustd-scaling-edit"
@@ -38,7 +39,7 @@ ELSEWHERE = [
 BUILD = re.compile(
     r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*"
     r"stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?"
-    r"(?:timeline-us: (.*)\n)?edit-to-binary: (\S+)")
+    r"(?:timeline-us: (.*)\n)?(?:asked: .*\n)?edit-to-binary: (\S+)")
 
 
 def measure(name, spec, repeat):
@@ -55,9 +56,8 @@ def measure(name, spec, repeat):
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     link = list(fx.link_args)
-    first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
     obj, patch, binary = (os.path.join(fx.work, n) for n in ("rustd.o", "rustd.patch.o", "bin-rustd"))
-    link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+    link = linkline.ahead(link, [patch, obj], RUSTD)
     link[link.index("-o") + 1] = binary
     if (ld := os.environ.get("SCALING_LD")) and "-fuse-ld=lld" in link:
         link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
@@ -65,12 +65,14 @@ def measure(name, spec, repeat):
     # SCALING_SYNC: each build is asked for once the file is written, as `rustd sync` does.
     socket = os.path.join(fx.work, "rustd.sock") if os.environ.get("SCALING_SYNC") else None
     trigger = ["--socket", socket] if socket else ["--watch"]
+    # SCALING_SPLICE: edits are added to the linked binary where that can be done.
+    splice = ["--splice", binary] if os.environ.get("SCALING_SPLICE") else []
     log_path = os.path.join(fx.work, "daemon.log")
     out, log = open(log_path, "a"), open(log_path)
     start = time.time()
     daemon = subprocess.Popen(
         [RUSTD, os.path.dirname(fx.touch) if fixture else fx.ws, *[x for c in crates for x in ("--crate", c)],
-         "--out", obj, *trigger, "--patch", patch, "--link-cmd", shlex.join(link), *symbols],
+         "--out", obj, *trigger, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols],
         stderr=out, stdout=out)
 
     def wait(pattern, seen):
@@ -142,7 +144,7 @@ def measure(name, spec, repeat):
                         ran = subprocess.run([binary, *run_arg], capture_output=True, text=True, timeout=60)
                         if (MARK in ran.stdout) == revert:
                             wrong.append((turn, revert, ran.stdout[:200]))
-        rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
+        rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(daemon.pid)])) // 1024
     finally:
         daemon.kill()
         open(fx.touch, "w").write(original)

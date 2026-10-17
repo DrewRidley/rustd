@@ -11,6 +11,7 @@ common reason first: that list is the worklist.
 import argparse, collections, concurrent.futures, glob, json, os, re, shlex, shutil, subprocess, sys, time
 
 import difftest
+import linkline
 
 # Tests needing more than a plain `rustc file.rs && ./file` are left out.
 DIRECTIVE = re.compile(
@@ -124,8 +125,7 @@ def run_chunk(index, paths, root, base):
         result["compiled"] = sum(r[0] == "compiled" for r in rows)
         result["roots"] = result["compiled"] + sum(result["skipped"].values())
         reference = args[args.index("-o") + 1]
-        first = next(i for i, a in enumerate(args) if a.endswith(".rlib"))
-        args[first:first] = [obj, "-Wl,--allow-multiple-definition"]
+        args = linkline.ahead(args, [obj], difftest.RUSTD)
         binary = f"{work}/{name}"
         args[args.index("-o") + 1] = binary
         link = subprocess.run(args, capture_output=True, text=True)

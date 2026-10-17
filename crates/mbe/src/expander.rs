@@ -5,13 +5,12 @@
 mod matcher;
 mod transcriber;
 
-use intern::Symbol;
 use rustc_hash::FxHashMap;
 use span::Span;
 
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MacroCallStyle, MatchedArmIndex,
-    parser::MetaVarKind,
+    parser::{MetaVar, MetaVarKind},
 };
 
 pub(crate) fn expand_rules(
@@ -112,7 +111,7 @@ pub(crate) fn expand_rules(
 /// many is not a plain `usize`, but a `&[usize]`.
 #[derive(Debug, Default, Clone)]
 struct Bindings<'a> {
-    inner: FxHashMap<Symbol, Binding<'a>>,
+    inner: FxHashMap<MetaVar, Binding<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +151,10 @@ enum Fragment<'a> {
     /// would cause a syntax error. We need to fix it up just before transcribing;
     /// see `transcriber::fix_up_and_push_path_tt()`.
     Path(tt::TokenTreesView<'a>),
+    /// A type is one thing to rustc wherever it is written, and tokens to us. `1 as $ty << n`
+    /// would read `u32 <<` as the start of generic arguments: the type is parenthesized on
+    /// transcription when a `<` follows it.
+    Ty(tt::TokenTreesView<'a>),
     TokensOwned(tt::TopSubtree),
 }
 
@@ -161,7 +164,7 @@ impl Fragment<'_> {
             Fragment::Empty => true,
             Fragment::Tokens { tree, .. } => tree.len() == 0,
             Fragment::Expr(it) => it.len() == 0,
-            Fragment::Path(it) => it.len() == 0,
+            Fragment::Path(it) | Fragment::Ty(it) => it.len() == 0,
             Fragment::TokensOwned(_) => false, // A `TopSubtree` is never empty
         }
     }

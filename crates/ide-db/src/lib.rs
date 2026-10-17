@@ -126,6 +126,43 @@ impl RootDatabase {
         self.files.included_files()
     }
 
+    /// The files an `include!` named that the VFS has not, each with the source root of the
+    /// file that includes it.
+    pub fn included_sources(&self) -> Vec<(vfs::AbsPathBuf, SourceRootId)> {
+        self.files.included_sources()
+    }
+
+    /// See [`base_db::Files::set_view`].
+    pub fn set_view(
+        &self,
+        base: &std::path::Path,
+        over: &std::path::Path,
+        built: Vec<std::path::PathBuf>,
+    ) {
+        self.files.set_view(base, over, built);
+    }
+
+    /// The variables `env!` and `option_env!` have asked for, by the crate asking.
+    pub fn env_read(&self) -> Vec<(base_db::Crate, String)> {
+        self.files.env_read()
+    }
+
+    /// Has `krate` be compiled with `env`.
+    pub fn set_env(&mut self, krate: base_db::Crate, env: base_db::Env) {
+        use salsa::Setter as _;
+        krate.set_env(self).to(env);
+    }
+
+    /// See [`base_db::Files::on_disk`].
+    pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
+        self.files.on_disk(path)
+    }
+
+    /// Whether such a file is on disk what was read of it.
+    pub fn included_is_read(&self, path: &vfs::AbsPath) -> bool {
+        self.files.included_is_read(self, path)
+    }
+
     /// Reads such a file again, after it changed on disk.
     pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
         let files = Arc::clone(&self.files);
@@ -176,6 +213,20 @@ impl SourceDatabase for RootDatabase {
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
         let path = anchor.parent()?.absolutize(path.path);
         Some(self.files.included_file(self, &path, durability))
+    }
+
+    fn env_is_read(&self, krate: base_db::Crate, key: &str) {
+        self.files.env_is_read(krate, key);
+    }
+
+    fn include_source(&self, path: base_db::AnchoredPath<'_>) {
+        let root_id = self.file_source_root(path.anchor).source_root_id(self);
+        let root = self.source_root(root_id).source_root(self);
+        if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
+            && let Some(parent) = anchor.parent()
+        {
+            self.files.include_source(&parent.absolutize(path.path), root_id);
+        }
     }
 
     fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {

@@ -28,7 +28,8 @@ import os, random, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, RUSTD, sysroot_rlibs
+import linkline
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, profile_dir
 
 MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")
 ITEM = re.compile(r"(use|mod|fn|pub|#\[|static|const|struct|enum|extern|type|macro_rules|impl|trait|async|unsafe)\b")
@@ -322,8 +323,7 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
+        link = linkline.ahead(link, [patch, obj], RUSTD)
         link[link.index("-o") + 1] = binary
         for path in (socket, binary):
             if os.path.exists(path):
@@ -341,7 +341,7 @@ def main():
 
     def run(path):
         try:
-            p = subprocess.run([path, *run_args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            p = subprocess.run([*RUNNER, path, *run_args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
             # A usage line names the program by its file name, which is not the same for the two.
             return f"{p.stdout}\n--\n{p.stderr}\n[exit {p.returncode}]".replace(path, "BIN").replace("bin-rustd", bin_name)
         except Exception as error:
@@ -386,7 +386,7 @@ def main():
         elif kind == "error":
             verdict = "REFUSED: " + reply[:300].replace("|", "/").replace("\n", " ")
         else:
-            ours, theirs = run(binary), run(os.path.join(reference, "debug", bin_name))
+            ours, theirs = run(binary), run(os.path.join(profile_dir(reference), bin_name))
             if ours == theirs:
                 verdict = "same"
             else:

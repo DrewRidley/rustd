@@ -17,7 +17,9 @@ BOARD = os.path.join(HERE, "scoreboard.json")
 def run(name, target):
     out = tempfile.mktemp(suffix=".json")
     if "tests" in target:
-        subprocess.run([os.path.join(HERE, "vendor.sh"), target["tests"]], check=True)
+        # Windows starts no script by its first line.
+        shell = ["sh"] if os.name == "nt" else []
+        subprocess.run([*shell, os.path.join(HERE, "vendor.sh"), target["tests"]], check=True)
         directory = os.path.join(HERE, "vendor", target["tests"].rsplit("-", 1)[0])
         cmd = [sys.executable, os.path.join(HERE, "cratetest.py"), directory, "--bisect", "--json", out]
     else:

@@ -171,7 +171,10 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
 
     // test safe_outside_of_extern
     // fn foo() { safe = true; }
-    if is_in_extern && p.at_contextual_kw(T![safe]) {
+    if is_in_extern && p.at_contextual_kw(T![safe]) && !p.nth_at(1, T![!]) && !p.nth_at(1, T![::]) {
+        // test safe_macro_call
+        // safe!(A);
+        // safe::b!();
         p.eat_contextual_kw(T![safe]);
         has_mods = true;
     }

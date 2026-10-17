@@ -5,7 +5,10 @@ use std::cmp::{self, Ordering};
 
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use rustc_abi::ExternAbi;
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
+use rustc_type_ir::{
+    TypeVisitableExt,
+    inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
+};
 use stdx::never;
 
 use crate::{
@@ -753,11 +756,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 if let Some((size, _)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &size.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(size))
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (size, _) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &size.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(size))
                 }
             }
             "align_of_val" => {
@@ -772,12 +775,28 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 if let Some((_, align)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &align.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(align))
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (_, align) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &align.to_le_bytes())
+                    destination.write_from_bytes(self, &super::word_bytes(align))
                 }
+            }
+            "type_id" => {
+                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "type_id generic arg is not provided".into(),
+                    ));
+                };
+                // Two spellings of one type may differ in their lifetimes.
+                if ty.has_free_regions() || ty.has_bound_regions() {
+                    not_supported!("`type_id` of a type with lifetimes");
+                }
+                let id = self.type_ids.iter().position(|&it| it == ty).unwrap_or_else(|| {
+                    self.type_ids.push(ty);
+                    self.type_ids.len() - 1
+                });
+                destination.write_from_bytes(self, &(id as u128 + 1).to_le_bytes())
             }
             "type_name" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -793,7 +812,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 destination.slice(0..self.ptr_size()).write_from_bytes(self, &addr.to_bytes())?;
                 destination
                     .slice(self.ptr_size()..2 * self.ptr_size())
-                    .write_from_bytes(self, &len.to_le_bytes())
+                    .write_from_bytes(self, &super::word_bytes(len))
             }
             "needs_drop" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -1156,6 +1175,27 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let result = u128::from_le_bytes(pad16(arg.get(self)?, IsSigned::No)).count_ones();
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
+            }
+            "bswap" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError("bswap arg is not provided".into()));
+                };
+                let mut result = arg.get(self)?.to_vec();
+                result.reverse();
+                destination.write_from_bytes(self, &result)
+            }
+            "bitreverse" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "bitreverse arg is not provided".into(),
+                    ));
+                };
+                let mut result = arg.get(self)?.to_vec();
+                result.reverse();
+                for byte in &mut result {
+                    *byte = byte.reverse_bits();
+                }
+                destination.write_from_bytes(self, &result)
             }
             "ctlz" | "ctlz_nonzero" => {
                 let [arg] = args else {

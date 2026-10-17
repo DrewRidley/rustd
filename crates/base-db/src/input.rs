@@ -900,6 +900,10 @@ impl Env {
         self.entries.get(env).cloned()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(key, value)| (&**key, &**value))
+    }
+
     pub fn extend_from_other(&mut self, other: &Env) {
         self.entries.extend(other.entries.iter().map(|(x, y)| (x.to_owned(), y.to_owned())));
     }

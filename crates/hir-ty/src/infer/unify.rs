@@ -507,6 +507,36 @@ impl<'db> InferenceTable<'db> {
         self.try_structurally_resolve_type(Span::Dummy, ty)
     }
 
+    /// `ty` with what its projections say of its variables: a projection is of a trait that
+    /// its self type implements, which is a part of the type being well formed that nothing
+    /// asks for otherwise. In `OVector::from_element` the storage is `<DefaultAllocator as
+    /// Allocator<?D, U1>>::Buffer`, a where clause of the caller makes `?D` its own `D`, and
+    /// until it does `?D` could be the `Dyn` of another impl with a `from_element`.
+    pub(crate) fn resolve_projections_within(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        let interner = self.interner();
+        let traits: Vec<_> = ty
+            .walk()
+            .filter_map(|arg| arg.as_type())
+            .filter(|ty| ty.has_non_region_infer())
+            .filter_map(|ty| match ty.kind() {
+                TyKind::Alias(alias)
+                    if matches!(alias.kind, crate::next_solver::AliasTyKind::Projection { .. }) =>
+                {
+                    Some(alias.trait_ref(interner))
+                }
+                _ => None,
+            })
+            .collect();
+        if traits.is_empty() {
+            return ty;
+        }
+        for trait_ref in traits {
+            let cause = ObligationCause::new(Span::Dummy);
+            self.register_predicate(Obligation::new(interner, cause, self.param_env, trait_ref));
+        }
+        self.resolve_vars_with_obligations(ty)
+    }
+
     fn emit_trait_errors(&mut self, diagnostics: &mut ThinVec<InferenceDiagnostic>) {
         diagnostics.extend(std::mem::take(&mut self.trait_errors).into_iter().filter_map(
             |error| {

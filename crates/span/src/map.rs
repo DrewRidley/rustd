@@ -18,12 +18,27 @@ pub struct SpanMap {
     /// Index of the matched macro arm on successful expansion for declarative macros.
     // FIXME: Does it make sense to have this here?
     pub matched_arm: Option<u32>,
+    /// Where the macro fragments start and where they end, each in order. A fragment is one
+    /// token tree to the macro it is passed on to, which the text does not show.
+    fragment_starts: Vec<TextSize>,
+    fragment_ends: Vec<TextSize>,
+}
+
+/// How many of the sorted `offsets` are `offset`.
+fn count_of(offsets: &[TextSize], offset: TextSize) -> usize {
+    let first = offsets.partition_point(|&it| it < offset);
+    offsets[first..].partition_point(|&it| it == offset)
 }
 
 impl SpanMap {
     /// Creates a new empty [`SpanMap`].
     pub fn empty() -> Self {
-        Self { spans: Vec::new(), matched_arm: None }
+        Self {
+            spans: Vec::new(),
+            matched_arm: None,
+            fragment_starts: Vec::new(),
+            fragment_ends: Vec::new(),
+        }
     }
 
     /// Finalizes the [`SpanMap`], shrinking its backing storage and validating that the offsets are
@@ -34,6 +49,8 @@ impl SpanMap {
             "spans are not in order"
         );
         self.spans.shrink_to_fit();
+        self.fragment_starts.sort_unstable();
+        self.fragment_ends.sort_unstable();
     }
 
     /// Pushes a new span onto the [`SpanMap`].
@@ -47,6 +64,22 @@ impl SpanMap {
             );
         }
         self.spans.push((offset, span));
+    }
+
+    /// Records that the tokens of `range` are one macro fragment.
+    pub fn push_fragment(&mut self, range: TextRange) {
+        self.fragment_starts.push(range.start());
+        self.fragment_ends.push(range.end());
+    }
+
+    /// How many macro fragments start at `offset`.
+    pub fn fragments_starting_at(&self, offset: TextSize) -> usize {
+        count_of(&self.fragment_starts, offset)
+    }
+
+    /// How many macro fragments end at `offset`.
+    pub fn fragments_ending_at(&self, offset: TextSize) -> usize {
+        count_of(&self.fragment_ends, offset)
     }
 
     /// Returns all [`TextRange`]s that correspond to the given span.
@@ -144,6 +177,35 @@ impl SpanMap {
             .extend(other.spans.iter().map(|&(offset, span)| (offset + other_range.start(), span)));
 
         self.spans.sort_unstable_by_key(|&(offset, _)| offset);
+
+        // A fragment that starts where the replaced text ends comes after it, one that ends
+        // where it starts comes before it.
+        let shift = |offset: &mut TextSize| *offset = *offset + other_size - other_range.len();
+        self.fragment_starts.retain_mut(|start| {
+            if other_range.contains(*start) {
+                return false;
+            }
+            if *start >= other_range.end() {
+                shift(start);
+            }
+            true
+        });
+        self.fragment_ends.retain_mut(|end| {
+            if other_range.start() < *end && *end <= other_range.end() {
+                return false;
+            }
+            if *end > other_range.end() {
+                shift(end);
+            }
+            true
+        });
+        let moved = |offsets: &[TextSize]| {
+            offsets.iter().map(|&offset| offset + other_range.start()).collect::<Vec<_>>()
+        };
+        self.fragment_starts.extend(moved(&other.fragment_starts));
+        self.fragment_ends.extend(moved(&other.fragment_ends));
+        self.fragment_starts.sort_unstable();
+        self.fragment_ends.sort_unstable();
 
         // Matched arm info is no longer correct once we have multiple macros.
         self.matched_arm = None;

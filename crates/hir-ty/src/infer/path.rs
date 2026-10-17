@@ -183,7 +183,8 @@ impl<'db> InferenceContext<'db> {
             let (ty, _) = path_ctx.lower_ty_relative_path(ty, orig_ns, true, id.into());
             drop_ctx(ctx, no_diagnostics);
             let ty = self.table.process_user_written_ty(ty);
-            self.resolve_ty_assoc_item(ty, last.name, id).map(|(it, substs)| (it, Some(substs)))?
+            self.resolve_ty_assoc_item(ty, last.name, id, false)
+                .map(|(it, substs)| (it, Some(substs)))?
         } else {
             let hygiene = self.store.expr_or_pat_path_hygiene(id.unpack());
             // FIXME: report error, unresolved first path segment
@@ -254,7 +255,8 @@ impl<'db> InferenceContext<'db> {
 
                             let ty = self.process_user_written_ty(ty);
 
-                            self.resolve_ty_assoc_item(ty, last_segment.name, id)
+                            let desugared = matches!(path, Path::LangItem(..));
+                            self.resolve_ty_assoc_item(ty, last_segment.name, id, desugared)
                         }
                     }?;
                     (resolution, Some(substs))
@@ -331,17 +333,24 @@ impl<'db> InferenceContext<'db> {
         ty: Ty<'db>,
         name: &Name,
         id: ExprOrPatIdPacked,
+        desugared: bool,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         if ty.is_ty_error() {
             return None;
         }
+        let ty = self.table.resolve_projections_within(ty);
 
         if let Some(result) = self.resolve_enum_variant_on_ty(ty, name, id) {
             return Some(result);
         }
 
         let res = self.with_method_resolution(Span::Dummy, Span::Dummy, |ctx| {
-            ctx.probe_for_name(method_resolution::Mode::Path, name.clone(), ty)
+            let (mode, name) = (method_resolution::Mode::Path, name.clone());
+            if desugared {
+                ctx.probe_for_desugared_name(mode, name, ty)
+            } else {
+                ctx.probe_for_name(mode, name, ty)
+            }
         });
         let (item, visible) = match res {
             Ok(res) => (res.item, true),

@@ -648,7 +648,9 @@ fn foo(a: A) {
 }
 "#,
             expect![[r#"
-                me pub_module_method() fn(&self)
+                me local_method()             fn(&self)
+                me pub_foreign_local_method() fn(&self)
+                me pub_module_method()        fn(&self)
             "#]],
         );
     }

@@ -1,6 +1,6 @@
 //! Defines a unit of change that can applied to the database to get the next
 //! state. Changes are transactional.
-use base_db::{CrateGraphBuilder, FileChange, SourceDatabase, SourceRoot};
+use base_db::{CrateGraphBuilder, CratesIdMap, FileChange, SourceDatabase, SourceRoot};
 use span::FileId;
 
 use crate::proc_macro::ProcMacrosBuilder;
@@ -12,7 +12,7 @@ pub struct ChangeWithProcMacros {
 }
 
 impl ChangeWithProcMacros {
-    pub fn apply(self, db: &mut impl SourceDatabase) {
+    pub fn apply(self, db: &mut impl SourceDatabase) -> Option<CratesIdMap> {
         let crates_id_map = self.source_change.apply(db);
         if let Some(proc_macros) = self.proc_macros {
             proc_macros.build_in(
@@ -22,6 +22,7 @@ impl ChangeWithProcMacros {
                     .expect("cannot set proc macros without setting the crate graph too"),
             );
         }
+        crates_id_map
     }
 
     pub fn change_file(&mut self, file_id: FileId, new_text: Option<String>) {

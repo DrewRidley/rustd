@@ -2768,7 +2768,9 @@ impl<'db> ExprCollector<'db> {
                         expr => this.maybe_collect_expr(expr),
                     })
                 }
-                None => None,
+                // What does not expand is not nothing: a block that ends in it has its type,
+                // not `()`.
+                None => Some(this.alloc_expr(Expr::Missing, syntax_ptr)),
             },
         );
         expansion.inspect(|&tail| {

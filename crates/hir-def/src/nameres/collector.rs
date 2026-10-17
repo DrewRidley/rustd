@@ -1174,6 +1174,23 @@ impl<'db> DefCollector<'db> {
         if !changed {
             return;
         }
+        // A name this module already had in one namespace kept its own item there, so only
+        // what the module now holds reaches the modules that glob-import it.
+        let scope = self.def_map.modules.building()[module_id].scope(self.db);
+        let held = resolutions
+            .iter()
+            .map(|(name, res)| {
+                let Some(name) = name else { return (None, *res) };
+                let now = scope.get(name);
+                let res = PerNs {
+                    types: res.types.filter(|it| now.types.is_some_and(|now| now.def == it.def)),
+                    values: res.values.filter(|it| now.values.is_some_and(|now| now.def == it.def)),
+                    macros: res.macros.filter(|it| now.macros.is_some_and(|now| now.def == it.def)),
+                };
+                (Some(name.clone()), res)
+            })
+            .collect::<Vec<_>>();
+        let resolutions = &held[..];
         let glob_imports = self
             .glob_imports
             .get(&module_id)

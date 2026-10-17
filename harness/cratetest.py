@@ -7,7 +7,7 @@ Each `tests/*.rs` target is built by cargo, then relinked with rustd's objects f
 front of rustc's rlib. Both binaries must report the same result for every test.
 """
 import argparse, json, os, re, subprocess, sys
-from difftest import Fixture, compare, discard
+from difftest import Fixture, compare, discard, RUNNER
 
 
 UNIT = "(unit tests)"
@@ -22,12 +22,25 @@ class TestFixture(Fixture):
             self.rustd_args = ["--cfg-test"]
         else:
             path = os.path.join(crate_dir, "tests", f"{test}.rs")
-            super().__init__(crate_dir, [crate, test.replace("-", "_")], ["--test", test], touch=path)
+            # By its file: an example may have the name of the test.
+            super().__init__(crate_dir, [crate, os.path.abspath(path)], ["--test", test], touch=path)
+            self.rustd_args = ["--dev-deps"]
         if features:
             self.target_args += ["--features", features]
             self.rustd_args += ["--features", features]
         self.run_args = ["--test-threads=1"]
         self.shared = shared
+
+    def rustc_build(self):
+        super().rustc_build()
+        # A test that names nothing of the crate is linked without it: there is nothing of the
+        # crate in the binary for rustd to stand in front of.
+        # The standard library's own copy of a crate of the same name (hashbrown) is not it.
+        linked = any(os.path.basename(r).startswith(f"lib{self.crates[0]}-") and "/rustlib/" not in r
+                     for r in self.rlibs)
+        if len(self.crates) == 2 and not linked:
+            print(f"{self.crates[0]} is not linked into this test")
+            self.crates = self.crates[1:]
 
     def rustd_build(self, deny=()):
         # The crate's objects are the same whichever test binary they are linked into.
@@ -48,7 +61,7 @@ class TestFixture(Fixture):
 
 def differing_tests(fx):
     """Runs every test on its own in both binaries: one that aborts hides the ones after it."""
-    listed = subprocess.run([fx.reference, "--list"], capture_output=True, text=True).stdout
+    listed = subprocess.run([*RUNNER, fx.reference, "--list"], capture_output=True, text=True).stdout
     names = [l[:-len(": test")] for l in listed.splitlines() if l.endswith(": test")]
     differing = []
     for name in names:

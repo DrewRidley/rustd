@@ -66,7 +66,7 @@ impl Borrow<AbsPath> for AbsPathBuf {
 impl TryFrom<Utf8PathBuf> for AbsPathBuf {
     type Error = Utf8PathBuf;
     fn try_from(path_buf: Utf8PathBuf) -> Result<AbsPathBuf, Utf8PathBuf> {
-        if !path_buf.is_absolute() {
+        if !is_absolute(&path_buf) {
             return Err(path_buf);
         }
         Ok(AbsPathBuf(path_buf))
@@ -193,7 +193,7 @@ impl ToOwned for AbsPath {
 impl<'a> TryFrom<&'a Utf8Path> for &'a AbsPath {
     type Error = &'a Utf8Path;
     fn try_from(path: &'a Utf8Path) -> Result<&'a AbsPath, &'a Utf8Path> {
-        if !path.is_absolute() {
+        if !is_absolute(path.as_ref()) {
             return Err(path);
         }
         Ok(AbsPath::assert(path))
@@ -207,7 +207,7 @@ impl AbsPath {
     ///
     /// Panics if `path` is not absolute.
     pub fn assert(path: &Utf8Path) -> &AbsPath {
-        assert!(path.is_absolute(), "{path} is not absolute");
+        assert!(is_absolute(path.as_ref()), "{path} is not absolute");
         unsafe { &*(path as *const Utf8Path as *const AbsPath) }
     }
 
@@ -434,4 +434,14 @@ fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
         }
     }
     ret
+}
+
+/// Whether the path is absolute. Where the standard library knows no file system, as on
+/// `wasm64-unknown-unknown`, it calls no path absolute; a path from the root is one here.
+fn is_absolute(path: &Utf8Path) -> bool {
+    if cfg!(all(target_family = "wasm", target_os = "unknown")) {
+        path.has_root()
+    } else {
+        path.is_absolute()
+    }
 }

@@ -1,0 +1,66 @@
+# rustd: the daemon's own checks, on its branches. The harnesses compare what rustd builds
+# with what rustc builds, under both producers.
+name: rustd
+on:
+  push:
+    branches: ["rustd-*"]
+  workflow_dispatch:
+
+concurrency:
+  group: rustd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  LLVM_SYS_201_PREFIX: /usr/lib/llvm-20
+
+jobs:
+  checks:
+    name: fmt and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
+
+  harness:
+    name: harness (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cranelift, llvm]
+    env:
+      RUSTD_BACKEND: ${{ matrix.backend }}
+      RUSTD_OPT: 2
+      RUSTD_EMIT: fast
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - name: LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+          sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rustd --release --features llvm
+      - name: Harnesses
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          failed=0
+          run() { echo "::group::$*"; python3 "$@" || { failed=1; echo "::error::$* failed"; }; echo "::endgroup::"; }
+          run difftest.py corpus --bin runner --crate cases --layouts
+          run programs.py
+          run stress.py
+          run breakers.py
+          run unwinds.py
+          run splices.py
+          run asmedits.py
+          run includes.py
+          run worktrees.py
+          run keys.py
+          exit $failed

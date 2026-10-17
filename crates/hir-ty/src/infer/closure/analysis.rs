@@ -546,6 +546,11 @@ impl<'db> InferenceContext<'db> {
             fake_reads: Default::default(),
         };
 
+        // The statements of this block move the arguments in. Arguments are not what the
+        // closure captured, so only the body as written says whether it consumes that.
+        let Expr::Block { tail: Some(body), .. } = self.store[body] else {
+            return false;
+        };
         let _ = euv::ExprUseVisitor::new(self, coroutine_def_id, upvars, &mut delegate)
             .consume_expr(body);
 

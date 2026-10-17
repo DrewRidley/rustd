@@ -92,17 +92,42 @@ impl MetaTemplate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
-    Var { name: Symbol, kind: Option<MetaVarKind>, id: Span },
-    Ignore { name: Symbol, id: Span },
+    Var { name: MetaVar, kind: Option<MetaVarKind>, id: Span },
+    Ignore { name: MetaVar, id: Span },
     Index { depth: usize },
     Len { depth: usize },
-    Count { name: Symbol, depth: usize },
+    Count { name: MetaVar, depth: usize },
     Concat { elements: Box<[ConcatMetaVarExprElem]>, span: Span },
     Repeat { tokens: MetaTemplate, kind: RepeatKind, separator: Option<Arc<Separator>> },
     Subtree { tokens: MetaTemplate, delimiter: tt::Delimiter },
     Literal(tt::Literal),
     Punct(Box<ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>),
     Ident(tt::Ident),
+}
+
+/// The name of a metavariable. Two of one spelling are two variables when they were written by
+/// different expansions, as the `$arg`s of a macro that another macro writes out an argument at a
+/// time.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MetaVar {
+    sym: Symbol,
+    ctx: SyntaxContext,
+}
+
+impl MetaVar {
+    pub(crate) fn new(sym: Symbol, span: Span) -> MetaVar {
+        MetaVar { sym, ctx: span.ctx }
+    }
+
+    pub(crate) fn sym(&self) -> &Symbol {
+        &self.sym
+    }
+}
+
+impl std::fmt::Display for MetaVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.sym.fmt(f)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,13 +264,13 @@ fn next_op(
                     }
                     tt::Leaf::Ident(ident) => {
                         let kind = eat_fragment_kind(edition, src, mode)?;
-                        let name = ident.sym.clone();
+                        let name = MetaVar::new(ident.sym.clone(), ident.span);
                         let id = ident.span;
                         Op::Var { name, kind, id }
                     }
                     tt::Leaf::Literal(lit) if is_boolean_literal(&lit) => {
                         let kind = eat_fragment_kind(edition, src, mode)?;
-                        let name = lit.text_and_suffix.clone();
+                        let name = MetaVar::new(lit.text_and_suffix.clone(), lit.span);
                         let id = lit.span;
                         Op::Var { name, kind, id }
                     }
@@ -400,7 +425,7 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
         s if sym::ignore == *s => {
             args_iter.expect_dollar()?;
             let ident = args_iter.expect_ident()?;
-            Op::Ignore { name: ident.sym.clone(), id: ident.span }
+            Op::Ignore { name: MetaVar::new(ident.sym.clone(), ident.span), id: ident.span }
         }
         s if sym::index == *s => Op::Index { depth: parse_depth(&mut args_iter)? },
         s if sym::len == *s => Op::Len { depth: parse_depth(&mut args_iter)? },
@@ -409,7 +434,7 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
             let ident = args_iter.expect_ident()?;
             let depth =
                 if try_eat_comma(&mut args_iter) { parse_depth(&mut args_iter)? } else { 0 };
-            Op::Count { name: ident.sym.clone(), depth }
+            Op::Count { name: MetaVar::new(ident.sym.clone(), ident.span), depth }
         }
         s if sym::concat == *s => {
             let mut elements = Vec::new();

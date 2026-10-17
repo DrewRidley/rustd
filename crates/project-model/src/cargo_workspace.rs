@@ -541,6 +541,36 @@ impl CargoWorkspace {
         }
     }
 
+    /// The workspace with each member package `moved` picks, by its directory, at the place
+    /// under `to` that it has under `from`. The workspace is told to be where it was.
+    pub fn placed(
+        &self,
+        from: &AbsPath,
+        to: &AbsPath,
+        moved: &dyn Fn(&AbsPath) -> bool,
+    ) -> CargoWorkspace {
+        let place = |path: &AbsPath| match path.strip_prefix(from) {
+            Some(inside) => to.join(inside),
+            None => path.to_path_buf(),
+        };
+        let mut placed = self.clone();
+        let mut targets = Vec::new();
+        for (_, package) in placed.packages.iter_mut() {
+            if !package.is_member || !moved(package.manifest.parent()) {
+                continue;
+            }
+            let manifest: &AbsPath = package.manifest.as_ref();
+            package.manifest =
+                ManifestPath::try_from(place(manifest)).expect("a manifest is in a directory");
+            targets.extend(package.targets.iter().copied());
+        }
+        for target in targets {
+            let root = place(&placed.targets[target].root);
+            placed.targets[target].root = root;
+        }
+        placed
+    }
+
     pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
         self.packages.iter().map(|(id, _pkg)| id)
     }
@@ -746,32 +776,18 @@ impl FetchMetadata {
         // - and thus doesn't require progress reporting or copying lockfiles.
         //
         // Useful as a fast fallback to extract info like `target-dir`.
-        let cached_meta = if !no_deps
-            && let Ok(cache_path) = std::env::var("RUSTD_CACHE_META")
-            && let Ok(expected_fp) = std::env::var("RUSTD_CACHE_FP")
-            && let Ok(text) = std::fs::read_to_string(format!("{cache_path}.{}", config.kind))
-            && let Some((fp_line, json_line)) = text.split_once('\n')
-            && fp_line == expected_fp
-            && let Ok(parsed) = cargo_metadata::MetadataCommand::parse(json_line.trim())
-        {
-            Some(parsed)
-        } else {
-            None
-        };
-
         let cargo_command;
-        let no_deps_result = if let Some(m) = cached_meta {
-            Ok(m)
-        } else if no_deps {
+        let no_deps_result = if no_deps {
             command.no_deps();
             cargo_command = command.cargo_command();
-            command.exec().with_context(|| format!("Failed to run `{cargo_command:?}`"))
+            command.exec()
         } else {
             let mut no_deps_command = command.clone();
             no_deps_command.no_deps();
             cargo_command = no_deps_command.cargo_command();
-            no_deps_command.exec().with_context(|| format!("Failed to run `{cargo_command:?}`"))
-        };
+            no_deps_command.exec()
+        }
+        .with_context(|| format!("Failed to run `{cargo_command:?}`"));
 
         Self {
             manifest_path: cargo_toml.clone(),
@@ -797,13 +813,13 @@ impl FetchMetadata {
             mut command,
             manifest_path: _,
             lockfile_copy,
-            kind,
+            kind: _,
             no_deps,
             no_deps_result,
             mut other_options,
         } = self;
 
-        if no_deps || no_deps_result.as_ref().is_ok_and(|m| m.resolve.is_some()) {
+        if no_deps {
             return no_deps_result.map(|m| (m, None));
         }
 
@@ -872,13 +888,7 @@ impl FetchMetadata {
                 .lines()
                 .find(|line| line.starts_with('{'))
                 .ok_or(cargo_metadata::Error::NoJson)?;
-            let parsed = cargo_metadata::MetadataCommand::parse(stdout)?;
-            if let Ok(cache_path) = std::env::var("RUSTD_CACHE_META")
-                && let Ok(fp) = std::env::var("RUSTD_CACHE_FP")
-            {
-                let _ = std::fs::write(format!("{cache_path}.{kind}"), format!("{fp}\n{stdout}\n"));
-            }
-            Ok((parsed, None))
+            Ok((cargo_metadata::MetadataCommand::parse(stdout)?, None))
         })()
         .with_context(|| format!("Failed to run `{:?}`", command.cargo_command()));
         progress("cargo metadata: finished".to_owned());

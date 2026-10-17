@@ -2109,4 +2109,20 @@ impl<const F: fn() -> ()> Wrapper<{
         "#,
         );
     }
+
+    #[test]
+    fn format_args_is_not_a_trait_new_in_scope() {
+        check_diagnostics(
+            r#"
+//- minicore: fmt
+trait Paint {
+    fn new(self) -> Option<Self> where Self: Sized { loop {} }
+}
+impl<T: ?Sized> Paint for T {}
+fn f(left: &str) {
+    let _ = format_args!("{left}");
+}
+"#,
+        );
+    }
 }

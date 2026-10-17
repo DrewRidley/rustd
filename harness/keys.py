@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""keys.py: whether the store hands a build code that was compiled from something else.
+
+The workspace in harness/keys has a function for each thing code can depend on that is not the
+text of its file. Each case builds the workspace with an empty store, changes one such thing,
+and builds again with the store the first build filled: the program has to print what cargo's
+does. "again" changes the checkout where it is, "elsewhere" changes a copy of it at another
+path, as a second worktree or another machine would have it.
+
+usage: keys.py [case ...]
+"""
+import os, shutil, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from difftest import Fixture
+
+
+def write(path, text):
+    return lambda ws, env, args: open(os.path.join(ws, path), "w").write(text)
+
+
+def replace(path, old, new):
+    def edit(ws, env, args):
+        text = open(os.path.join(ws, path)).read()
+        assert old in text, (path, old)
+        open(os.path.join(ws, path), "w").write(text.replace(old, new))
+    return edit
+
+
+def setenv(name, value):
+    return lambda ws, env, args: env.__setitem__(name, value)
+
+
+def arg(*more):
+    return lambda ws, env, args: args.extend(more)
+
+
+# What rustd does not do yet: these differ, and are told apart when they do.
+OPEN = {
+    # rustd reads `env!` and `option_env!` from what cargo and build scripts set, not from the
+    # variables of whoever asked for the build.
+    "a variable of the process read by option_env!",
+    # rustd has no profile: it compiles as `dev` does, with debug assertions and overflow checks.
+    "the release profile",
+}
+
+# (name, the change, the line of the program's output it has to show in or None for no line)
+CASES = [
+    ("nothing", lambda ws, env, args: None, None),
+    ("a file outside the package that is included", write("shared.txt", "shared anew"), "outside"),
+    ("a file of the package that is included", write("klib/src/inside.txt", "inside anew"), "inside"),
+    ("what a build script reads and generates code from", write("klib/gen.txt", "8"), "generated"),
+    ("a variable a build script reads and sets for the crate", setenv("KEYS_SCRIPT", "set"), "script_env"),
+    ("a cfg a build script sets", write("klib/flag", ""), "script_cfg"),
+    ("a feature", arg("--features", "extra"), "feature"),
+    ("a variable of the process read by option_env!", setenv("KEYS_PROCESS", "set"), "process_env"),
+    ("a variable of .cargo/config.toml", replace(".cargo/config.toml", '"config"', '"config anew"'), "config_env"),
+    ("a cfg of RUSTFLAGS", setenv("RUSTFLAGS", "--cfg keys_flag"), "flag_cfg"),
+    ("the release profile", arg("--release"), "assertions"),
+    ("a constant of a dependency", replace("kdep/src/lib.rs", "SCALE: u32 = 3", "SCALE: u32 = 4"), "scaled"),
+    ("an inlined function of a dependency", replace("kdep/src/lib.rs", "x + 1", "x + 2"), "scaled"),
+    ("the layout of a type of a dependency", replace("kdep/src/lib.rs", "pub side: u32,", "pub side: u32,\n    pub other: u64,"), "shape"),
+    ("a generic function of a dependency", replace("kdep/src/lib.rs", '"{:?} {}"', '"{:?} of {}"'), "described"),
+]
+
+
+def size(directory):
+    return sum(os.path.getsize(os.path.join(directory, name)) for name in os.listdir(directory))
+
+
+def build(ws, env, args):
+    """What cargo's program prints and what rustd's does, and how many functions were left to rustc."""
+    saved = dict(os.environ)
+    os.environ.update(env)
+    try:
+        fx = Fixture(ws, ["kapp", "klib", "kdep"], ["-p", "kapp", *args])
+        fx.rustd_args = [it for at, it in enumerate(args) if "--features" in args[max(0, at - 1):at + 1]]
+        fx.rustc_build()
+        fx.rustd_build()
+        left = sum(row[0] == "skipped" and "no rustc symbol" not in row[2] for rows in fx.reports.values() for row in rows)
+        return fx.behaviour(fx.reference), fx.behaviour(fx.binary), left
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        shutil.rmtree(fx.work, ignore_errors=True)
+
+
+def main():
+    work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-keys-"))
+    chosen = sys.argv[1:]
+    wrong = total = fixed = 0
+    for name, change, line in CASES:
+        if chosen and not any(it in name for it in chosen):
+            continue
+        for mode in ("again", "elsewhere"):
+            total += 1
+            at = os.path.join(work, str(total))
+            store, first = os.path.join(at, "store"), os.path.join(at, "first")
+            os.makedirs(store)
+            shutil.copytree(os.path.join(HERE, "keys"), first, ignore=shutil.ignore_patterns("target"))
+            env, args = {"RUSTD_CACHE": store}, []
+            want, got, _ = build(first, env, args)
+            problems = [] if want == got else ["the first build differs"]
+            filled = size(store)
+            second = first
+            if mode == "elsewhere":
+                second = os.path.join(at, "second")
+                shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
+            before = want
+            change(second, env, args)
+            want, got, left = build(second, env, args)
+            if want != got:
+                problems.append("the second build differs")
+            if line and before == want:
+                problems.append("cargo's program is the same after the change")
+            if left:
+                problems.append(f"{left} functions left to rustc")
+            known = name in OPEN
+            fixed += known and not problems
+            wrong += bool(problems) and not known
+            print(f"{'same     ' if not problems else 'open     ' if known else 'DIFFERENT'} {mode:9} {name}: store {filled} bytes, {size(store) - filled} more", flush=True)
+            for problem in problems:
+                print(f"    {problem}")
+            if want != got:
+                ours, theirs = (it[1].decode(errors="replace").splitlines() for it in (got, want))
+                for a, b in zip(theirs, ours):
+                    if a != b:
+                        print(f"    rustc: {a}\n    rustd: {b}")
+                if len(ours) != len(theirs):
+                    print(f"    rustd: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
+    still = sum(2 for name, _, _ in CASES if name in OPEN and (not chosen or any(it in name for it in chosen))) - fixed
+    print(f"{total - wrong - still} of {total - still} right, {still} open; {work}")
+    if fixed:
+        print(f"{fixed} of the open cases are the same now: take them out of OPEN")
+    sys.exit(1 if wrong or fixed else 0)
+
+
+if __name__ == "__main__":
+    main()

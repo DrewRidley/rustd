@@ -18,6 +18,7 @@ import os, re, shlex, signal, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["RUSTD_STATS"] = "1"
+import linkline
 from difftest import Fixture, RUSTD, sysroot_rlibs
 from bench import millis
 
@@ -140,10 +141,9 @@ def main():
     link, cargo_env, cargo_bin = [], None, None
     if a.cargo:
         args = list(fx.link_args)
-        first = next(i for i, arg in enumerate(args) if arg.endswith((".rlib", ".rcgu.o")))
         patch = os.path.join(fx.work, "rustd.patch.o")
         objects = [patch] * a.patch + [os.path.join(fx.work, "rustd.o")]
-        args[first:first] = [*objects, "-Wl,--allow-multiple-definition"]
+        args = linkline.ahead(args, objects, RUSTD)
         fx.binary = args[args.index("-o") + 1] = os.path.join(fx.work, "bin-rustd")
         link = ["--link-cmd", shlex.join(args)] + ["--patch", patch] * a.patch
         # cargo as it comes: incremental, and none of the flags the harness builds with.

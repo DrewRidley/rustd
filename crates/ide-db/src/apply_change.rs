@@ -1,6 +1,8 @@
 //! Applies changes to the IDE state transactionally.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use stdx::time::Instant;
 
 use profile::Bytes;
 use salsa::Database as _;

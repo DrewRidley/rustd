@@ -13,7 +13,8 @@ import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, RUSTD, sysroot_rlibs
+import linkline
+from difftest import Fixture, RUSTD, sysroot_rlibs, RUNNER, TARGET_ARGS, built, toolchain
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -218,16 +219,16 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
-        link[first:first] = [patch, obj, "-Wl,--allow-multiple-definition"]
-        link[link.index("-o") + 1] = binary
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], RUSTD), binary)
         for path in (socket, binary):
             if os.path.exists(path):
                 os.remove(path)
         seen = len(open(log_path).read())
+        # Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full.
+        splice = ["--binary", binary]
         daemon = subprocess.Popen(
             [RUSTD, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
-             "--patch", patch, "--link-cmd", shlex.join(link), *symbols], stderr=out, stdout=out)
+             "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
                 print("    daemon does not start on this source", flush=True)
@@ -237,7 +238,7 @@ def main():
 
     def run(path):
         try:
-            ran = subprocess.run([path], capture_output=True, text=True, timeout=30)
+            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -298,6 +299,9 @@ def main():
                     open(path, "a").write(op[2])
                 elif op[0] == "delete":
                     os.remove(path)
+        if os.environ.get("RUSTD_PATCH_FIRST"):
+            # The edit is first built for a request that does not link.
+            subprocess.run([RUSTD, "patch", socket], capture_output=True, text=True, timeout=120)
         asked = time.time()
         try:
             asked_for = subprocess.run([RUSTD, "sync", socket], capture_output=True, text=True, timeout=120)
@@ -306,7 +310,7 @@ def main():
             reply = "no reply in 120 s"
         took = (time.time() - asked) * 1000
         died = daemon.poll() is not None
-        cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp"], cwd=ws, capture_output=True, text=True,
+        cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
                                env={**os.environ, "CARGO_TARGET_DIR": reference})
         if (cargo.returncode != 0) != broken:
             raise SystemExit(f"step {index} {name!r}: cargo {'failed' if cargo.returncode else 'passed'}:\n{cargo.stderr[-2000:]}")
@@ -318,7 +322,7 @@ def main():
         elif kind == "error":
             verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
         else:
-            ours, theirs = run(binary), run(os.path.join(reference, "debug/sapp"))
+            ours, theirs = run(binary), run(built(reference, "sapp"))
             if ours == theirs:
                 verdict = "same"
             else:

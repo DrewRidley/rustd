@@ -782,9 +782,10 @@ fn relative_file(
     let lookup = call_id.loc(db);
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
-    let res: FileId = db
-        .resolve_path(path)
-        .ok_or_else(|| ExpandError::other(err_span, format!("failed to load file `{path_str}`")))?;
+    let res: FileId = db.resolve_path(path).ok_or_else(|| {
+        db.include_source(path);
+        ExpandError::other(err_span, format!("failed to load file `{path_str}`"))
+    })?;
     // Prevent include itself
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`")))
@@ -949,6 +950,7 @@ fn include_str_expand(
 
 fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
+    db.env_is_read(krate, key.as_str());
     krate.env(db).get(key.as_str())
 }
 

@@ -56,7 +56,7 @@ use crate::{
     fixup::SyntaxFixupUndoInfo,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt, span_with_mixed_site_ctxt},
     proc_macro::{CustomProcMacroExpander, ProcMacroKind, ProcMacros},
-    span_map::{ExpansionSpanMap, RealSpanMap, SpanMap},
+    span_map::{ExpansionSpanMap, MacroRulesArgs, RealSpanMap, SpanMap},
 };
 
 pub use crate::{
@@ -601,16 +601,20 @@ impl MacroCallId {
                     return dummy_tt(kind);
                 }
 
-                let mut tt = syntax_bridge::syntax_node_to_token_tree(
-                    tt.syntax(),
-                    map,
-                    span,
-                    if loc.def.is_proc_macro() {
-                        DocCommentDesugarMode::ProcMacro
-                    } else {
-                        DocCommentDesugarMode::Mbe
-                    },
-                );
+                let mode = if loc.def.is_proc_macro() {
+                    DocCommentDesugarMode::ProcMacro
+                } else {
+                    DocCommentDesugarMode::Mbe
+                };
+                let mut tt = match loc.def.kind {
+                    MacroDefKind::Declarative(..) => syntax_bridge::syntax_node_to_token_tree(
+                        tt.syntax(),
+                        MacroRulesArgs(map),
+                        span,
+                        mode,
+                    ),
+                    _ => syntax_bridge::syntax_node_to_token_tree(tt.syntax(), map, span, mode),
+                };
                 if loc.def.is_proc_macro() {
                     // proc macros expect their inputs without parentheses, MBEs expect it with them included
                     tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);

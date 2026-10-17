@@ -1,7 +1,7 @@
 //! Helper functions for working with def, which don't need to be a separate
 //! query, but can't be computed directly from `*Data` (ie, which need a `db`).
 
-use std::iter::Enumerate;
+use std::{borrow::Cow, iter::Enumerate};
 
 use base_db::target::{self, TargetData};
 use hir_def::{
@@ -99,11 +99,11 @@ pub fn detect_variant_from_bytes<'a>(
     target_data_layout: &TargetDataLayout,
     b: &[u8],
     e: EnumId,
-) -> Option<(EnumVariantId, &'a Layout)> {
+) -> Option<(EnumVariantId, Cow<'a, Layout>)> {
     let (var_id, var_layout) = match &layout.variants {
         hir_def::layout::Variants::Empty => unreachable!(),
         hir_def::layout::Variants::Single { index } => {
-            (e.enum_variants(db).variants[index.0].0, layout)
+            (e.enum_variants(db).variants[index.0].0, Cow::Borrowed(layout))
         }
         hir_def::layout::Variants::Multiple { tag, tag_encoding, variants, .. } => {
             let tag_size = tag.size(target_data_layout);
@@ -112,18 +112,17 @@ pub fn detect_variant_from_bytes<'a>(
             let tag = i128::from_le_bytes(pad16(&b[offset..offset + size], IsSigned::No));
             match tag_encoding {
                 TagEncoding::Direct => {
-                    let (var_idx, layout) =
-                        variants.iter_enumerated().find_map(|(var_idx, v)| {
-                            let def = e.enum_variants(db).variants[var_idx.0].0;
-                            (db.const_eval_discriminant(def) == Ok(tag)).then_some((def, v))
-                        })?;
-                    (var_idx, layout)
+                    let (def, var_idx) = variants.indices().find_map(|var_idx| {
+                        let def = e.enum_variants(db).variants[var_idx.0].0;
+                        (db.const_eval_discriminant(def) == Ok(tag)).then_some((def, var_idx))
+                    })?;
+                    (def, Cow::Owned(Layout::for_variant(layout, var_idx)))
                 }
                 TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                     // Compute the variant this niche value/"tag" corresponds to. With niche layout,
                     // discriminant (encoded in niche/tag) and variant index are the same.
-                    let variants_start = niche_variants.start().0;
-                    let variants_end = niche_variants.end().0;
+                    let variants_start = niche_variants.start.0;
+                    let variants_end = niche_variants.last.0;
 
                     // Match rustc's Sub, which uses overflowing_sub().
                     // https://github.com/rust-lang/rust/blob/e023590de407f417e0f3da675a372eca7acf60c6/compiler/rustc_const_eval/src/interpret/operator.rs#L256
@@ -155,10 +154,13 @@ pub fn detect_variant_from_bytes<'a>(
                     // Reading the discriminant of an uninhabited variant is UB. This is the basis for the
                     // `uninhabited_enum_branching` MIR pass. It also ensures consistency with
                     // `write_discriminant`.
-                    if variants[variant].uninhabited {
+                    if variants[variant].is_uninhabited() {
                         return None;
                     }
-                    (e.enum_variants(db).variants[variant.0].0, &variants[variant])
+                    (
+                        e.enum_variants(db).variants[variant.0].0,
+                        Cow::Owned(Layout::for_variant(layout, variant)),
+                    )
                 }
             }
         }

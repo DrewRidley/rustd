@@ -1797,14 +1797,20 @@ impl<'db> Interner for DbInterner<'db> {
         };
         let block = trait_def_id.0.loc(self.db).container.block(self.db);
 
+        // The impls of a block are among those of its crate as well as its own, and the solver
+        // takes a second copy for an ambiguity.
+        let mut seen = Vec::new();
         try_visit!(TraitImpls::for_each_block(self.db, block, &mut |impls| {
             for &impl_ in impls.blanket_impls(trait_def_id.0) {
+                seen.push(impl_);
                 try_visit!(f(impl_.into()));
             }
             R::output()
         }));
         for &impl_ in TraitImpls::blanket_in_crate_and_deps(self.db, krate, trait_def_id.0) {
-            try_visit!(f(impl_.into()));
+            if !seen.contains(&impl_) {
+                try_visit!(f(impl_.into()));
+            }
         }
         R::output()
     }

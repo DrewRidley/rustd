@@ -38,7 +38,13 @@ pub(crate) struct Moved {
 
 impl Tree {
     pub(crate) fn new(db: &RootDatabase, vfs: Vfs, watched: &[(FileId, &Path)]) -> Tree {
-        let mut directories = FxHashMap::default();
+        let mut tree = Tree { vfs, directories: FxHashMap::default() };
+        tree.watch(db, watched);
+        tree
+    }
+
+    /// Looks for new files next to `watched` too.
+    pub(crate) fn watch(&mut self, db: &RootDatabase, watched: &[(FileId, &Path)]) {
         for &(file, path) in watched {
             let root = db.file_source_root(file).source_root_id(db);
             if db.source_root(root).source_root(db).is_library {
@@ -46,19 +52,39 @@ impl Tree {
             }
             let Some(parent) = path.parent() else { continue };
             let listed = std::fs::metadata(parent).and_then(|it| it.modified()).ok();
-            directories.entry(parent.to_owned()).or_insert(Directory { root, listed });
+            self.directories.entry(parent.to_owned()).or_insert(Directory { root, listed });
         }
-        Tree { vfs, directories }
+    }
+
+    /// Has the directories under `base` listed again: they are read from somewhere else now.
+    pub(crate) fn relist(&mut self, base: &Path) {
+        for (path, dir) in &mut self.directories {
+            if path.starts_with(base) {
+                dir.listed = None;
+            }
+        }
+    }
+
+    pub(crate) fn vfs(&mut self) -> &mut Vfs {
+        &mut self.vfs
     }
 
     /// The source files that are new since the last look. Each is in its source root once
     /// this returns, with no text in it yet.
+    /// Whether [`Tree::added`] has directories to list again.
+    pub(crate) fn relisted(&self, db: &RootDatabase) -> bool {
+        self.directories.iter().any(|(path, dir)| {
+            let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
+            now.is_some() && now != dir.listed
+        })
+    }
+
     pub(crate) fn added(&mut self, db: &mut RootDatabase) -> Moved {
         let mut stale: Vec<PathBuf> = self
             .directories
             .iter()
             .filter(|(path, dir)| {
-                let now = std::fs::metadata(path).and_then(|it| it.modified()).ok();
+                let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
                 now.is_some() && now != dir.listed
             })
             .map(|(path, _)| path.clone())
@@ -68,18 +94,20 @@ impl Tree {
         while let Some(path) = stale.pop() {
             let Some(dir) = self.directories.get_mut(&path) else { continue };
             let root = dir.root;
-            dir.listed = std::fs::metadata(&path).and_then(|it| it.modified()).ok();
-            let Ok(entries) = std::fs::read_dir(&path) else { continue };
+            let on_disk = db.on_disk(&path);
+            dir.listed = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
+            let Ok(entries) = std::fs::read_dir(&on_disk) else { continue };
             // A package's directory holds much that is not source: only the directories
             // with source right in them are looked into there.
-            let package = path.join("Cargo.toml").exists();
+            let package = on_disk.join("Cargo.toml").exists();
             for entry in entries.flatten() {
-                let entry_path = entry.path();
+                let (entry_on_disk, entry_path) = (entry.path(), path.join(entry.file_name()));
                 let Ok(kind) = entry.file_type() else { continue };
                 let hidden = entry.file_name().to_str().is_none_or(|it| it.starts_with('.'));
                 if kind.is_dir() {
                     let source = !hidden
-                        && (!package || entry.file_name() != "target" && holds_source(&entry_path));
+                        && (!package
+                            || entry.file_name() != "target" && holds_source(&entry_on_disk));
                     if source && !self.directories.contains_key(&entry_path) {
                         self.directories
                             .insert(entry_path.clone(), Directory { root, listed: None });
@@ -121,6 +149,46 @@ impl Tree {
         moved
     }
 
+    /// Puts the files an `include!` named that were not loaded, as they are not source by
+    /// their extension, in the source root of the file that includes them, with their text.
+    /// Whether [`Tree::included`] has files to add.
+    pub(crate) fn includes_more(&self, db: &RootDatabase) -> bool {
+        db.included_sources().into_iter().any(|(path, root)| {
+            let source_root = db.source_root(root).source_root(db);
+            !self
+                .vfs
+                .file_id(&VfsPath::from(path))
+                .is_some_and(|(file, _)| source_root.path_for_file(&file).is_some())
+        })
+    }
+
+    pub(crate) fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {
+        let mut added = Vec::new();
+        let mut joined: FxHashMap<SourceRootId, Vec<(FileId, VfsPath)>> = FxHashMap::default();
+        for (path, root) in db.included_sources() {
+            let vfs_path = VfsPath::from(path.clone());
+            let source_root = db.source_root(root).source_root(db);
+            if let Some((file, _)) = self.vfs.file_id(&vfs_path)
+                && source_root.path_for_file(&file).is_some()
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(db.on_disk(path.as_ref())) else { continue };
+            self.vfs.set_file_contents(vfs_path.clone(), Some(text.clone().into_bytes()));
+            let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
+            let durability =
+                if source_root.is_library { Durability::HIGH } else { Durability::LOW };
+            db.set_file_text_with_durability(file, &text, durability);
+            db.set_file_source_root_with_durability(file, root, durability);
+            joined.entry(root).or_default().push((file, vfs_path));
+            added.push((file, path.into()));
+        }
+        for (root, files) in joined {
+            self.rewrite(db, root, files, &FxHashSet::default());
+        }
+        added
+    }
+
     /// Takes files that are gone out of their source roots, so that a path no longer leads
     /// to them.
     pub(crate) fn remove(&mut self, db: &mut RootDatabase, files: &[FileId]) {
@@ -151,11 +219,11 @@ impl Tree {
         for (file, path) in joined {
             files.insert(file, path);
         }
-        db.set_source_root_with_durability(
-            root,
-            Arc::new(SourceRoot::new_local(files)),
-            Durability::LOW,
-        );
+        let (source_root, durability) = match was.is_library {
+            true => (SourceRoot::new_library(files), Durability::HIGH),
+            false => (SourceRoot::new_local(files), Durability::LOW),
+        };
+        db.set_source_root_with_durability(root, Arc::new(source_root), durability);
     }
 }
 

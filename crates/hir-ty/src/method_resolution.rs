@@ -11,18 +11,20 @@ mod probe;
 
 use either::Either;
 use hir_expand::name::Name;
+use intern::Symbol;
 use salsa::SalsaValue;
 use span::Edition;
 use tracing::{debug, instrument};
 
 use base_db::Crate;
 use hir_def::{
-    AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, FunctionId, GenericParamId, HasModule,
-    ImplId, ItemContainerId, ModuleId, TraitId,
+    AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
+    GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::{Body, path::GenericArgs as HirGenericArgs},
     hir::{ExprId, generics::GenericParams},
+    item_scope::ItemScope,
     lang_item::LangItems,
     nameres::{DefMap, block_def_map, crate_def_map},
     resolver::Resolver,
@@ -37,6 +39,7 @@ use rustc_type_ir::{
     try_visit,
 };
 use stdx::impl_from;
+use syntax::SyntaxKind;
 use triomphe::Arc;
 
 use crate::{
@@ -540,6 +543,76 @@ pub(crate) fn find_matching_impl<'db>(
     }
 }
 
+/// The crates rustc loads to compile `krate`, and so the ones whose impls it knows of: `krate`,
+/// the dependencies it names and what those load in turn. A dependency that is never named
+/// is not loaded, and with it go the impls that leave a type open: `assert_eq!(1.5, s.parse()
+/// .unwrap())` parses an `f64` until serde_json's `impl PartialEq<Value> for f64` is seen, and
+/// a test of a crate whose benches use criterion depends on serde_json.
+///
+/// Named is by the identifiers of `krate`'s files, which is more than rustc resolves (a local
+/// of the same name does) and less where a macro of another crate alone names the dependency.
+#[salsa::tracked(returns(deref))]
+pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+    let _p = tracing::info_span!("loaded_crates").entered();
+    let identifiers: FxHashSet<_> = crate_def_map(db, krate)
+        .modules(db)
+        .filter_map(|(_, module)| module.origin.file_id())
+        .flat_map(|file| {
+            let tokens = file.parse(db).syntax_node().descendants_with_tokens();
+            tokens.filter_map(|it| it.into_token()).filter(|it| it.kind() == SyntaxKind::IDENT)
+        })
+        .map(|ident| Symbol::intern(ident.text()))
+        .collect();
+    let named = |name: &Symbol| identifiers.contains(name);
+    let mut loaded = FxHashSet::default();
+    let mut ordered = vec![krate];
+    loaded.insert(krate);
+    for dep in &krate.data(db).dependencies {
+        let data = dep.crate_id.data(db);
+        let is_loaded = dep.is_sysroot()
+            || data.origin.is_lang()
+            || data.is_proc_macro
+            || named(dep.name.symbol());
+        if !is_loaded {
+            continue;
+        }
+        // The same of the dependency: the crates of its tests and benches are among its own.
+        for &dep in loaded_crates(db, dep.crate_id) {
+            if loaded.insert(dep) {
+                ordered.push(dep);
+            }
+        }
+    }
+    ordered.into()
+}
+
+/// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
+/// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
+/// name, and those are looked into in every crate. A function can hold one as well, of a type
+/// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
+/// functions are looked into in the crates of the workspace alone: lowering every body of
+/// every dependency for this is too much.
+fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
+    let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
+    if !krate.data(db).origin.is_local() {
+        return holders;
+    }
+    let declared = scope.declarations().filter_map(|def| match def {
+        ModuleDefId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+        ModuleDefId::StaticId(it) => Some(DefWithBodyId::from(it)),
+        _ => None,
+    });
+    holders.extend(declared);
+    let in_impls =
+        scope.impls().flat_map(|it| &it.impl_items(db).items).filter_map(|(_, item)| match *item {
+            AssocItemId::FunctionId(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::ConstId(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::TypeAliasId(_) => None,
+        });
+    holders.extend(in_impls);
+    holders
+}
+
 #[salsa::tracked(returns(ref))]
 fn crates_containing_incoherent_inherent_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
@@ -661,11 +734,8 @@ impl<'db> InherentImpls<'db> {
                     }
                 }
 
-                // To better support custom derives, collect impls in all unnamed const items.
-                // const _: () = { ... };
-                for konst in module_data.scope(db).unnamed_consts() {
-                    let body = Body::of(db, konst.into());
-                    for (_, block_def_map) in body.blocks(db) {
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                         collect(db, block_def_map, map);
                     }
                 }
@@ -750,7 +820,7 @@ impl<'db> TraitImpls<'db> {
 
     #[salsa::tracked(returns(deref))]
     pub fn for_crate_and_deps(db: &'db dyn HirDatabase, krate: Crate) -> Box<[Arc<Self>]> {
-        krate.transitive_deps(db).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
+        loaded_crates(db, krate).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
     }
 
     /// The impls of one trait for one type in `krate` and its dependencies. An impl added for
@@ -849,11 +919,8 @@ impl<'db> TraitImpls<'db> {
                     entry.1.push(impl_id);
                 }
 
-                // To better support custom derives, collect impls in all unnamed const items.
-                // const _: () = { ... };
-                for konst in module_data.scope(db).unnamed_consts() {
-                    let body = Body::of(db, konst.into());
-                    for (_, block_def_map) in body.blocks(db) {
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                         collect(db, block_def_map, lang_items, map);
                     }
                 }

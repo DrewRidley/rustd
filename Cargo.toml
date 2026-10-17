@@ -1,6 +1,8 @@
 [workspace]
 members = ["xtask/", "lib/*", "lib/ungrammar/ungrammar2json", "crates/*"]
-exclude = ["crates/proc-macro-srv/proc-macro-test/imp"]
+# `rustd-wasm` turns on a feature of `hir-ty` that swaps the code generator's output, which
+# must not be unified into a build of the native crates.
+exclude = ["crates/proc-macro-srv/proc-macro-test/imp", "crates/rustd-wasm"]
 resolver = "2"
 
 [workspace.package]
@@ -35,6 +37,8 @@ inherits = "release"
 debug = 2
 
 [patch.'crates-io']
+# rustc's layout code, from the tag of the stable in `harness/toolchain`.
+ra-ap-rustc_abi = { path = "lib/rustc_abi" }
 # rowan = { path = "../rowan" }
 
 # line-index = { path = "lib/line-index" }

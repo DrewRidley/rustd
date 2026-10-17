@@ -31,6 +31,37 @@ mod tests;
 
 pub trait SpanMapper {
     fn span_for(&self, range: TextRange) -> Span;
+
+    /// The macro fragments that start and that end with the token at `range`, see
+    /// [`MacroFragments`].
+    fn fragment_bounds(&self, _range: TextRange) -> FragmentBounds {
+        FragmentBounds::default()
+    }
+}
+
+/// How many macro fragments a token starts and how many it ends.
+#[derive(Default, Clone, Copy)]
+pub struct FragmentBounds {
+    pub starting: usize,
+    pub ending: usize,
+}
+
+/// The spans of a macro expansion for the arguments of a `macro_rules` macro called in it. A
+/// fragment that the expansion substituted is one token tree to that macro: an `$e:expr` that was
+/// `0` does not match a `0` in a rule, and a `$t:ty` that was `a::B` is one `$t:tt`.
+pub struct MacroFragments<'a>(pub &'a SpanMap);
+
+impl SpanMapper for MacroFragments<'_> {
+    fn span_for(&self, range: TextRange) -> Span {
+        self.0.span_for(range)
+    }
+
+    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
+        FragmentBounds {
+            starting: self.0.fragments_starting_at(range.start()),
+            ending: self.0.fragments_ending_at(range.end()),
+        }
+    }
 }
 
 impl SpanMapper for SpanMap {
@@ -42,6 +73,10 @@ impl SpanMapper for SpanMap {
 impl<SM: SpanMapper> SpanMapper for &SM {
     fn span_for(&self, range: TextRange) -> Span {
         SM::span_for(self, range)
+    }
+
+    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
+        SM::fragment_bounds(self, range)
     }
 }
 
@@ -213,7 +248,20 @@ where
     let mut builder =
         tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(conv.call_site()));
 
+    // The fragments that the last token ended, with its span.
+    let mut ended = (0, conv.call_site());
     while let Some((token, abs_range)) = conv.bump() {
+        close_fragments(&mut builder, ended);
+        let fragments = conv.fragment_bounds(abs_range);
+        if fragments.starting > 0 || fragments.ending > 0 {
+            let span = conv.span_for(abs_range);
+            for _ in 0..fragments.starting {
+                builder.open(tt::DelimiterKind::Invisible, span);
+            }
+            ended = (fragments.ending, span);
+        } else {
+            ended.0 = 0;
+        }
         let tt = match token.as_leaf() {
             // These delimiters are not actually valid punctuation, but we produce them in syntax fixup.
             // So we need to handle them specially here.
@@ -350,12 +398,24 @@ where
 
         builder.push(tt);
     }
+    close_fragments(&mut builder, ended);
 
     while builder.expected_delimiters().next().is_some() {
         // FIXME: record an error somewhere?
         builder.close(conv.call_site());
     }
     builder.build_skip_top_subtree()
+}
+
+/// Closes the `count` fragments that the token at `span` ended, of those that started in these
+/// tokens: a fragment may be more than the arguments of a macro in it.
+fn close_fragments(builder: &mut tt::TopSubtreeBuilder, (count, span): (usize, Span)) {
+    for _ in 0..count {
+        if builder.expected_delimiters().next() != Some(tt::DelimiterKind::Invisible) {
+            break;
+        }
+        builder.close(span);
+    }
 }
 
 fn is_single_token_op(kind: SyntaxKind) -> bool {
@@ -499,6 +559,10 @@ trait TokenConverter: Sized {
     fn peek(&self) -> Option<Self::Token>;
 
     fn span_for(&self, range: TextRange) -> Span;
+
+    fn fragment_bounds(&self, _range: TextRange) -> FragmentBounds {
+        FragmentBounds::default()
+    }
 
     fn call_site(&self) -> Span;
 }
@@ -829,6 +893,10 @@ where
     fn span_for(&self, range: TextRange) -> Span {
         self.map.span_for(range)
     }
+
+    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
+        self.map.fragment_bounds(range)
+    }
     fn call_site(&self) -> Span {
         self.call_site
     }
@@ -840,6 +908,10 @@ struct TtTreeSink<'a> {
     text_pos: TextSize,
     inner: SyntaxTreeBuilder,
     token_map: SpanMap,
+    /// Where the token trees without delimiters start that the cursor is in.
+    open_fragments: Vec<TextSize>,
+    /// Where the last token ends, before the whitespace that may follow it.
+    token_end: TextSize,
 }
 
 impl<'a> TtTreeSink<'a> {
@@ -850,10 +922,24 @@ impl<'a> TtTreeSink<'a> {
             text_pos: 0.into(),
             inner: SyntaxTreeBuilder::default(),
             token_map: SpanMap::empty(),
+            open_fragments: Vec::new(),
+            token_end: 0.into(),
+        }
+    }
+
+    /// Records the token tree without delimiters that the cursor leaves as a macro fragment.
+    fn close_fragment(&mut self) {
+        if let Some(start) = self.open_fragments.pop()
+            && start < self.token_end
+        {
+            self.token_map.push_fragment(TextRange::new(start, self.token_end));
         }
     }
 
     fn finish(mut self) -> (Parse<SyntaxNode>, SpanMap) {
+        while !self.open_fragments.is_empty() {
+            self.close_fragment();
+        }
         self.token_map.finish();
         (self.inner.finish(), self.token_map)
     }
@@ -988,14 +1074,20 @@ impl TtTreeSink<'_> {
                         self.cursor.bump();
                         match delim_to_str(subtree.delimiter.kind, false) {
                             Some(it) => (it, subtree.delimiter.open),
-                            None => continue,
+                            None => {
+                                self.open_fragments.push(self.text_pos);
+                                continue;
+                            }
                         }
                     }
                     None => {
                         let parent = self.cursor.end();
                         match delim_to_str(parent.delimiter.kind, true) {
                             Some(it) => (it, parent.delimiter.close),
-                            None => continue,
+                            None => {
+                                self.close_fragment();
+                                continue;
+                            }
                         }
                     }
                 };
@@ -1009,6 +1101,7 @@ impl TtTreeSink<'_> {
         }
 
         self.token_map.push(self.text_pos, combined_span.expect("expected at least one token"));
+        self.token_end = self.text_pos;
         self.inner.token(kind, self.buf.as_str());
         self.buf.clear();
         // FIXME: Emitting whitespace for this is really just a hack, we should get rid of it.

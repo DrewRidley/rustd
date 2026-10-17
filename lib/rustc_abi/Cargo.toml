@@ -1,0 +1,23 @@
+# rustc's `rustc_abi`, as it is at the tag of the toolchain in `harness/toolchain`: `src` is
+# `compiler/rustc_abi/src` of rust-lang/rust at 1.99.0, unchanged. It takes the place of the
+# crates.io `ra-ap-rustc_abi`, whose snapshots are of no stable release.
+[package]
+name = "ra-ap-rustc_abi"
+version = "0.166.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "ra_ap_rustc_abi"
+
+[features]
+# Both need the compiler's own crates.
+nightly = []
+randomize = []
+
+[dependencies]
+bitflags = "2.4.1"
+rustc_hashes = { version = "0.166.0", package = "ra-ap-rustc_hashes" }
+rustc_index = { version = "0.166.0", package = "ra-ap-rustc_index", default-features = false }
+tracing = "0.1"

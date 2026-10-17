@@ -1025,7 +1025,7 @@ fn render_const_scalar_inner<'db>(
                         f,
                         field_types,
                         f.db.trait_environment(def.into()),
-                        var_layout,
+                        &var_layout,
                         args,
                         b,
                         memory_map,

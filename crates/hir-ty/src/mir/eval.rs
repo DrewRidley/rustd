@@ -44,7 +44,7 @@ use crate::{
     consteval::{self, ConstEvalError, try_const_usize},
     db::{GeneralConstId, HirDatabase, InternedClosureId},
     infer::PointerCast,
-    layout::{Layout, LayoutError, RustcEnumVariantIdx},
+    layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         AliasTy, Allocation, AllocationData, Const, ConstKind, DbInterner, ErrorGuaranteed,
@@ -65,30 +65,13 @@ use super::{
 mod shim;
 
 macro_rules! from_bytes {
-    (usize, $value:expr) => {{
-        let val: &[u8] = &($value);
-        if let Ok(b) = <[u8; 4]>::try_from(val) {
-            u32::from_le_bytes(b) as usize
-        } else if let Ok(b) = <[u8; size_of::<usize>()]>::try_from(val) {
-            usize::from_le_bytes(b)
-        } else {
-            return Err(MirEvalError::InternalError(
-                "mismatched size in constructing usize".into(),
-            ));
+    // A `usize` of the target, which is as wide as what holds it.
+    (usize, $value:expr) => {
+        match $crate::mir::eval::usize_of(AsRef::<[u8]>::as_ref(&$value)) {
+            Some(it) => it,
+            None => return Err(MirEvalError::InternalError("mismatched size in constructing usize".into())),
         }
-    }};
-    (isize, $value:expr) => {{
-        let val: &[u8] = &($value);
-        if let Ok(b) = <[u8; 4]>::try_from(val) {
-            i32::from_le_bytes(b) as isize
-        } else if let Ok(b) = <[u8; size_of::<isize>()]>::try_from(val) {
-            isize::from_le_bytes(b)
-        } else {
-            return Err(MirEvalError::InternalError(
-                "mismatched size in constructing isize".into(),
-            ));
-        }
-    }};
+    };
     ($ty:tt, $value:expr) => {
         ($ty::from_le_bytes(match ($value).try_into() {
             Ok(it) => it,
@@ -236,6 +219,9 @@ pub struct Evaluator<'a, 'db> {
     cached_fn_mut_trait_func: Option<FunctionId>,
     cached_fn_once_trait_func: Option<FunctionId>,
     crate_id: Crate,
+    /// The types whose `TypeId` was asked for. An id here is the type's place in this list,
+    /// which says whether two are of one type and is not the hash compiled code has.
+    type_ids: Vec<Ty<'db>>,
     // FIXME: This is a workaround, see the comment on `interpret_mir`
     assert_placeholder_ty_is_unused: bool,
     /// A general limit on execution, to prevent non terminating programs from breaking r-a main process
@@ -282,12 +268,7 @@ impl Interval {
         memory: &mut Evaluator<'a, 'db>,
         bytes: &[u8],
     ) -> Result<'db, ()> {
-        let slice = if bytes.len() > self.size && self.size > 0 {
-            &bytes[..self.size]
-        } else {
-            bytes
-        };
-        memory.write_memory(self.addr, slice)
+        memory.write_memory(self.addr, bytes)
     }
 
     fn write_from_interval<'a, 'db>(
@@ -339,8 +320,32 @@ impl IntervalOrOwned {
     }
 }
 
-const STACK_OFFSET: usize = 1 << 30;
-const HEAP_OFFSET: usize = 1 << 29;
+/// Where the addresses of the stack and of the heap start, which have to fit an address
+/// of the target.
+fn stack_offset() -> usize {
+    1 << (target_word() * 8 - 4)
+}
+
+fn heap_offset() -> usize {
+    1 << (target_word() * 8 - 5)
+}
+
+/// How many bytes an address of the target takes.
+fn target_word() -> usize {
+    crate::mir::codegen::Target::current().word()
+}
+
+/// The `usize` of the target that `bytes` are.
+fn usize_of(bytes: &[u8]) -> Option<usize> {
+    let mut word = [0; size_of::<usize>()];
+    (bytes.len() == target_word()).then(|| word[..bytes.len()].copy_from_slice(bytes))?;
+    Some(usize::from_le_bytes(word))
+}
+
+/// `value` as a `usize` of the target.
+fn word_bytes(value: usize) -> smallvec::SmallVec<[u8; 8]> {
+    smallvec::SmallVec::from_slice(&value.to_le_bytes()[..target_word()])
+}
 
 impl Address {
     fn from_bytes<'db>(it: &[u8]) -> Result<'db, Self> {
@@ -348,27 +353,23 @@ impl Address {
     }
 
     fn from_usize(it: usize) -> Self {
-        if it > STACK_OFFSET {
-            Stack(it - STACK_OFFSET)
-        } else if it > HEAP_OFFSET {
-            Heap(it - HEAP_OFFSET)
+        if it > stack_offset() {
+            Stack(it - stack_offset())
+        } else if it > heap_offset() {
+            Heap(it - heap_offset())
         } else {
             Invalid(it)
         }
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
-        if crate::mir::codegen::is_wasm32() {
-            (self.to_usize() as u32).to_le_bytes().to_vec()
-        } else {
-            usize::to_le_bytes(self.to_usize()).to_vec()
-        }
+    fn to_bytes(&self) -> smallvec::SmallVec<[u8; 8]> {
+        word_bytes(self.to_usize())
     }
 
     fn to_usize(&self) -> usize {
         match self {
-            Stack(it) => *it + STACK_OFFSET,
-            Heap(it) => *it + HEAP_OFFSET,
+            Stack(it) => *it + stack_offset(),
+            Heap(it) => *it + heap_offset(),
             Invalid(it) => *it,
         }
     }
@@ -541,6 +542,12 @@ impl<'db> Evaluator<'db, 'db> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
         let interval = self.interpret_mir(body, None.into_iter())?;
+        // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
+        // so only a constant that cannot carry one is answered: a `bool`, which is what
+        // comparing two gives, as `IS_UNIT` in core does.
+        if !self.type_ids.is_empty() && !matches!(ty.kind(), TyKind::Bool) {
+            not_supported!("a constant computed from a `TypeId`");
+        }
         let bytes = interval.get(self)?;
         let mut memory_map = self.create_memory_map(
             bytes,
@@ -603,6 +610,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             crate_id,
             stdout: vec![],
             stderr: vec![],
+            type_ids: Vec::new(),
             assert_placeholder_ty_is_unused,
             stack_depth_limit: 100,
             execution_limit: EXECUTION_LIMIT,
@@ -764,9 +772,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     };
                     metadata = match metadata {
                         Some(it) => {
-                            let prev_len = from_bytes!(u64, it.get(self)?);
+                            let prev_len = from_bytes!(usize, it.get(self)?) as u64;
                             Some(IntervalOrOwned::Owned(
-                                (prev_len - from - to).to_le_bytes().to_vec(),
+                                word_bytes((prev_len - from - to) as usize).to_vec(),
                             ))
                         }
                         None => None,
@@ -776,27 +784,25 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 }
                 ProjectionElem::Field(f) => {
                     let layout = self.layout(prev_ty.ty)?;
-                    let variant_layout = match &layout.variants {
+                    let offset = match &layout.variants {
                         Variants::Empty => {
                             return Err(MirEvalError::UndefinedBehavior(
                                 "field of an uninhabited type".to_owned(),
                             ));
                         }
-                        Variants::Single { .. } => &layout,
+                        Variants::Single { .. } => layout.fields.offset(f.0 as usize),
                         Variants::Multiple { variants, .. } => {
-                            &variants[match prev_ty.variant_id {
-                                Some(hir_def::VariantId::EnumVariantId(it)) => {
-                                    RustcEnumVariantIdx(it.index(self.db))
-                                }
-                                _ => {
-                                    return Err(MirEvalError::InternalError(
-                                        "mismatched layout".into(),
-                                    ));
-                                }
-                            }]
+                            let Some(hir_def::VariantId::EnumVariantId(it)) = prev_ty.variant_id
+                            else {
+                                return Err(MirEvalError::InternalError(
+                                    "mismatched layout".into(),
+                                ));
+                            };
+                            variants[RustcEnumVariantIdx(it.index(self.db))].field_offsets
+                                [RustcFieldIdx::new(f.0 as usize)]
                         }
                     };
-                    let offset = variant_layout.fields.offset(f.0 as usize).bytes_usize();
+                    let offset = offset.bytes_usize();
                     addr = addr.offset(offset);
                     // Unsized field metadata is equal to the metadata of the struct
                     if self.size_align_of(ty.ty, locals)?.is_some() {
@@ -903,6 +909,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                 locals.drop_flags.add_place(l.as_ref());
                             }
                             StatementKind::Deinit(_) => not_supported!("de-init statement"),
+                            StatementKind::InlineAsm(_) => not_supported!("inline assembly"),
                             StatementKind::StorageLive(_)
                             | StatementKind::FakeRead(_)
                             | StatementKind::StorageDead(_)
@@ -1407,11 +1414,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let ty = self.place_ty(p, locals)?;
                 let bytes = self.eval_place(p, locals)?.get(self)?;
                 let result = self.compute_discriminant(ty, bytes)?;
-                if crate::mir::codegen::is_wasm32() {
-                    Owned((result as i64).to_le_bytes().to_vec())
-                } else {
-                    Owned(result.to_le_bytes().to_vec())
-                }
+                Owned(result.to_le_bytes().to_vec())
             }
             Rvalue::Repeat(it, len) => {
                 let len = match try_const_usize(self.db, len.as_ref()) {
@@ -1642,7 +1645,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     self.const_eval_discriminant(e.enum_variants(self.db).variants[index.0].0)?;
                 Ok(r)
             }
-            Variants::Multiple { tag, tag_encoding, variants, .. } => {
+            Variants::Multiple { tag, tag_encoding, .. } => {
                 let size = tag.size(self.target_data_layout).bytes_usize();
                 let offset = layout.fields.offset(0).bytes_usize(); // The only field on enum variants is the tag field
                 let is_signed = tag.is_signed().into();
@@ -1651,18 +1654,20 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let tag = &bytes[offset..offset + size];
                         Ok(i128::from_le_bytes(pad16(tag, is_signed)))
                     }
-                    TagEncoding::Niche { untagged_variant, niche_start, .. } => {
+                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                         let tag = &bytes[offset..offset + size];
-                        let candidate_tag = i128::from_le_bytes(pad16(tag, is_signed))
-                            .wrapping_sub(*niche_start as i128)
+                        // A niche value stands for the variant that many after the first of
+                        // `niche_variants`, and the untagged one may lie among them.
+                        let relative = (u128::from_le_bytes(pad16(tag, IsSigned::No))
+                            .wrapping_sub(*niche_start)
+                            & (u128::MAX >> (128 - 8 * size)))
                             as usize;
-                        let idx = variants
-                            .iter_enumerated()
-                            .map(|(it, _)| it)
-                            .filter(|it| it != untagged_variant)
-                            .nth(candidate_tag)
-                            .unwrap_or(*untagged_variant)
-                            .0;
+                        let first = niche_variants.start.0;
+                        let idx = if relative <= niche_variants.last.0 - first {
+                            first + relative
+                        } else {
+                            untagged_variant.0
+                        };
                         let result =
                             self.const_eval_discriminant(e.enum_variants(self.db).variants[idx].0)?;
                         Ok(result)
@@ -1736,7 +1741,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     let mut r = Vec::with_capacity(16);
                     let addr = addr.get(self)?;
                     r.extend(addr.iter().copied());
-                    r.extend(len.to_le_bytes());
+                    r.extend(word_bytes(len));
                     Owned(r)
                 }
                 t => {
@@ -1748,7 +1753,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let mut r = Vec::with_capacity(16);
                 let addr = addr.get(self)?;
                 r.extend(addr.iter().copied());
-                r.extend(vtable.to_le_bytes());
+                r.extend(word_bytes(vtable));
                 Owned(r)
             }
             TyKind::Adt(adt_def, target_subst) => match &current_ty.kind() {
@@ -1807,25 +1812,22 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         let layout = self.layout_adt(adt, subst)?;
         Ok(match &layout.variants {
             Variants::Single { .. } | Variants::Empty => (layout.size.bytes_usize(), layout, None),
-            Variants::Multiple { variants, tag, tag_encoding, .. } => {
+            Variants::Multiple { tag, tag_encoding, .. } => {
                 let enum_variant_id = match it {
                     VariantId::EnumVariantId(it) => it,
                     _ => not_supported!("multi variant layout for non-enums"),
                 };
                 let mut discriminant = self.const_eval_discriminant(enum_variant_id)?;
                 let rustc_enum_variant_idx = RustcEnumVariantIdx(enum_variant_id.index(self.db));
-                let variant_layout = variants[rustc_enum_variant_idx].clone();
+                let variant_layout = Layout::for_variant(&layout, rustc_enum_variant_idx);
                 let have_tag = match tag_encoding {
                     TagEncoding::Direct => true,
-                    TagEncoding::Niche { untagged_variant, niche_variants: _, niche_start } => {
+                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                         if *untagged_variant == rustc_enum_variant_idx {
                             false
                         } else {
-                            discriminant = (variants
-                                .iter_enumerated()
-                                .filter(|(it, _)| it != untagged_variant)
-                                .position(|(it, _)| it == rustc_enum_variant_idx)
-                                .unwrap() as i128)
+                            discriminant = ((rustc_enum_variant_idx.0 - niche_variants.start.0)
+                                as i128)
                                 .wrapping_add(*niche_start as i128);
                             true
                         }
@@ -2292,6 +2294,30 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         Ok(layout.is_sized().then(|| (layout.size.bytes_usize(), layout.align.bytes() as usize)))
     }
 
+    /// The size of a value of a struct whose last field is a `str` or a slice, or of one of
+    /// those, given the pointer metadata. `None` for a `dyn` tail.
+    fn size_of_unsized_struct(&self, ty: Ty<'db>, metadata: &[u8]) -> Result<'db, Option<usize>> {
+        let len = from_bytes!(usize, metadata);
+        Ok(match ty.kind() {
+            TyKind::Str => Some(len),
+            TyKind::Slice(inner) => Some(self.layout(inner)?.size.bytes_usize() * len),
+            TyKind::Adt(adt, subst) => {
+                let AdtId::StructId(id) = adt.def_id() else { return Ok(None) };
+                let layout = self.layout(ty)?;
+                let field_types = self.db.field_types(id.into());
+                let Some((_, last)) = field_types.iter().next_back() else { return Ok(None) };
+                let last = last.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                let Some(tail) = self.size_of_unsized_struct(last, metadata)? else {
+                    return Ok(None);
+                };
+                let start = layout.fields.offset(field_types.iter().count() - 1).bytes_usize();
+                let align = layout.align.bytes() as usize;
+                Some((start + tail).next_multiple_of(align))
+            }
+            _ => None,
+        })
+    }
+
     /// A version of `self.size_of` which returns error if the type is unsized. `what` argument should
     /// be something that complete this: `error: type {ty} was unsized. {what} should be sized`
     fn size_of_sized(
@@ -2422,6 +2448,16 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         None => {
                             let mut check_inner = None;
                             let (addr, meta) = bytes.split_at(bytes.len() / 2);
+                            if let TyKind::Adt(..) = t.kind() {
+                                // A struct with an unsized tail. FIXME: pointers in the
+                                // struct itself are not followed.
+                                if let Some(size) = this.size_of_unsized_struct(t, meta)? {
+                                    let addr = Address::from_bytes(addr)?;
+                                    let b = this.read_memory(addr, size)?;
+                                    mm.insert(addr.to_usize(), b.into());
+                                }
+                                return Ok(());
+                            }
                             let element_size = match t.kind() {
                                 TyKind::Str => 1,
                                 TyKind::Slice(t) => {
@@ -2606,15 +2642,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     ) -> Result<'db, ()> {
         let layout = self.layout(ty)?;
         let my_size = self.size_of_sized(ty, locals, "value to patch address")?;
-        let ps = self.ptr_size();
         use rustc_type_ir::TyKind;
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
-            let current = from_bytes!(usize, self.read_memory(addr, ps)?);
+            let current = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
             if let Some((id, offset)) = source.static_at(current) {
                 let location = self.eval_static(id, locals)?;
-                let start = from_bytes!(usize, self.read_memory(location, ps)?);
-                return self.write_memory(addr, &(start + offset).to_le_bytes()[..ps]);
+                let start = from_bytes!(usize, self.read_memory(location, self.ptr_size())?);
+                return self.write_memory(addr, &word_bytes(start + offset));
             }
         }
         match ty.kind() {
@@ -2625,7 +2660,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let current = from_bytes!(usize, self.read_memory(addr, my_size)?);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &it.to_le_bytes()[..ps])?;
+                                self.write_memory(addr, &word_bytes(*it))?;
                                 *it
                             }
                             None => current,
@@ -2646,14 +2681,14 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         let current = from_bytes!(usize, current);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &it.to_le_bytes()[..ps])?;
+                                self.write_memory(addr, &word_bytes(*it))?;
                                 *it
                             }
                             None => current,
                         };
                         let patched = Address::from_usize(patched);
                         if let TyKind::Slice(inner) = t.kind() {
-                            let len = from_bytes!(usize, &metadata);
+                            let len = from_bytes!(usize, metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;
                             for i in 0..len {
                                 self.patch_addresses(
@@ -2674,17 +2709,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             }
             // A raw pointer can point anywhere into the allocation that was kept for it.
             TyKind::RawPtr(..) => {
-                let current = from_bytes!(usize, self.read_memory(addr, ps)?);
+                let current = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
                 if let Some((start, _)) = source.memory_at(current)
                     && let Some(new_start) = patch_map.get(&start)
                 {
-                    self.write_memory(addr, &(new_start + (current - start)).to_le_bytes()[..ps])?;
+                    self.write_memory(addr, &word_bytes(new_start + (current - start)))?;
                 }
             }
             TyKind::FnPtr(_, _) => {
                 let ty = ty_of_bytes(self.read_memory(addr, my_size)?)?;
                 let new_id = self.vtable_map.id(ty);
-                self.write_memory(addr, &new_id.to_le_bytes()[..ps])?;
+                self.write_memory(addr, &word_bytes(new_id))?;
             }
             TyKind::Adt(id, args) => match id.def_id() {
                 AdtId::StructId(s) => {
@@ -2701,7 +2736,24 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         )?;
                     }
                 }
-                AdtId::UnionId(_) => (),
+                // As when the memory was kept: every word that is the address of something
+                // is taken to be a pointer.
+                AdtId::UnionId(_) => {
+                    if layout.align.abi.bytes_usize().is_multiple_of(self.ptr_size()) {
+                        let pointer =
+                            Ty::new_imm_ptr(self.interner(), Ty::new_unit(self.interner()));
+                        for word in 0..my_size / self.ptr_size() {
+                            self.patch_addresses(
+                                patch_map,
+                                source,
+                                ty_of_bytes,
+                                addr.offset(word * self.ptr_size()),
+                                pointer,
+                                locals,
+                            )?;
+                        }
+                    }
+                }
                 AdtId::EnumId(e) => {
                     if let Some((ev, layout)) = detect_variant_from_bytes(
                         &layout,
@@ -2771,12 +2823,23 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             | TyKind::Error(_)
             | TyKind::Placeholder(_)
             | TyKind::Dynamic(_, _)
-            | TyKind::Alias(..)
             | TyKind::Bound(_, _)
             | TyKind::Infer(_)
             | TyKind::Param(_)
             | TyKind::UnsafeBinder(_)
             | TyKind::CoroutineClosure(_, _) => (),
+            TyKind::Alias(..) => {
+                let normalized = ObligationCtxt::new(&self.infcx)
+                    .structurally_normalize_ty(
+                        &ObligationCause::dummy(),
+                        self.param_env.param_env,
+                        ty,
+                    )
+                    .unwrap_or(ty);
+                if !matches!(normalized.kind(), TyKind::Alias(..)) {
+                    self.patch_addresses(patch_map, source, ty_of_bytes, addr, normalized, locals)?;
+                }
+            }
         }
         Ok(())
     }
@@ -3363,7 +3426,7 @@ pub fn render_const_using_debug_impl<'db>(
         CallableDefId::FunctionId(debug_fmt_fn).into(),
         GenericArgs::new_from_slice(&[ty.into()]),
     ));
-    evaluator.write_memory(argument.offset(ptr_size), &debug_fmt_fn_ptr.to_le_bytes())?;
+    evaluator.write_memory(argument.offset(ptr_size), &word_bytes(debug_fmt_fn_ptr))?;
     // Since Rust 1.93 `core::fmt::Arguments` is two words wide:
     //   struct Arguments<'a> { template: NonNull<u8>, args: NonNull<Argument<'a>> }
     // `template` points at a byte-encoded format string; `format_args!("{:?}", x)` encodes to a

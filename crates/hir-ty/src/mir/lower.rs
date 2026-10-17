@@ -9,8 +9,9 @@ use hir_def::{
     ItemContainerId, LocalFieldId, Lookup, TraitId,
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
-        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ClosureKind, CoroutineKind, ExprId,
-        ExprOrPatId, LabelId, Literal, MatchArm, Pat, PatId, RecordLitField, RecordSpread,
+        ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
+        CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, MatchArm, Pat,
+        PatId, RecordLitField, RecordSpread,
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
@@ -22,7 +23,10 @@ use itertools::{EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
 use rustc_hash::FxHashMap;
-use rustc_type_ir::inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _};
+use rustc_type_ir::{
+    CoroutineArgs, CoroutineArgsParts,
+    inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
+};
 use salsa::SalsaValue;
 use span::Edition;
 
@@ -446,8 +450,120 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             Expr::InlineAsm(asm) if asm.comment_only => Ok(Some(current)),
-            Expr::InlineAsm(_) => {
-                not_supported!("builtin#asm")
+            Expr::InlineAsm(asm) => {
+                let Some(template) = &asm.template else {
+                    not_supported!("inline assembly whose template is not known");
+                };
+                let naked = match asm.kind {
+                    hir_def::hir::InlineAsmKind::Asm => false,
+                    hir_def::hir::InlineAsmKind::NakedAsm => true,
+                    hir_def::hir::InlineAsmKind::GlobalAsm => {
+                        not_supported!("`global_asm!` in a body")
+                    }
+                };
+                let mut labels = Vec::new();
+                let mut operands = Vec::with_capacity(asm.operands.len());
+                for (_, operand) in &asm.operands {
+                    let (reg, input, output) = match operand {
+                        AsmOperand::In { reg, expr } => (reg, Some(*expr), None),
+                        AsmOperand::Out { reg, expr, late: _ } => (reg, None, *expr),
+                        AsmOperand::InOut { reg, expr, late: _ } => (reg, Some(*expr), Some(*expr)),
+                        AsmOperand::SplitInOut { reg, in_expr, out_expr, late: _ } => {
+                            (reg, Some(*in_expr), *out_expr)
+                        }
+                        AsmOperand::Const(value) => {
+                            let Some((value, next)) =
+                                self.lower_expr_to_some_operand(*value, current)?
+                            else {
+                                return Ok(None);
+                            };
+                            current = next;
+                            operands.push(super::AsmOperand::Const(value));
+                            continue;
+                        }
+                        AsmOperand::Label(block) => {
+                            labels.push(*block);
+                            operands.push(super::AsmOperand::Label);
+                            continue;
+                        }
+                        AsmOperand::Sym(_) => not_supported!("inline assembly with a `sym`"),
+                    };
+                    let input = match input {
+                        Some(input) => {
+                            let Some((input, next)) =
+                                self.lower_expr_to_some_operand(input, current)?
+                            else {
+                                return Ok(None);
+                            };
+                            current = next;
+                            Some(input)
+                        }
+                        None => None,
+                    };
+                    let output = match output {
+                        Some(output) => {
+                            let Some((output, next)) =
+                                self.lower_expr_as_place(current, output, true)?
+                            else {
+                                return Ok(None);
+                            };
+                            current = next;
+                            Some(output.store())
+                        }
+                        None => None,
+                    };
+                    operands.push(super::AsmOperand::Reg { reg: reg.clone(), input, output });
+                }
+                let taken: Option<Place<'db>> = if labels.is_empty() {
+                    None
+                } else {
+                    let ty = Ty::new_uint(self.interner(), rustc_type_ir::UintTy::U64);
+                    Some(self.temp(ty, current, expr_id.into())?.into())
+                };
+                self.push_statement(
+                    current,
+                    StatementKind::InlineAsm(Box::new(super::InlineAsm {
+                        template: template.clone(),
+                        operands: operands.into(),
+                        options: asm.options,
+                        taken: taken.map(|it| it.store()),
+                        naked,
+                    }))
+                    .with_span(expr_id.into()),
+                );
+                let noreturn = naked || asm.options.contains(hir_def::hir::AsmOptions::NORETURN);
+                let Some(taken) = taken else {
+                    if noreturn {
+                        self.set_terminator(current, TerminatorKind::Unreachable, expr_id.into());
+                        return Ok(None);
+                    }
+                    return Ok(Some(current));
+                };
+                let end = self.new_basic_block();
+                if noreturn {
+                    self.set_terminator(end, TerminatorKind::Unreachable, expr_id.into());
+                }
+                let mut ends = (!noreturn).then_some(end);
+                let mut targets = Vec::with_capacity(labels.len());
+                for (at, label) in labels.into_iter().enumerate() {
+                    let start = self.new_basic_block();
+                    targets.push((at as u128 + 1, start));
+                    let unit = self.temp(Ty::new_unit(self.interner()), start, label.into())?;
+                    let label_end = self.lower_expr_to_place(label, unit.into(), start)?;
+                    ends = self.merge_blocks(ends, label_end, expr_id.into());
+                }
+                self.set_terminator(
+                    current,
+                    TerminatorKind::SwitchInt {
+                        discr: Operand {
+                            kind: OperandKind::Copy(taken.store()),
+                            span: Some(expr_id.into()),
+                        },
+                        targets: SwitchTargets::new(targets.into_iter(), end),
+                    },
+                    expr_id.into(),
+                );
+                Ok(ends)
             }
             Expr::Missing => {
                 if let Some(f) = self.owner.as_function() {
@@ -1231,6 +1347,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         expr_id.into(),
                     );
                 }
+                // `-128i8` is that number, not the negation of one `i8` does not have.
+                if let hir_def::hir::UnaryOp::Neg = op
+                    && !self.has_adjustments(*expr)
+                    && let Expr::Literal(literal @ hir_def::hir::Literal::Int(..)) =
+                        &self.store[*expr]
+                    && let Some(negated) = literal.clone().negate()
+                {
+                    let ty = self.expr_ty_without_adjust(*expr);
+                    let mut operand = self.lower_literal_to_operand(ty, &negated)?;
+                    operand.span = Some(expr_id.into());
+                    self.push_assignment(current, place, Rvalue::Use(operand), expr_id.into());
+                    return Ok(Some(current));
+                }
                 let Some((operand, current)) = self.lower_expr_to_some_operand(*expr, current)?
                 else {
                     return Ok(None);
@@ -1415,8 +1544,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             &Expr::Assignment { target, value } => {
-                let Some((value, mut current)) = self.lower_expr_to_fresh_place(value, current)?
-                else {
+                // `_ = place` moves nothing out of the place, as `let _ = place` does not.
+                let lowered = if matches!(self.store[target], Pat::Wild) {
+                    self.lower_expr_as_place(current, value, true)?
+                } else {
+                    self.lower_expr_to_fresh_place(value, current)?
+                };
+                let Some((value, mut current)) = lowered else {
                     return Ok(None);
                 };
                 self.push_fake_read(current, value, expr_id.into());
@@ -1428,12 +1562,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Closure {
                 closure_kind:
-                    ClosureKind::Closure | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. },
+                    ClosureKind::Closure
+                    | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
+                    | ClosureKind::CoroutineClosure(CoroutineKind::Async),
                 ..
             } => {
                 let ty = self.expr_ty_without_adjust(expr_id);
                 match ty.kind() {
                     TyKind::Closure(id, _) => self.result.closures.push(id.0),
+                    TyKind::CoroutineClosure(id, _) => {
+                        self.result.closures.push(id.0.as_closure(self.db))
+                    }
                     TyKind::Coroutine(..) => (),
                     _ => not_supported!("closure with non closure type"),
                 }
@@ -1596,10 +1735,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .type_of_type_placeholder(offset.container)
             .ok_or(MirLowerError::TypeError("unknown type in offset_of"))?;
         let base = self.temp(Ty::new_ptr(interner, ty, Mutability::Not), current, span)?;
-        let null = Operand::from_bytes(
-            Box::new(0usize.to_le_bytes()),
-            self.result.locals[base].ty.as_ref(),
-        );
+        let null = Operand::from_bytes(word_bytes(0), self.result.locals[base].ty.as_ref());
         self.push_assignment(current, base.into(), null.into(), span);
         let mut place = Place::from(base).project(ProjectionElem::Deref);
         let mut variant = None;
@@ -1714,31 +1850,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 )
                 .map(|it| it.size.bytes_usize())
         };
-        const USIZE_SIZE: usize = size_of::<usize>();
+        // A reference to `len` bytes, whose address the memory map gives: two words of the
+        // target.
+        let fat = |len: usize| -> Box<[u8]> { [word_bytes(0), word_bytes(len)].concat().into() };
         let bytes: Box<[_]> = match l {
             hir_def::hir::Literal::String(b) => {
                 let b = b.as_str();
-                let mut data = [0; { 2 * USIZE_SIZE }];
-                data[..USIZE_SIZE].copy_from_slice(&0usize.to_le_bytes());
-                data[USIZE_SIZE..].copy_from_slice(&b.len().to_le_bytes());
+                let data = fat(b.len());
                 let mm = MemoryMap::simple(b.as_bytes().into());
-                return Ok(Operand::from_concrete_const(Box::new(data), mm, ty));
+                return Ok(Operand::from_concrete_const(data, mm, ty));
             }
             hir_def::hir::Literal::CString(b) => {
                 let bytes = b.iter().copied().chain(iter::once(0)).collect::<Box<_>>();
 
-                let mut data = [0; { 2 * USIZE_SIZE }];
-                data[..USIZE_SIZE].copy_from_slice(&0usize.to_le_bytes());
-                data[USIZE_SIZE..].copy_from_slice(&bytes.len().to_le_bytes());
+                let data = fat(bytes.len());
                 let mm = MemoryMap::simple(bytes);
-                return Ok(Operand::from_concrete_const(Box::new(data), mm, ty));
+                return Ok(Operand::from_concrete_const(data, mm, ty));
             }
             hir_def::hir::Literal::ByteString(b) => {
-                let mut data = [0; { 2 * USIZE_SIZE }];
-                data[..USIZE_SIZE].copy_from_slice(&0usize.to_le_bytes());
-                data[USIZE_SIZE..].copy_from_slice(&b.len().to_le_bytes());
+                // A reference to an array is the address alone.
+                let mut data = fat(b.len()).into_vec();
+                data.truncate(size()?);
+                let data = data.into_boxed_slice();
                 let mm = MemoryMap::simple(b.clone());
-                return Ok(Operand::from_concrete_const(Box::new(data), mm, ty));
+                return Ok(Operand::from_concrete_const(data, mm, ty));
             }
             hir_def::hir::Literal::Char(c) => Box::new(u32::from(*c).to_le_bytes()),
             hir_def::hir::Literal::Bool(b) => Box::new([*b as u8]),
@@ -1962,6 +2097,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
                 exprs.clone().iter().all(|&it| self.is_promotable(it))
             }
+            // The length is a constant already.
+            &Expr::Array(Array::Repeat { initializer, .. }) => self.is_promotable(initializer),
             Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
                 fields.clone().iter().all(|it| self.is_promotable(it.expr))
             }
@@ -1983,7 +2120,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg,
             } => scalar(self, expr) && self.is_promotable(expr),
             &Expr::Cast { expr: inner, .. } => {
-                scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
+                // `function as fn()` is the function's address, as the coercion to it is.
+                let is_fn_address = matches!(self.store[inner], Expr::Path(_))
+                    && matches!(self.expr_ty_without_adjust(inner).kind(), TyKind::FnDef(..))
+                    && matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnPtr(..));
+                is_fn_address
+                    || scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
             }
             // Division is left out: it is only promoted when the divisor is known not to be 0.
             &Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
@@ -2039,12 +2181,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Some(it) => it.as_ref(),
             None => {
                 // FIXME: rustc's ty is dependent on the adt type, maybe we need to do that as well
-                let int_ty = if crate::mir::codegen::is_wasm32() {
-                    rustc_type_ir::IntTy::I64
-                } else {
-                    rustc_type_ir::IntTy::I128
-                };
-                let discr_ty = Ty::new_int(self.interner(), int_ty);
+                let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
                 let tmp: Place<'_> = self
                     .temp(discr_ty, current, MirSpan::Unknown)
                     .expect("discr_ty is never unsized")
@@ -2870,7 +3007,7 @@ pub fn mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    lower_closure_body(db, closure.loc(db))
+    lower_closure_body(db, closure.loc(db), CoroutineCaptures::Own)
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
@@ -2879,7 +3016,45 @@ pub fn mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    lower_closure_body(db, coroutine.loc(db))
+    lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::Own)
+}
+
+/// The body of the `async` block of an `async` closure that is called by value though it could
+/// be called again: the future that makes owns what the closure captured, where the block
+/// itself borrows from the closure.
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
+pub fn mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+) -> Result<'db, MirBody<'db>> {
+    lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
+}
+
+/// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
+/// what its `async` closure captured.
+pub fn is_by_move_coroutine<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    args: CoroutineArgs<DbInterner<'db>>,
+) -> bool {
+    let InternedClosure { owner, expr, .. } = coroutine.loc(db);
+    let store = ExpressionStore::of(db, owner.expression_store_owner(db));
+    let Expr::Closure {
+        closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
+        ..
+    } = &store[expr]
+    else {
+        return false;
+    };
+    let closure = ExpressionStore::closure_for_coroutine(expr);
+    let TyKind::CoroutineClosure(_, closure_args) =
+        InferenceResult::of(db, owner).expr_ty(closure).kind()
+    else {
+        return false;
+    };
+    let once = rustc_type_ir::ClosureKind::FnOnce;
+    args.kind_ty().to_opt_closure_kind() == Some(once)
+        && closure_args.as_coroutine_closure().kind() != once
 }
 
 fn mir_body_for_coroutine_cycle_result<'db>(
@@ -2902,9 +3077,20 @@ enum Receiver {
     Coroutine,
 }
 
+/// What the future of an `async` block holds of its surroundings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoroutineCaptures {
+    /// What the block itself captures.
+    Own,
+    /// The arguments of the `async` closure the block is the body of, then what that closure
+    /// captures.
+    OfClosure,
+}
+
 fn lower_closure_body<'db>(
     db: &'db dyn HirDatabase,
     InternedClosure { owner: body_owner, expr, .. }: InternedClosure<'db>,
+    held: CoroutineCaptures,
 ) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
@@ -2914,7 +3100,19 @@ fn lower_closure_body<'db>(
     let Some(closure_data) = infer.closures_data.get(&expr) else {
         not_supported!("closure without capture analysis");
     };
-    let captures = closure_data.min_captures.values().flatten();
+    let captures: Vec<&CapturedPlace> = match held {
+        CoroutineCaptures::Own => closure_data.min_captures.values().flatten().collect(),
+        CoroutineCaptures::OfClosure => {
+            let closure = ExpressionStore::closure_for_coroutine(expr);
+            let (Expr::Closure { args, .. }, Some(of_closure)) =
+                (&store[closure], infer.closures_data.get(&closure))
+            else {
+                implementation_error!("async block of a closure that is not one");
+            };
+            let arguments = closure_data.min_captures.values().flatten().take(args.len());
+            arguments.chain(of_closure.min_captures.values().flatten()).collect()
+        }
+    };
     let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
     let interner = ctx.interner();
     let by_ref = |mutability| {
@@ -2935,9 +3133,41 @@ fn lower_closure_body<'db>(
             };
             (receiver, ty, sig.inputs())
         }
-        crate::next_solver::TyKind::Coroutine(_, substs) => {
-            ctx.result.locals.alloc(Local { ty: substs.as_coroutine().return_ty().store() });
-            (Receiver::Coroutine, by_ref(Mutability::Mut), Default::default())
+        crate::next_solver::TyKind::CoroutineClosure(_, substs) => {
+            // Returns the future of its `async` block.
+            let sig = closure_data.liberated_sig.get();
+            ctx.result.locals.alloc(Local { ty: sig.output().store() });
+            let (receiver, ty) = match substs.as_coroutine_closure().kind() {
+                rustc_type_ir::ClosureKind::FnOnce => (Receiver::Owned, infer.expr_ty(expr)),
+                rustc_type_ir::ClosureKind::FnMut => (Receiver::Borrowed, by_ref(Mutability::Mut)),
+                rustc_type_ir::ClosureKind::Fn => (Receiver::Borrowed, by_ref(Mutability::Not)),
+            };
+            (receiver, ty, sig.inputs())
+        }
+        crate::next_solver::TyKind::Coroutine(id, substs) => {
+            let own = substs.as_coroutine();
+            ctx.result.locals.alloc(Local { ty: own.return_ty().store() });
+            let future = match held {
+                CoroutineCaptures::Own => infer.expr_ty(expr),
+                CoroutineCaptures::OfClosure => {
+                    let once = rustc_type_ir::ClosureKind::FnOnce;
+                    let parts = CoroutineArgsParts {
+                        parent_args: own.parent_args(),
+                        kind_ty: Ty::from_coroutine_closure_kind(interner, once),
+                        resume_ty: own.resume_ty(),
+                        yield_ty: own.yield_ty(),
+                        return_ty: own.return_ty(),
+                        tupled_upvars_ty: Ty::new_tup_from_iter(
+                            interner,
+                            captures.iter().map(|it| it.captured_ty(db)),
+                        ),
+                    };
+                    Ty::new_coroutine(interner, id, CoroutineArgs::new(interner, parts).args)
+                }
+            };
+            let future =
+                Ty::new_ref(interner, Region::new_erased(interner), future, Mutability::Mut);
+            (Receiver::Coroutine, future, Default::default())
         }
         _ => implementation_error!("closure expression is not closure"),
     };
@@ -2980,7 +3210,7 @@ fn lower_closure_body<'db>(
     let is_by_ref_closure = receiver == Receiver::Borrowed;
     let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedPlace, LocalId, usize)>> =
         FxHashMap::default();
-    for (capture_idx, capture) in captures.enumerate() {
+    for (capture_idx, capture) in captures.into_iter().enumerate() {
         let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
         let mut projections = Vec::with_capacity(2);
@@ -3233,6 +3463,9 @@ pub fn lower_body_to_mir<'db>(
         };
         let mut param_tys = callable_sig.inputs().iter().copied();
         let self_param = self_param.and_then(|id| Some((id, param_tys.next()?)));
+        // The signature has no type for `...`, whose pattern is the last and binds the list.
+        let list = params.last().filter(|_| callable_sig.c_variadic());
+        let param_tys = param_tys.chain(list.map(|list| infer.pat_ty(list.formal)));
 
         lower_to_mir_with_store(
             db,
@@ -3296,4 +3529,10 @@ pub fn lower_to_mir_with_store<'db>(
         ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());
     }
     Ok(ctx.result)
+}
+
+/// `value` as a `usize` of the target.
+fn word_bytes(value: usize) -> Box<[u8]> {
+    let word = crate::mir::codegen::Target::current().word();
+    value.to_le_bytes()[..word].into()
 }

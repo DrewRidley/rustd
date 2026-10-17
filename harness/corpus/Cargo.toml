@@ -1,3 +1,3 @@
 [workspace]
-members = ["cases", "old_macros", "runner"]
+members = ["cases", "kernels", "old_macros", "runner"]
 resolver = "2"

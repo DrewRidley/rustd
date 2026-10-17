@@ -450,6 +450,17 @@ impl<'db> Ty<'db> {
         matches!(self.kind(), TyKind::Char)
     }
 
+    /// What a closure captured, as a tuple, whether or not the closure is `async`.
+    pub fn closure_upvars_ty(self) -> Option<Ty<'db>> {
+        match self.kind() {
+            TyKind::Closure(_, args) => Some(args.as_closure().tupled_upvars_ty()),
+            TyKind::CoroutineClosure(_, args) => {
+                Some(args.as_coroutine_closure().tupled_upvars_ty())
+            }
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn is_coroutine_closure(self) -> bool {
         matches!(self.kind(), TyKind::CoroutineClosure(..))

@@ -683,7 +683,7 @@ impl ExpressionStore {
             Expr::OffsetOf(OffsetOf { container, fields: _ }) => visitor.on_type(*container),
             Expr::Path(path) => visitor.on_path(path),
             Expr::Continue { label: _ } | Expr::Missing | Expr::Literal(_) | Expr::Underscore => {}
-            Expr::InlineAsm(InlineAsm { operands, options: _, kind: _, comment_only: _ }) => {
+            Expr::InlineAsm(InlineAsm { operands, .. }) => {
                 operands.iter().for_each(|(_, op)| match op {
                     AsmOperand::In { expr, reg: _ }
                     | AsmOperand::Out { expr: Some(expr), late: _, reg: _ }

@@ -87,7 +87,7 @@ pub fn layout_of_adt_query(
         .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
         .collect::<SmallVec<[_; 1]>>();
     let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
-    let mut result = if matches!(def, AdtId::UnionId(..)) {
+    let result = if matches!(def, AdtId::UnionId(..)) {
         cx.calc.layout_of_union(&repr, &variants)?
     } else {
         cx.calc.layout_of_struct_or_enum(
@@ -95,67 +95,17 @@ pub fn layout_of_adt_query(
             &variants,
             matches!(def, AdtId::EnumId(..)),
             is_special_no_niche,
-            |min, max| repr_discr(dl, &repr, min, max).unwrap_or((Integer::I8, false)),
+            |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
             variants.iter_enumerated().filter_map(|(id, _)| {
                 let AdtId::EnumId(e) = def else { return None };
                 let d = db.const_eval_discriminant(e.enum_variants(db).variants[id.0].0).ok()?;
-                Some((id, d))
+                // As rustc has a discriminant: the bits of its type, and no more.
+                let size = Integer::from_attr(dl, repr.discr_type()).size();
+                Some((id, size.truncate(d as u128)))
             }),
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
     };
-    if let rustc_abi::Variants::Multiple {
-        ref mut tag,
-        tag_encoding:
-            rustc_abi::TagEncoding::Niche {
-                untagged_variant,
-                ref niche_variants,
-                ref mut niche_start,
-            },
-        ref variants,
-        ..
-    } = result.variants
-        && niche_variants.start() == niche_variants.end()
-        && let Some(orig_niche) = variants[untagged_variant].largest_niche
-    {
-        let v = orig_niche.valid_range;
-        let max_value = orig_niche.value.size(&dl).unsigned_int_max();
-        let distance_end_zero = max_value - v.end;
-        if v.start == 0 && v.start <= v.end && v.start <= distance_end_zero {
-            let new_start = v.end.wrapping_add(1) & max_value;
-            *niche_start = new_start;
-            *tag.valid_range_mut() = rustc_abi::WrappingRange { start: v.start, end: new_start };
-            match &mut result.backend_repr {
-                rustc_abi::BackendRepr::Scalar(s) => {
-                    *s = *tag;
-                }
-                rustc_abi::BackendRepr::ScalarPair(a, b) => {
-                    if orig_niche.offset == rustc_abi::Size::ZERO {
-                        *a = *tag;
-                    } else {
-                        *b = *tag;
-                    }
-                }
-                _ => {}
-            }
-            result.largest_niche = rustc_abi::Niche::from_scalar(&dl, orig_niche.offset, *tag);
-        }
-    }
-    let valid_range = AttrFlags::rustc_layout_scalar_valid_range(db, def);
-    if valid_range.start.is_some() || valid_range.end.is_some() {
-        if let rustc_abi::BackendRepr::Scalar(scalar)
-        | rustc_abi::BackendRepr::ScalarPair(scalar, _) = &mut result.backend_repr
-        {
-            if let Some(start) = valid_range.start {
-                scalar.valid_range_mut().start = start;
-            }
-            if let Some(end) = valid_range.end {
-                scalar.valid_range_mut().end = end;
-            }
-            result.largest_niche =
-                rustc_abi::Niche::from_scalar(&dl, rustc_abi::Size::ZERO, *scalar);
-        }
-    }
     Ok(Arc::new(result))
 }
 
@@ -177,14 +127,14 @@ fn repr_discr(
     dl: &TargetDataLayout,
     repr: &ReprOptions,
     min: i128,
-    max: i128,
+    max: u128,
 ) -> Result<(Integer, bool), LayoutError> {
     // Theoretically, negative values could be larger in unsigned representation
     // than the unsigned representation of the signed minimum. However, if there
     // are any negative values, the only valid unsigned representation is u128
     // which can fit all i128 values, so the result remains unaffected.
-    let unsigned_fit = Integer::fit_unsigned(cmp::max(min as u128, max as u128));
-    let signed_fit = cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
+    let unsigned_fit = Integer::fit_unsigned(cmp::max(min as u128, max));
+    let signed_fit = cmp::max(Integer::fit_signed(min), Integer::fit_signed(max as i128));
 
     if let Some(ity) = repr.int {
         let discr = Integer::from_attr(dl, ity);

@@ -89,12 +89,10 @@ fn outline(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<u64> {
     };
     // A function the edit took away is an edit to more than bodies, and asking for its body
     // panics.
-    crate::PROBING.set(true);
     let seen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::lower(db, functions.iter().map(|&it| it.into()).collect());
         Written::of(db, &functions)
     }));
-    crate::PROBING.set(false);
     let seen = match seen {
         Ok(Some(seen)) => seen,
         Ok(None) => {
@@ -248,12 +246,32 @@ fn is_inert(item: &SyntaxNode) -> bool {
 }
 
 impl Listed {
+    /// Whether the file is a module of a crate that is built, or of one that such a crate uses.
+    /// Any file may be one before a crate is listed.
+    pub(crate) fn sees(&self, db: &RootDatabase, file: FileId) -> bool {
+        // Copied out: a query that is cancelled unwinds, and would poison the lock.
+        let built = self.built.lock().unwrap().clone();
+        // Before the first build there is no telling.
+        built.is_empty()
+            || relevant_crates(db, file).iter().any(|&krate| {
+                let read = built.iter().any(|&built| {
+                    let built = ide_db::base_db::Crate::from(built);
+                    built == krate || built.transitive_deps(db).contains(&krate)
+                });
+                read && hir_def::nameres::crate_def_map(db, krate)
+                    .modules_for_file(db, file)
+                    .next()
+                    .is_some()
+            })
+    }
+
     /// The functions written in the file, or `None` when it has some that are not listed: it
     /// belongs to a crate that the ones being built use and that is not one of them.
     pub(crate) fn in_file(&self, db: &RootDatabase, file: FileId) -> Option<Vec<FunctionId>> {
         let mut functions = Vec::new();
+        let listed = self.functions.lock().unwrap().clone();
         for &krate in relevant_crates(db, file).iter() {
-            match self.functions.get(&krate.into()) {
+            match listed.get(&krate.into()) {
                 Some(listed) => functions.extend(
                     listed
                         .functions
@@ -261,7 +279,7 @@ impl Listed {
                         .copied()
                         .filter(|&it| hir_ty::mir::codegen::body_file(db, it.into()) == file),
                 ),
-                None if self.functions.keys().any(|&built| {
+                None if listed.keys().any(|&built| {
                     ide_db::base_db::Crate::from(built).transitive_deps(db).contains(&krate)
                 }) =>
                 {

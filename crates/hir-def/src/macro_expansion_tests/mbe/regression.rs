@@ -618,8 +618,8 @@ macro_rules! arbitrary {
 }
 
 impl <A: Arbitrary> $crate::arbitrary::Arbitrary for Vec<A> {
-    type Parameters = RangedParams1<A::Parameters> ;
-    type Strategy = VecStrategy<A::Strategy> ;
+    type Parameters = RangedParams1<A::Parameters>;
+    type Strategy = VecStrategy<A::Strategy>;
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy { {
             let product_unpack![range, a] = args;
             vec(any_with::<A>(a), range)
@@ -898,8 +898,8 @@ ok!(b0 b1);
 
 #[test]
 fn test_issue_3861() {
-    // This is should (and does) produce a parse error. It used to infinite loop
-    // instead.
+    // The type is one thing, and `<<` after it a shift. It used to infinite loop, and then
+    // to read `u32 <<` as the start of generic arguments.
     check(
         r#"
 macro_rules! rgb_color {
@@ -909,7 +909,7 @@ macro_rules! rgb_color {
         }
     };
 }
-// +tree +errors
+// +tree
 rgb_color!(8 + 8, u32);
 "#,
         expect![[r#"
@@ -920,19 +920,11 @@ macro_rules! rgb_color {
         }
     };
 }
-/* parse error: expected type */
-/* parse error: expected R_PAREN */
-/* parse error: expected R_ANGLE */
-/* parse error: expected `::` */
-/* parse error: expected COMMA */
-/* parse error: expected R_ANGLE */
-/* parse error: expected SEMICOLON */
-/* parse error: expected expression, item or let statement */
 pub fn new() {
-    let _ = 0 as u32<<(8+8);
+    let _ = 0 as (u32)<<(8+8);
 }
-// MACRO_ITEMS@0..31
-//   FN@0..31
+// MACRO_ITEMS@0..33
+//   FN@0..33
 //     VISIBILITY@0..3
 //       PUB_KW@0..3 "pub"
 //     FN_KW@3..5 "fn"
@@ -941,46 +933,39 @@ pub fn new() {
 //     PARAM_LIST@8..10
 //       L_PAREN@8..9 "("
 //       R_PAREN@9..10 ")"
-//     BLOCK_EXPR@10..31
-//       STMT_LIST@10..31
+//     BLOCK_EXPR@10..33
+//       STMT_LIST@10..33
 //         L_CURLY@10..11 "{"
-//         LET_STMT@11..28
+//         LET_STMT@11..32
 //           LET_KW@11..14 "let"
 //           WILDCARD_PAT@14..15
 //             UNDERSCORE@14..15 "_"
 //           EQ@15..16 "="
-//           CAST_EXPR@16..28
-//             LITERAL@16..17
-//               INT_NUMBER@16..17 "0"
-//             AS_KW@17..19 "as"
-//             PATH_TYPE@19..28
-//               PATH@19..28
-//                 PATH_SEGMENT@19..28
-//                   NAME_REF@19..22
-//                     IDENT@19..22 "u32"
-//                   GENERIC_ARG_LIST@22..28
-//                     L_ANGLE@22..23 "<"
-//                     TYPE_ARG@23..27
-//                       DYN_TRAIT_TYPE@23..27
-//                         TYPE_BOUND_LIST@23..27
-//                           TYPE_BOUND@23..26
-//                             PATH_TYPE@23..26
-//                               PATH@23..26
-//                                 PATH_SEGMENT@23..26
-//                                   TYPE_ANCHOR@23..26
-//                                     L_ANGLE@23..24 "<"
-//                                     PAREN_TYPE@24..26
-//                                       L_PAREN@24..25 "("
-//                                       ERROR@25..26
-//                                         INT_NUMBER@25..26 "8"
-//                           PLUS@26..27 "+"
-//                     CONST_ARG@27..28
-//                       LITERAL@27..28
-//                         INT_NUMBER@27..28 "8"
-//         ERROR@28..29
-//           R_PAREN@28..29 ")"
-//         SEMICOLON@29..30 ";"
-//         R_CURLY@30..31 "}"
+//           BIN_EXPR@16..31
+//             CAST_EXPR@16..24
+//               LITERAL@16..17
+//                 INT_NUMBER@16..17 "0"
+//               AS_KW@17..19 "as"
+//               PAREN_TYPE@19..24
+//                 L_PAREN@19..20 "("
+//                 PATH_TYPE@20..23
+//                   PATH@20..23
+//                     PATH_SEGMENT@20..23
+//                       NAME_REF@20..23
+//                         IDENT@20..23 "u32"
+//                 R_PAREN@23..24 ")"
+//             SHL@24..26 "<<"
+//             PAREN_EXPR@26..31
+//               L_PAREN@26..27 "("
+//               BIN_EXPR@27..30
+//                 LITERAL@27..28
+//                   INT_NUMBER@27..28 "8"
+//                 PLUS@28..29 "+"
+//                 LITERAL@29..30
+//                   INT_NUMBER@29..30 "8"
+//               R_PAREN@30..31 ")"
+//           SEMICOLON@31..32 ";"
+//         R_CURLY@32..33 "}"
 
 "#]],
     );

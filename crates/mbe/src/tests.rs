@@ -228,7 +228,8 @@ fn expr_2021() {
 "#,
         expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..25#ROOT2024 1:Root[0000, 0]@0..25#ROOT2024
-              IDENT   _ 1:Root[0000, 0]@5..6#ROOT2024
+              SUBTREE $$ 0:Root[0000, 0]@34..35#ROOT2024 0:Root[0000, 0]@34..35#ROOT2024
+                IDENT   _ 1:Root[0000, 0]@5..6#ROOT2024
               PUNCH   ; [joint] 0:Root[0000, 0]@36..37#ROOT2024
               SUBTREE () 0:Root[0000, 0]@34..35#ROOT2024 0:Root[0000, 0]@34..35#ROOT2024
                 IDENT   const 1:Root[0000, 0]@12..17#ROOT2024
@@ -306,9 +307,11 @@ fn expr_2021() {
 "#,
         expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..76#ROOT2024 1:Root[0000, 0]@0..76#ROOT2024
-              LITERAL Integer 4 1:Root[0000, 0]@5..6#ROOT2024
+              SUBTREE $$ 0:Root[0000, 0]@39..40#ROOT2024 0:Root[0000, 0]@39..40#ROOT2024
+                LITERAL Integer 4 1:Root[0000, 0]@5..6#ROOT2024
               PUNCH   ; [joint] 0:Root[0000, 0]@41..42#ROOT2024
-              LITERAL Str literal 1:Root[0000, 0]@12..21#ROOT2024
+              SUBTREE $$ 0:Root[0000, 0]@39..40#ROOT2024 0:Root[0000, 0]@39..40#ROOT2024
+                LITERAL Str literal 1:Root[0000, 0]@12..21#ROOT2024
               PUNCH   ; [joint] 0:Root[0000, 0]@41..42#ROOT2024
               SUBTREE () 0:Root[0000, 0]@39..40#ROOT2024 0:Root[0000, 0]@39..40#ROOT2024
                 IDENT   funcall 1:Root[0000, 0]@27..34#ROOT2024

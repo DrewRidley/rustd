@@ -16,6 +16,7 @@ anyhow.workspace = true
 crossbeam-channel.workspace = true
 itertools.workspace = true
 tracing.workspace = true
+triomphe.workspace = true
 
 # workspace deps
 

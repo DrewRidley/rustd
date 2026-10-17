@@ -871,7 +871,7 @@ fn foo() {
 }
 
 fn foo() {
-    let a = bar::<u8>::baz::<u8> ;
+    let a = bar::<u8>::baz::<u8>;
 }
 "#]],
     );
@@ -938,12 +938,12 @@ macro_rules! m {
 }
 fn test() {
     let S;
-    let S:: <i32> ;
-    let S:: <S:: <i32>> ;
+    let S:: <i32>;
+    let S:: <S:: <i32>>;
     let S:: < {
         module::CONST<42
     }
-    > ;
+    >;
 }
 "#]],
     );

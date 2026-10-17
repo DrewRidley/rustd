@@ -61,7 +61,7 @@
 
 use std::{rc::Rc, sync::Arc};
 
-use intern::{Symbol, sym};
+use intern::sym;
 use smallvec::{SmallVec, smallvec};
 use tt::{
     DelimSpan,
@@ -72,15 +72,15 @@ use crate::{
     ExpandError, ExpandErrorKind, MetaTemplate, ValueResult,
     expander::{Binding, Bindings, ExpandResult, Fragment, TokensOrigin},
     expect_fragment,
-    parser::{ExprKind, MetaVarKind, Op, RepeatKind, Separator},
+    parser::{ExprKind, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
 impl<'a> Bindings<'a> {
-    fn push_optional(&mut self, name: Symbol) {
+    fn push_optional(&mut self, name: MetaVar) {
         self.inner.insert(name, Binding::Fragment(Fragment::Empty));
     }
 
-    fn push_empty(&mut self, name: Symbol) {
+    fn push_empty(&mut self, name: MetaVar) {
         self.inner.insert(name, Binding::Empty);
     }
 
@@ -133,10 +133,10 @@ pub(super) fn match_<'t>(
 
 #[derive(Debug, Clone)]
 enum BindingKind<'a> {
-    Empty(Symbol),
-    Optional(Symbol),
-    Fragment(Symbol, Fragment<'a>),
-    Missing(Symbol, MetaVarKind),
+    Empty(MetaVar),
+    Optional(MetaVar),
+    Fragment(MetaVar, Fragment<'a>),
+    Missing(MetaVar, MetaVarKind),
     Nested(usize, usize),
 }
 
@@ -184,20 +184,20 @@ impl<'a> BindingsBuilder<'a> {
         }
     }
 
-    fn push_empty(&mut self, idx: &mut BindingsIdx, var: &Symbol) {
+    fn push_empty(&mut self, idx: &mut BindingsIdx, var: &MetaVar) {
         self.nodes[idx.0].push(LinkNode::Node(Rc::new(BindingKind::Empty(var.clone()))));
     }
 
-    fn push_optional(&mut self, idx: &mut BindingsIdx, var: &Symbol) {
+    fn push_optional(&mut self, idx: &mut BindingsIdx, var: &MetaVar) {
         self.nodes[idx.0].push(LinkNode::Node(Rc::new(BindingKind::Optional(var.clone()))));
     }
 
-    fn push_fragment(&mut self, idx: &mut BindingsIdx, var: &Symbol, fragment: Fragment<'a>) {
+    fn push_fragment(&mut self, idx: &mut BindingsIdx, var: &MetaVar, fragment: Fragment<'a>) {
         self.nodes[idx.0]
             .push(LinkNode::Node(Rc::new(BindingKind::Fragment(var.clone(), fragment))));
     }
 
-    fn push_missing(&mut self, idx: &mut BindingsIdx, var: &Symbol, kind: MetaVarKind) {
+    fn push_missing(&mut self, idx: &mut BindingsIdx, var: &MetaVar, kind: MetaVarKind) {
         self.nodes[idx.0].push(LinkNode::Node(Rc::new(BindingKind::Missing(var.clone(), kind))));
     }
 
@@ -784,6 +784,10 @@ fn match_meta_var<'t>(
             return expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span)
                 .map(Fragment::Path);
         }
+        MetaVarKind::Ty => {
+            return expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span)
+                .map(Fragment::Ty);
+        }
         MetaVarKind::Expr(expr) => {
             // `expr_2021` should not match underscores, let expressions, or inline const.
             // The latter two are for [backwards compatibility][0].
@@ -833,7 +837,7 @@ fn match_meta_var<'t>(
                 }),
                 MetaVarKind::Literal => {
                     eat_char(input, '-');
-                    input.expect_literal().map(drop).map_err(|()| {
+                    expect_literal(input).map_err(|()| {
                         ExpandError::binding_error(
                             span.unwrap_or(delim_span.close),
                             "expected literal",
@@ -845,14 +849,18 @@ fn match_meta_var<'t>(
             .err();
             let value = match err {
                 Some(_) => Fragment::Empty,
-                None => Fragment::Tokens {
-                    tree: input.from_savepoint(savepoint),
-                    origin: TokensOrigin::Raw,
-                },
+                None => {
+                    let tree = input.from_savepoint(savepoint);
+                    // A fragment taken as a token tree is still that fragment where it goes.
+                    let origin = match kind {
+                        MetaVarKind::Tt if is_fragment(tree) => TokensOrigin::Ast,
+                        _ => TokensOrigin::Raw,
+                    };
+                    Fragment::Tokens { tree, origin }
+                }
             };
             return ValueResult { value, err };
         }
-        MetaVarKind::Ty => (parser::PrefixEntryPoint::Ty, TokensOrigin::Ast),
         MetaVarKind::Pat => (parser::PrefixEntryPoint::PatTop, TokensOrigin::Ast),
         MetaVarKind::PatParam => (parser::PrefixEntryPoint::Pat, TokensOrigin::Ast),
         MetaVarKind::Stmt => (parser::PrefixEntryPoint::Stmt, TokensOrigin::Ast),
@@ -866,7 +874,29 @@ fn match_meta_var<'t>(
         .map(|tree| Fragment::Tokens { tree, origin })
 }
 
-fn collect_vars(collector_fun: &mut impl FnMut(Symbol), pattern: &MetaTemplate) {
+/// Whether `tree` is what an earlier expansion put in for one of its metavariables.
+fn is_fragment(tree: tt::TokenTreesView<'_>) -> bool {
+    tree.try_into_subtree()
+        .is_some_and(|it| it.top_subtree().delimiter.kind == tt::DelimiterKind::Invisible)
+}
+
+/// A literal, which may be one that an earlier expansion took as an expression.
+fn expect_literal(input: &mut TtIter<'_>) -> Result<(), ()> {
+    let mut fork = input.clone();
+    if let Ok((subtree, mut inner)) = fork.expect_subtree()
+        && subtree.delimiter.kind == tt::DelimiterKind::Invisible
+    {
+        inner.expect_literal()?;
+        if inner.next().is_some() {
+            return Err(());
+        }
+        *input = fork;
+        return Ok(());
+    }
+    input.expect_literal().map(drop)
+}
+
+fn collect_vars(collector_fun: &mut impl FnMut(MetaVar), pattern: &MetaTemplate) {
     for op in pattern.iter() {
         match op {
             Op::Var { name, .. } => collector_fun(name.clone()),

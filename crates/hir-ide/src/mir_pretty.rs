@@ -277,6 +277,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                             this.place(p);
                             wln!(this, ");");
                         }
+                        StatementKind::InlineAsm(_) => wln!(this, "InlineAsm;"),
                         StatementKind::Nop => wln!(this, "Nop;"),
                     }
                 }

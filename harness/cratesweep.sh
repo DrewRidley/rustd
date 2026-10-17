@@ -7,6 +7,8 @@ one() {
     name=${1%-*}; name=${name%-*+*}
     "$here/vendor.sh" "$1" > "$out/$name.log" 2>&1 &&
         timeout 1800 python3 "$here/cratetest.py" "$here/vendor/$name" --json "$out/$name.json" >> "$out/$name.log" 2>&1
+    # CLEAN=1: a sweep over many crates fills the disk with their target directories.
+    [ -n "$CLEAN" ] && rm -rf "$here/vendor/$name/target"
     echo "$name: $(grep -E '^(MATCH|MISMATCH): ' "$out/$name.log" || echo "FAILED $(tail -1 "$out/$name.log" | cut -c1-150)")"
 }
 export -f one; export here out

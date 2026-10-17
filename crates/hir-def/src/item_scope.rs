@@ -340,6 +340,16 @@ impl ItemScope {
         self.unnamed_consts.iter().copied()
     }
 
+    /// Every const of the module, named or not. An impl in the block of any of them is an impl
+    /// of the crate.
+    pub fn consts(&self) -> impl Iterator<Item = ConstId> + '_ {
+        let named = self.declarations.iter().filter_map(|&def| match def {
+            ModuleDefId::ConstId(konst) => Some(konst),
+            _ => None,
+        });
+        self.unnamed_consts().chain(named)
+    }
+
     /// Iterate over all legacy textual scoped macros visible at the end of the module
     pub fn legacy_macros(&self) -> impl Iterator<Item = (&Name, &[MacroId])> + '_ {
         self.legacy_macros.iter().map(|(name, def)| (name, &**def))

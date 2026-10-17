@@ -2,7 +2,10 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
-#![feature(box_patterns)]
+// `box` patterns are unstable: the case is for a nightly toolchain only.
+#![cfg_attr(feature = "nightly", feature(box_patterns))]
+
+pub mod stabilized;
 
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
@@ -79,9 +82,16 @@ pub mod aggregates {
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct Small(pub u8, pub u16);
     #[derive(Debug, Clone, Copy)]
-    pub struct Pair { pub a: u32, pub b: u64 }
+    pub struct Pair {
+        pub a: u32,
+        pub b: u64,
+    }
     #[derive(Debug, Clone, Copy)]
-    pub struct Big { pub a: u64, pub b: [u32; 5], pub c: i8 }
+    pub struct Big {
+        pub a: u64,
+        pub b: [u32; 5],
+        pub c: i8,
+    }
     #[derive(Debug, Clone, Copy)]
     pub struct Odd(pub u8, pub u8, pub u8);
 
@@ -118,43 +128,86 @@ pub mod aggregates {
 
 pub mod enums {
     #[derive(Debug, Clone, Copy, PartialEq)]
-    pub enum Plain { A, B, C }
+    pub enum Plain {
+        A,
+        B,
+        C,
+    }
     #[derive(Debug, Clone, Copy)]
-    pub enum Explicit { Low = 3, Mid = 70, High = 200 }
+    pub enum Explicit {
+        Low = 3,
+        Mid = 70,
+        High = 200,
+    }
     #[derive(Debug, Clone, Copy)]
-    pub enum Data { Unit, One(u32), Two { a: u8, b: u64 } }
+    pub enum Data {
+        Unit,
+        One(u32),
+        Two { a: u8, b: u64 },
+    }
     #[derive(Debug)]
-    pub enum HexError { Invalid { c: char, index: usize }, OddLength, BadLength }
+    pub enum HexError {
+        Invalid { c: char, index: usize },
+        OddLength,
+        BadLength,
+    }
 
     pub fn plain(n: u32) -> Plain {
-        match n % 3 { 0 => Plain::A, 1 => Plain::B, _ => Plain::C }
+        match n % 3 {
+            0 => Plain::A,
+            1 => Plain::B,
+            _ => Plain::C,
+        }
     }
     pub fn plain_back(p: Plain) -> u32 {
-        match p { Plain::A => 10, Plain::B => 20, Plain::C => 30 }
+        match p {
+            Plain::A => 10,
+            Plain::B => 20,
+            Plain::C => 30,
+        }
     }
     pub fn explicit(e: Explicit) -> u8 {
         e as u8
     }
     pub fn data(n: u32) -> Data {
-        match n { 0 => Data::Unit, 1..=9 => Data::One(n * 2), _ => Data::Two { a: n as u8, b: n as u64 * 3 } }
+        match n {
+            0 => Data::Unit,
+            1..=9 => Data::One(n * 2),
+            _ => Data::Two { a: n as u8, b: n as u64 * 3 },
+        }
     }
     pub fn data_back(d: Data) -> u64 {
-        match d { Data::Unit => 0, Data::One(x) => x as u64, Data::Two { a, b } => a as u64 + b }
+        match d {
+            Data::Unit => 0,
+            Data::One(x) => x as u64,
+            Data::Two { a, b } => a as u64 + b,
+        }
     }
     pub fn option(n: u32) -> Option<u32> {
         if n % 2 == 0 { Some(n / 2) } else { None }
     }
     pub fn option_ref(v: &Option<u64>) -> u64 {
-        match v { Some(x) => *x + 1, None => 0 }
+        match v {
+            Some(x) => *x + 1,
+            None => 0,
+        }
     }
     pub fn niche_ref<'a>(flag: bool, v: &'a u32) -> Option<&'a u32> {
         if flag { Some(v) } else { None }
     }
     pub fn niche_bool(n: u8) -> Option<bool> {
-        match n { 0 => None, 1 => Some(false), _ => Some(true) }
+        match n {
+            0 => None,
+            1 => Some(false),
+            _ => Some(true),
+        }
     }
     pub fn niche_bool_back(v: Option<bool>) -> u8 {
-        match v { None => 0, Some(false) => 1, Some(true) => 2 }
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        }
     }
     pub fn nested_niche(c: u8, index: usize) -> Result<u8, HexError> {
         match c {
@@ -246,7 +299,10 @@ pub mod slices {
 }
 
 pub mod pointers {
-    pub struct Cursor { pub start: *const u8, pub end: *const u8 }
+    pub struct Cursor {
+        pub start: *const u8,
+        pub end: *const u8,
+    }
 
     /// Ordering on raw pointers: RA used to lower this to a self-recursive `PartialOrd::lt`.
     pub fn peek(c: &Cursor) -> Option<u8> {
@@ -272,7 +328,10 @@ pub mod consts {
     pub const LIMIT: u32 = 40 + 2;
     pub static TABLE: [u8; 8] = [1, 1, 2, 3, 5, 8, 13, 21];
     const NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
-    pub struct Config { pub scale: u32, pub name: &'static str }
+    pub struct Config {
+        pub scale: u32,
+        pub name: &'static str,
+    }
     const CONFIG: Config = Config { scale: 9, name: "cfg" };
 
     pub fn limit(n: u32) -> u32 {
@@ -307,19 +366,41 @@ pub mod generics {
     fn add_one(x: u32) -> u32 {
         x + 1
     }
-    pub struct Counter { n: u32 }
-    impl Counter {
-        pub fn new(n: u32) -> Counter { Counter { n } }
-        pub fn bump(&mut self, by: u32) -> u32 { self.n += by; self.n }
-        pub fn get(&self) -> u32 { self.n }
+    pub struct Counter {
+        n: u32,
     }
-    pub trait Shape { fn area(&self) -> u64; fn double(&self) -> u64 { self.area() * 2 } }
+    impl Counter {
+        pub fn new(n: u32) -> Counter {
+            Counter { n }
+        }
+        pub fn bump(&mut self, by: u32) -> u32 {
+            self.n += by;
+            self.n
+        }
+        pub fn get(&self) -> u32 {
+            self.n
+        }
+    }
+    pub trait Shape {
+        fn area(&self) -> u64;
+        fn double(&self) -> u64 {
+            self.area() * 2
+        }
+    }
     pub struct Rect(pub u32, pub u32);
     pub struct Square(pub u32);
-    impl Shape for Rect { fn area(&self) -> u64 { self.0 as u64 * self.1 as u64 } }
+    impl Shape for Rect {
+        fn area(&self) -> u64 {
+            self.0 as u64 * self.1 as u64
+        }
+    }
     impl Shape for Square {
-        fn area(&self) -> u64 { self.0 as u64 * self.0 as u64 }
-        fn double(&self) -> u64 { 7 }
+        fn area(&self) -> u64 {
+            self.0 as u64 * self.0 as u64
+        }
+        fn double(&self) -> u64 {
+            7
+        }
     }
     fn total<S: Shape>(s: &S) -> u64 {
         s.area() + s.double()
@@ -375,11 +456,22 @@ pub mod closures {
 }
 
 pub mod callables {
-    fn double(x: u32) -> u32 { x * 2 }
-    fn pair(x: u32) -> (u64, u64) { (x as u64, x as u64 + 1) }
-    fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(x) }
-    fn apply_mut<F: FnMut(u32)>(mut f: F, x: u32) { f(x); f(x + 1) }
-    fn apply_once<F: FnOnce() -> [u64; 3]>(f: F) -> [u64; 3] { f() }
+    fn double(x: u32) -> u32 {
+        x * 2
+    }
+    fn pair(x: u32) -> (u64, u64) {
+        (x as u64, x as u64 + 1)
+    }
+    fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 {
+        f(x)
+    }
+    fn apply_mut<F: FnMut(u32)>(mut f: F, x: u32) {
+        f(x);
+        f(x + 1)
+    }
+    fn apply_once<F: FnOnce() -> [u64; 3]>(f: F) -> [u64; 3] {
+        f()
+    }
 
     pub fn reify(x: u32) -> u32 {
         let f: fn(u32) -> u32 = double;
@@ -401,7 +493,9 @@ pub mod callables {
         let big = [a, a + 1, a + 2];
         apply_once(move || big)
     }
-    pub fn takes_fn(f: fn(u8, u8) -> u8, a: u8) -> u8 { f(a, 3) }
+    pub fn takes_fn(f: fn(u8, u8) -> u8, a: u8) -> u8 {
+        f(a, 3)
+    }
 }
 
 pub mod odd {
@@ -414,10 +508,18 @@ pub mod odd {
     #[derive(Clone, Copy)]
     pub struct B7(pub [u8; 7]);
 
-    pub fn rot3(b: B3) -> B3 { B3(b.1, b.2, b.0) }
-    pub fn rot5(b: B5) -> B5 { B5([b.0[4], b.0[0], b.0[1], b.0[2], b.0[3]]) }
-    pub fn rot6(b: B6) -> B6 { B6(b.2, b.0, b.1) }
-    pub fn rot7(b: B7, x: u8) -> B7 { B7([x, b.0[0], b.0[1], b.0[2], b.0[3], b.0[4], b.0[5]]) }
+    pub fn rot3(b: B3) -> B3 {
+        B3(b.1, b.2, b.0)
+    }
+    pub fn rot5(b: B5) -> B5 {
+        B5([b.0[4], b.0[0], b.0[1], b.0[2], b.0[3]])
+    }
+    pub fn rot6(b: B6) -> B6 {
+        B6(b.2, b.0, b.1)
+    }
+    pub fn rot7(b: B7, x: u8) -> B7 {
+        B7([x, b.0[0], b.0[1], b.0[2], b.0[3], b.0[4], b.0[5]])
+    }
     pub fn chain(b: B3) -> u32 {
         let r = rot3(rot3(b));
         r.0 as u32 * 10000 + r.1 as u32 * 100 + r.2 as u32
@@ -425,11 +527,21 @@ pub mod odd {
 }
 
 pub mod dynamic {
-    pub trait Speak { fn speak(&self) -> u32; }
+    pub trait Speak {
+        fn speak(&self) -> u32;
+    }
     pub struct Dog(pub u32);
     pub struct Cat;
-    impl Speak for Dog { fn speak(&self) -> u32 { self.0 } }
-    impl Speak for Cat { fn speak(&self) -> u32 { 9 } }
+    impl Speak for Dog {
+        fn speak(&self) -> u32 {
+            self.0
+        }
+    }
+    impl Speak for Cat {
+        fn speak(&self) -> u32 {
+            9
+        }
+    }
 
     pub fn call(s: &dyn Speak) -> u32 {
         s.speak() + 1
@@ -445,38 +557,105 @@ pub mod objects {
     use std::cell::Cell;
     use std::fmt::{self, Display};
 
-    pub trait Base { fn base(&self) -> u32; fn twice(&self) -> u32 { self.base() * 2 } }
-    pub trait Named { fn name(&self) -> &'static str; }
-    pub trait Sized2: Sized { fn nope(&self) -> u32 { 0 } }
-    pub trait Mid: Base { fn mid(&self, x: u32) -> u32; }
+    pub trait Base {
+        fn base(&self) -> u32;
+        fn twice(&self) -> u32 {
+            self.base() * 2
+        }
+    }
+    pub trait Named {
+        fn name(&self) -> &'static str;
+    }
+    pub trait Sized2: Sized {
+        fn nope(&self) -> u32 {
+            0
+        }
+    }
+    pub trait Mid: Base {
+        fn mid(&self, x: u32) -> u32;
+    }
     /// Two supertraits with methods, a marker in between, and a method that is not in the vtable.
     pub trait Top: Mid + Send + Named {
         fn top(&mut self) -> u64;
-        fn skipped(&self) -> u32 where Self: Sized { 77 }
+        fn skipped(&self) -> u32
+        where
+            Self: Sized,
+        {
+            77
+        }
         fn big(&self) -> [u64; 3];
     }
-    pub trait Conv<T> { fn conv(&self, x: T) -> T; }
+    pub trait Conv<T> {
+        fn conv(&self, x: T) -> T;
+    }
 
     pub struct One(pub u32);
     pub struct Two(pub u32, pub u64);
-    impl Base for One { fn base(&self) -> u32 { self.0 } }
-    impl Named for One { fn name(&self) -> &'static str { "one" } }
-    impl Mid for One { fn mid(&self, x: u32) -> u32 { self.0 + x } }
+    impl Base for One {
+        fn base(&self) -> u32 {
+            self.0
+        }
+    }
+    impl Named for One {
+        fn name(&self) -> &'static str {
+            "one"
+        }
+    }
+    impl Mid for One {
+        fn mid(&self, x: u32) -> u32 {
+            self.0 + x
+        }
+    }
     impl Top for One {
-        fn top(&mut self) -> u64 { self.0 += 1; self.0 as u64 }
-        fn big(&self) -> [u64; 3] { [self.0 as u64, 1, 2] }
+        fn top(&mut self) -> u64 {
+            self.0 += 1;
+            self.0 as u64
+        }
+        fn big(&self) -> [u64; 3] {
+            [self.0 as u64, 1, 2]
+        }
     }
-    impl Base for Two { fn base(&self) -> u32 { self.0 } fn twice(&self) -> u32 { 5 } }
-    impl Named for Two { fn name(&self) -> &'static str { "two" } }
-    impl Mid for Two { fn mid(&self, x: u32) -> u32 { self.0 * x } }
+    impl Base for Two {
+        fn base(&self) -> u32 {
+            self.0
+        }
+        fn twice(&self) -> u32 {
+            5
+        }
+    }
+    impl Named for Two {
+        fn name(&self) -> &'static str {
+            "two"
+        }
+    }
+    impl Mid for Two {
+        fn mid(&self, x: u32) -> u32 {
+            self.0 * x
+        }
+    }
     impl Top for Two {
-        fn top(&mut self) -> u64 { self.1 += 10; self.1 }
-        fn big(&self) -> [u64; 3] { [self.1, self.0 as u64, 0] }
+        fn top(&mut self) -> u64 {
+            self.1 += 10;
+            self.1
+        }
+        fn big(&self) -> [u64; 3] {
+            [self.1, self.0 as u64, 0]
+        }
     }
-    impl Conv<u8> for One { fn conv(&self, x: u8) -> u8 { x.wrapping_add(self.0 as u8) } }
-    impl Conv<u64> for One { fn conv(&self, x: u64) -> u64 { x * self.0 as u64 } }
+    impl Conv<u8> for One {
+        fn conv(&self, x: u8) -> u8 {
+            x.wrapping_add(self.0 as u8)
+        }
+    }
+    impl Conv<u64> for One {
+        fn conv(&self, x: u64) -> u64 {
+            x * self.0 as u64
+        }
+    }
     impl Display for One {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "One({})", self.0) }
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "One({})", self.0)
+        }
     }
 
     /// Calls every kind of slot on an object somebody else made.
@@ -488,17 +667,29 @@ pub mod objects {
     pub fn make_top(two: bool) -> Box<dyn Top> {
         if two { Box::new(Two(3, 4)) } else { Box::new(One(7)) }
     }
-    pub fn make_ref(one: &One) -> &dyn Top { one }
+    pub fn make_ref(one: &One) -> &dyn Top {
+        one
+    }
     pub fn local(x: u32) -> u64 {
         let mut one = One(x);
         let t: &mut dyn Top = &mut one;
         t.top() + t.mid(1) as u64 + t.twice() as u64
     }
-    pub fn upcast_first(t: &dyn Top) -> &dyn Mid { t }
-    pub fn upcast_base(t: &dyn Top) -> &dyn Base { t }
-    pub fn upcast_named(t: &dyn Top) -> &dyn Named { t }
-    pub fn upcast_box(t: Box<dyn Top>) -> Box<dyn Named> { t }
-    pub fn use_named(n: &dyn Named) -> usize { n.name().len() }
+    pub fn upcast_first(t: &dyn Top) -> &dyn Mid {
+        t
+    }
+    pub fn upcast_base(t: &dyn Top) -> &dyn Base {
+        t
+    }
+    pub fn upcast_named(t: &dyn Top) -> &dyn Named {
+        t
+    }
+    pub fn upcast_box(t: Box<dyn Top>) -> Box<dyn Named> {
+        t
+    }
+    pub fn use_named(n: &dyn Named) -> usize {
+        n.name().len()
+    }
     pub fn generic_trait(one: &One) -> (u8, u64) {
         let a: &dyn Conv<u8> = one;
         let b: &dyn Conv<u64> = one;
@@ -506,32 +697,61 @@ pub mod objects {
     }
     pub fn boxed_sum(xs: &[Box<dyn Base>]) -> u32 {
         let mut sum = 0;
-        for x in xs { sum += x.base(); }
+        for x in xs {
+            sum += x.base();
+        }
         sum
     }
     pub fn display(x: u32) -> String {
         let d: &dyn Display = &One(x);
         d.to_string()
     }
-    pub fn show(d: &dyn Display) -> usize { d.to_string().len() }
+    pub fn show(d: &dyn Display) -> usize {
+        d.to_string().len()
+    }
 
     pub struct Loud<'a>(pub &'a Cell<u64>, pub u64);
     impl Drop for Loud<'_> {
-        fn drop(&mut self) { self.0.set(self.0.get() * 10 + self.1); }
+        fn drop(&mut self) {
+            self.0.set(self.0.get() * 10 + self.1);
+        }
     }
-    pub trait Thing { fn id(&self) -> u64; }
-    impl Thing for Loud<'_> { fn id(&self) -> u64 { self.1 } }
-    impl Thing for u8 { fn id(&self) -> u64 { *self as u64 } }
+    pub trait Thing {
+        fn id(&self) -> u64;
+    }
+    impl Thing for Loud<'_> {
+        fn id(&self) -> u64 {
+            self.1
+        }
+    }
+    impl Thing for u8 {
+        fn id(&self) -> u64 {
+            *self as u64
+        }
+    }
     pub fn make_thing<'a>(log: &'a Cell<u64>, loud: bool) -> Box<dyn Thing + 'a> {
         if loud { Box::new(Loud(log, 4)) } else { Box::new(9u8) }
     }
-    pub fn drop_thing(t: Box<dyn Thing + '_>) -> u64 { t.id() }
+    pub fn drop_thing(t: Box<dyn Thing + '_>) -> u64 {
+        t.id()
+    }
 
-    pub fn call_fn(f: &dyn Fn(u32, u32) -> u32, x: u32) -> u32 { f(x, 2) + f(1, x) }
-    pub fn call_fn_mut(f: &mut dyn FnMut(u64) -> u64) -> u64 { f(1); f(2); f(3) }
-    pub fn make_fn(k: u32) -> Box<dyn Fn(u32) -> u32> { Box::new(move |x| x * k + 1) }
+    pub fn call_fn(f: &dyn Fn(u32, u32) -> u32, x: u32) -> u32 {
+        f(x, 2) + f(1, x)
+    }
+    pub fn call_fn_mut(f: &mut dyn FnMut(u64) -> u64) -> u64 {
+        f(1);
+        f(2);
+        f(3)
+    }
+    pub fn make_fn(k: u32) -> Box<dyn Fn(u32) -> u32> {
+        Box::new(move |x| x * k + 1)
+    }
     pub fn make_fn_mut(mut acc: u64) -> Box<dyn FnMut(u64) -> u64> {
-        Box::new(move |x| { acc += x; acc })
+        Box::new(move |x| {
+            acc += x;
+            acc
+        })
     }
     pub fn make_fn_once(s: String) -> Box<dyn FnOnce(usize) -> usize> {
         Box::new(move |x| s.len() + x)
@@ -539,7 +759,9 @@ pub mod objects {
     pub fn local_fn(xs: &[u32], k: u32) -> u32 {
         let f: &dyn Fn(u32) -> u32 = &|x| x + k;
         let mut sum = 0;
-        for &x in xs { sum += f(x); }
+        for &x in xs {
+            sum += f(x);
+        }
         sum
     }
 }
@@ -554,8 +776,15 @@ pub mod drops {
             self.0.set(self.0.get() * 10 + self.1);
         }
     }
-    pub struct Pair<'a> { a: Noisy<'a>, b: Noisy<'a> }
-    pub enum Either<'a> { Left(Noisy<'a>), Right(Noisy<'a>, Noisy<'a>), Neither }
+    pub struct Pair<'a> {
+        a: Noisy<'a>,
+        b: Noisy<'a>,
+    }
+    pub enum Either<'a> {
+        Left(Noisy<'a>),
+        Right(Noisy<'a>, Noisy<'a>),
+        Neither,
+    }
 
     pub fn scope(log: &Cell<u64>) {
         let _a = Noisy(log, 1);
@@ -567,7 +796,12 @@ pub mod drops {
     pub fn moved(log: &Cell<u64>, keep: bool) -> Option<Noisy<'_>> {
         let a = Noisy(log, 1);
         let b = Noisy(log, 2);
-        if keep { Some(a) } else { drop(b); None }
+        if keep {
+            Some(a)
+        } else {
+            drop(b);
+            None
+        }
     }
     pub fn fields(log: &Cell<u64>) {
         let _p = Pair { a: Noisy(log, 4), b: Noisy(log, 5) };
@@ -626,11 +860,7 @@ pub mod drops {
         add(cell, n) + add(cell, n + 1) + add2(cell, n) + add2(cell, n)
     }
     pub fn condition_temp(log: &Cell<u64>) -> u64 {
-        if make(log, 6).1 == 6 {
-            log.get() + 1
-        } else {
-            0
-        }
+        if make(log, 6).1 == 6 { log.get() + 1 } else { 0 }
     }
     pub fn match_temp(log: &Cell<u64>) -> u64 {
         match make(log, 7).1 {
@@ -669,7 +899,11 @@ pub mod drops {
     /// alternative matched, and those of a later parameter go first.
     pub fn binding_order(log: &Cell<u64>, first: bool) {
         let ((true, _x, _y) | (false, _y, _x)) = (first, make(log, 1), make(log, 2));
-        (|_a, (Ok(_b) | Err(_b)), _c| {})(make(log, 3), Ok::<_, Noisy<'_>>(make(log, 4)), make(log, 5));
+        (|_a, (Ok(_b) | Err(_b)), _c| {})(
+            make(log, 3),
+            Ok::<_, Noisy<'_>>(make(log, 4)),
+            make(log, 5),
+        );
     }
     fn next<'a>(n: &Noisy<'a>) -> Noisy<'a> {
         make(n.0, n.1 + 1)
@@ -742,7 +976,10 @@ pub mod heap {
         empty.len() + full.len()
     }
     /// A `?Sized` last field stays last, even where sorting by size would move it first.
-    pub fn unsizable_tail(cell: &std::cell::RefCell<[u64; 14]>, lock: &std::sync::Mutex<(u128, u8)>) -> u64 {
+    pub fn unsizable_tail(
+        cell: &std::cell::RefCell<[u64; 14]>,
+        lock: &std::sync::Mutex<(u128, u8)>,
+    ) -> u64 {
         *lock.lock().unwrap() = (7, 1);
         cell.borrow_mut()[13] += 1;
         cell.borrow()[0] + cell.borrow()[13]
@@ -820,6 +1057,52 @@ pub mod simd {
             out
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    use std::arch::aarch64::*;
+
+    /// A bit per byte that is the needle, as `_mm_movemask_epi8` has them.
+    #[cfg(target_arch = "aarch64")]
+    pub fn find(hay: &[u8; 16], needle: u8) -> i32 {
+        unsafe {
+            let hay = vld1q_u8(hay.as_ptr());
+            let equal = vceqq_u8(hay, vdupq_n_u8(needle));
+            let bits =
+                vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+            let masked = vandq_u8(equal, bits);
+            let low = vaddv_u8(vget_low_u8(masked)) as i32;
+            let high = vaddv_u8(vget_high_u8(masked)) as i32;
+            low | high << 8
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn shuffle(a: &[u8; 16], b: &[u8; 16]) -> ([u8; 16], i32) {
+        unsafe {
+            let x = vld1q_u8(a.as_ptr());
+            let y = vld1q_u8(b.as_ptr());
+            let shifted = vreinterpretq_u8_u16(vshrq_n_u16::<3>(vreinterpretq_u16_u8(x)));
+            let z = vqtbl1q_u8(x, vmaxq_u8(y, shifted));
+            let doubled = vreinterpretq_u8_u16(vshlq_n_u16::<1>(vreinterpretq_u16_u8(y)));
+            let least =
+                vreinterpretq_u8_s8(vminq_s8(vreinterpretq_s8_u8(z), vreinterpretq_s8_u8(x)));
+            let z = vbicq_u8(least, doubled);
+            let mut out = [0; 16];
+            vst1q_u8(out.as_mut_ptr(), z);
+            (out, vgetq_lane_u16::<3>(vreinterpretq_u16_u8(z)) as i32)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    pub fn mix(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+        unsafe {
+            let x = vld1q_u8(a.as_ptr());
+            let y = vld1q_u8(b.as_ptr());
+            let z = veorq_u8(vandq_u8(x, y), vorrq_u8(x, vaddq_u8(x, y)));
+            let greater = vcgtq_s8(vreinterpretq_s8_u8(x), vreinterpretq_s8_u8(y));
+            let mut out = [0; 16];
+            vst1q_u8(out.as_mut_ptr(), vsubq_u8(z, greater));
+            out
+        }
+    }
 }
 
 pub mod statics {
@@ -870,7 +1153,11 @@ pub mod floats {
         (a * b + 0.5, -a % b, a < b, a == b)
     }
     pub fn compare(a: f64, b: f64) -> u8 {
-        (a < b) as u8 | ((a <= b) as u8) << 1 | ((a > b) as u8) << 2 | ((a >= b) as u8) << 3 | ((a != b) as u8) << 4
+        (a < b) as u8
+            | ((a <= b) as u8) << 1
+            | ((a > b) as u8) << 2
+            | ((a >= b) as u8) << 3
+            | ((a != b) as u8) << 4
     }
     pub fn to_int(x: f64) -> (i64, u64, i32, u8, i8, u16) {
         (x as i64, x as u64, x as i32, x as u8, x as i8, x as u16)
@@ -926,6 +1213,25 @@ pub mod locations {
     pub fn borrows(cell: &std::cell::RefCell<u8>) -> u8 {
         *cell.borrow_mut() += 1;
         *cell.borrow()
+    }
+    pub struct Thrower;
+    impl Thrower {
+        /// doc
+        #[track_caller]
+        pub fn method<T>(_: T) -> &'static Location<'static> {
+            Location::caller()
+        }
+    }
+    /// A pointer to a tracked function reports where the function is declared, not the call.
+    pub fn through_pointers(x: Option<u8>) -> (u32, u32, u32, u32, bool) {
+        let direct: fn() -> &'static Location<'static> = here;
+        let method: fn(u8) -> &'static Location<'static> = Thrower::method::<u8>;
+        let table: [(fn(u8) -> &'static Location<'static>, u8); 2] =
+            [(Thrower::method, 1), (Thrower::method, 2)];
+        let (a, b) = (direct(), method(3));
+        let c = table[x.unwrap_or(0) as usize & 1].0(x.unwrap_or(0));
+        let lines = (a.line(), a.column(), b.line(), b.column());
+        (lines.0, lines.1, lines.2, lines.3, c.file() == a.file() && c.line() == b.line())
     }
 }
 
@@ -983,7 +1289,16 @@ pub mod misc {
         (raw as usize == addr, back(x))
     }
     pub fn float_math(x: f64, y: f32) -> (f64, f64, f64, f64, f64, f32, f64, f64) {
-        (x.abs(), x.sqrt(), x.floor(), x.ceil(), x.round(), y.abs().trunc(), x.copysign(-1.0), x.max(2.5).min(100.0))
+        (
+            x.abs(),
+            x.sqrt(),
+            x.floor(),
+            x.ceil(),
+            x.round(),
+            y.abs().trunc(),
+            x.copysign(-1.0),
+            x.max(2.5).min(100.0),
+        )
     }
     fn double(x: u32) -> u32 {
         x * 2
@@ -992,7 +1307,8 @@ pub mod misc {
         x * 3
     }
     static TABLE: [fn(u32) -> u32; 2] = [double, triple];
-    static LAZY: core::sync::atomic::AtomicPtr<()> = core::sync::atomic::AtomicPtr::new(double as *mut ());
+    static LAZY: core::sync::atomic::AtomicPtr<()> =
+        core::sync::atomic::AtomicPtr::new(double as *mut ());
     pub fn fn_statics(x: u32) -> (u32, u32, u32) {
         use core::sync::atomic::Ordering;
         let first: fn(u32) -> u32 = unsafe { core::mem::transmute(LAZY.load(Ordering::Relaxed)) };
@@ -1083,7 +1399,48 @@ pub mod foreign {
         Two { a: a + b + c + d + e + two.a, b: two.b * last }
     }
 
-    pub fn through_pointer(f: extern "C" fn(Floats, f32) -> Floats, g: extern "C" fn(u64) -> Big) -> f32 {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Quad {
+        pub at: [f64; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Five {
+        pub at: [f32; 5],
+    }
+
+    /// Two of four floats fill the float registers a target has eight of, so the third goes
+    /// to the stack whole, and the float after it follows it there.
+    pub extern "C" fn quads(a: Quad, b: Quad, c: Quad, last: f64) -> Quad {
+        Quad { at: [a.at[0] + b.at[1], b.at[2] - c.at[3], c.at[0] * last, a.at[3] + c.at[1]] }
+    }
+
+    /// Five floats are one too many to come back in registers.
+    pub extern "C" fn five(x: Five, by: f32) -> Five {
+        Five { at: [x.at[4] * by, x.at[3], x.at[2] + by, x.at[1], x.at[0]] }
+    }
+
+    /// A 128-bit integer starts at an even register, and at an aligned slot once on the stack.
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn wides(
+        a: u64,
+        b: u128,
+        c: u64,
+        d: i128,
+        e: u64,
+        f: u128,
+        g: u8,
+        h: i128,
+    ) -> u128 {
+        (a as u128 + b + c as u128).wrapping_add(d as u128) + e as u128 + f + g as u128 + h as u128
+    }
+
+    pub fn through_pointer(
+        f: extern "C" fn(Floats, f32) -> Floats,
+        g: extern "C" fn(u64) -> Big,
+    ) -> f32 {
         let x = f(Floats { a: 1.0, b: [2.0, 3.0] }, 0.5);
         x.a + x.b[0] + x.b[1] + g(3).c as f32
     }
@@ -1274,6 +1631,40 @@ pub mod const_pointers {
     }
 }
 
+pub mod const_unsized_struct {
+    #[repr(transparent)]
+    pub struct Bytes {
+        all: [u8],
+    }
+    #[repr(C)]
+    pub struct Headed {
+        head: u16,
+        rest: [u16],
+    }
+    pub enum Held<'a> {
+        Owned(Vec<u8>),
+        Borrowed(&'a Bytes),
+    }
+    const fn bytes(all: &[u8]) -> &Bytes {
+        unsafe { &*(all as *const [u8] as *const Bytes) }
+    }
+    const fn headed(all: &[u16]) -> &Headed {
+        unsafe { &*(std::ptr::slice_from_raw_parts(all.as_ptr(), all.len() - 1) as *const Headed) }
+    }
+    const HELD: Held<'static> = Held::Borrowed(bytes(b"abcd"));
+    const HEADED: &Headed = headed(&[7, 8, 9]);
+    static IN_STATIC: (u8, &Bytes) = (3, bytes(b"xyz"));
+
+    /// A constant that points to a struct whose last field is a slice.
+    pub fn run() -> (Vec<u8>, u16, Vec<u16>, u8) {
+        let held = match &HELD {
+            Held::Owned(it) => it.clone(),
+            Held::Borrowed(it) => it.all.to_vec(),
+        };
+        (held, HEADED.head, HEADED.rest.to_vec(), IN_STATIC.1.all[IN_STATIC.0 as usize - 1])
+    }
+}
+
 pub mod promoted {
     use std::hash::{Hash, Hasher};
 
@@ -1413,9 +1804,7 @@ pub mod unsized_tail {
 
     pub fn packed(value: u64) -> (usize, usize, isize) {
         let p: &Packed<dyn Get> = &Packed(0, std::mem::ManuallyDrop::new(value));
-        let offset = unsafe {
-            (&raw const p.1).cast::<u8>().offset_from(&raw const p.0)
-        };
+        let offset = unsafe { (&raw const p.1).cast::<u8>().offset_from(&raw const p.0) };
         (size_of_val(p), align_of_val(p), offset)
     }
 
@@ -1862,16 +2251,26 @@ pub mod stringify_spacing {
     pub fn run() -> Vec<&'static str> {
         vec![
             stringify!(std::option),
-            stringify!(a , b,c),
-            stringify!(f(x).y.0 + #[attr] g ( 1 )),
-            stringify!({ foo += 1; eprintln!("before"); 7331 }),
+            stringify!(a, b, c),
+            stringify!(
+                f(x).y.0
+                    + #[attr]
+                    g(1)
+            ),
+            stringify!({
+                foo += 1;
+                eprintln!("before");
+                7331
+            }),
             stringify!(let (a, b) = &'a mut x;),
-            stringify!(fn f<T: Tr>(x: Vec<T>) -> [u8; 3] {}),
+            stringify!(
+                fn f<T: Tr>(x: Vec<T>) -> [u8; 3] {}
+            ),
             ty!(<Vec<i32>>),
             list!(a, b, c),
             stringify!(("Yeah",)),
             stringify!(1u8),
-            stringify!(r#struct . r#fn),
+            stringify!(r#struct.r#fn),
             expr!(1 + 2),
             expr!(Point { x: 42 }),
             expr!(&a),
@@ -1982,7 +2381,12 @@ pub mod guard_moves {
 
     fn failed(log: &RefCell<Vec<u32>>) -> u32 {
         match (Noisy(log, 2), Noisy(log, 3)) {
-            (_x, _y) if let _z = Noisy(log, 1) && false => 0,
+            (_x, _y)
+                if let _z = Noisy(log, 1)
+                    && false =>
+            {
+                0
+            }
             (x, _) if x.1 == 7 => 1,
             (_, y) => y.1,
         }
@@ -2019,8 +2423,17 @@ pub mod division_panics {
             panic::catch_unwind(|| black_box(i64::MIN) % black_box(-1)).is_err(),
             panic::catch_unwind(|| black_box(i128::MIN) / black_box(-1)).is_err(),
             panic::catch_unwind(|| black_box(i16::MIN) / black_box(1)).is_err(),
+            panic::catch_unwind(|| -black_box(i32::MIN)).is_err(),
+            panic::catch_unwind(|| -black_box(i128::MIN)).is_err(),
+            panic::catch_unwind(|| -black_box(-128i8 + 1)).is_err(),
+            panic::catch_unwind(|| black_box(-128i8) == i8::MIN).is_err(),
         ];
-        (caught, black_box(i128::MIN + 1) / black_box(-1), black_box(7u8) % black_box(4), black_box(-7i64) / 2)
+        (
+            caught,
+            black_box(i128::MIN + 1) / black_box(-1),
+            black_box(7u8) % black_box(4),
+            black_box(-7i64) / 2,
+        )
     }
 }
 
@@ -2070,12 +2483,14 @@ pub mod unwind_owned {
         let counter = Rc::new(());
         let c = counter.clone();
         let _ = panic::catch_unwind(AssertUnwindSafe(move || {
-            let _ = (Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)).clone();
+            let _ =
+                (Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)).clone();
         }));
         let tuple = Rc::strong_count(&counter);
         let c = counter.clone();
         let _ = panic::catch_unwind(AssertUnwindSafe(move || {
-            let _ = [Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)].clone();
+            let _ =
+                [Seventh(c.clone()), Seventh(c.clone()), Seventh(c.clone()), Seventh(c)].clone();
         }));
         (caught, dropped, tuple, Rc::strong_count(&counter))
     }
@@ -2297,6 +2712,202 @@ pub mod async_basic {
     }
 }
 
+pub mod async_closures {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    struct Noisy(&'static str, Log);
+
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    /// Pending the given number of times, then ready.
+    struct Countdown(u32);
+
+    impl Future for Countdown {
+        type Output = u32;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+            if self.0 == 0 {
+                return Poll::Ready(7);
+            }
+            self.0 -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    async fn twice(f: impl AsyncFn(u32) -> u32) -> u32 {
+        f(1).await + f(2).await
+    }
+
+    async fn counted(mut f: impl AsyncFnMut(u32) -> u32) -> u32 {
+        f(1).await;
+        f(2).await
+    }
+
+    async fn once(f: impl AsyncFnOnce(u32) -> usize) -> usize {
+        f(3).await
+    }
+
+    async fn plainly<F: Fn(u32) -> R, R: Future<Output = u32>>(f: F) -> u32 {
+        f(4).await + f(5).await
+    }
+
+    pub fn run() -> (u32, u32, u32, usize, usize, u32, usize, Vec<&'static str>) {
+        // Captures nothing, and is called where it is written.
+        let plain = async |a: u32, b: u32| a + b + Countdown(1).await;
+        let direct = block_on(plain(1, 2));
+
+        // Borrows what it captures, on every call.
+        let base = 10;
+        let shared = block_on(twice(async |x| x + base + Countdown(2).await));
+
+        // Changes what it captures.
+        let mut total = 0;
+        let changed = block_on(counted(async |x| {
+            total += x + Countdown(1).await;
+            total
+        }));
+
+        // Gives away what it captures.
+        let text = String::from("abcd");
+        let moved = block_on(once(async move |x| {
+            let text = text;
+            text.len() + x as usize
+        }));
+
+        // Borrows, and is called as one that is called once.
+        let kept = String::from("ab");
+        let lent = block_on(once(async |x| kept.len() + x as usize + Countdown(1).await as usize));
+
+        // Through the plain closure traits.
+        let plain_traits = block_on(plainly(async |y: u32| y * 3 + Countdown(1).await));
+
+        // What is dropped when: one never called, one called and not polled, one polled and
+        // left waiting.
+        let log = Log::default();
+        let guard = Noisy("closure", log.clone());
+        let holds = async move |name: Noisy| {
+            let _guard = &guard;
+            Countdown(1).await;
+            drop(name);
+        };
+        {
+            let unpolled = holds(Noisy("unpolled", log.clone()));
+            log.borrow_mut().push("made");
+            drop(unpolled);
+            let mut waiting = pin!(holds(Noisy("waiting", log.clone())));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            log.borrow_mut().push("polled");
+        }
+        block_on(holds(Noisy("finished", log.clone())));
+        log.borrow_mut().push("called");
+        drop(holds);
+        log.borrow_mut().push("end");
+        let sizes = size_of_val(&plain) + size_of_val(&plain(1, 2));
+        let dropped = log.borrow().clone();
+        (direct, shared, changed, moved, lent, plain_traits, sizes, dropped)
+    }
+
+    async fn once_noisy<R>(f: impl AsyncFnOnce(Noisy) -> R) -> R {
+        let log = Log::default();
+        f(Noisy("arg", log)).await
+    }
+    async fn once_u<R>(f: impl AsyncFnOnce(u32) -> R) -> R {
+        f(3).await
+    }
+    async fn nested(f: impl AsyncFn(u32) -> u32) -> u32 {
+        twice(&f).await + once_u(&f).await + counted(&f).await + once_u(f).await
+    }
+    async fn named(x: u32) -> u32 {
+        x + Countdown(1).await
+    }
+    fn boxed(
+        f: impl AsyncFn(u32) -> u32 + 'static,
+    ) -> Box<dyn Fn(u32) -> Pin<Box<dyn Future<Output = u32>>>> {
+        let f = Rc::new(f);
+        Box::new(move |x| {
+            let f = f.clone();
+            Box::pin(async move { f(x).await })
+        })
+    }
+    pub fn more() -> Vec<String> {
+        let mut out = Vec::new();
+        // FnOnce by use, with a borrowed capture beside the consumed one.
+        let text = String::from("abcd");
+        let other = String::from("xy");
+        let log = Log::default();
+        let noisy = Noisy("moved", log.clone());
+        let f = async move |x: u32| {
+            let n = other.len();
+            Countdown(1).await;
+            let text = text;
+            drop(noisy);
+            text.len() + n + x as usize
+        };
+        out.push(block_on(once_u(f)).to_string());
+        // Mutable capture by-move.
+        let mut total = 5;
+        let g = async |x: u32| {
+            total += x;
+            Countdown(1).await;
+            total
+        };
+        out.push(block_on(once_u(g)).to_string());
+        out.push(total.to_string());
+        let base = String::from("base");
+        out.push(
+            block_on(nested(async |x| x + base.len() as u32 + Countdown(2).await)).to_string(),
+        );
+        out.push(block_on(nested(async move |x| x + base.len() as u32)).to_string());
+        out.push(block_on(nested(named)).to_string());
+        out.push(block_on(twice(|x| async move { x * 2 })).to_string());
+        out.push(block_on(twice(Box::new(async |x| x * 5))).to_string());
+        let b = boxed(async |x| x + 100);
+        out.push(block_on(b(1)).to_string());
+        // Dropped unpolled after a by-move call.
+        let keep = Noisy("kept", log.clone());
+        let h = async move |n: Noisy| {
+            let _k = &keep;
+            Countdown(1).await;
+            drop(n);
+        };
+        let fut = once_noisy(h);
+        drop(fut);
+        out.push(format!("{:?}", log.borrow()));
+        // Sizes and copies.
+        let small = async |a: u8, b: u64| a as u64 + b;
+        let copy = small;
+        out.push(format!("{} {}", size_of_val(&small), size_of_val(&small(1, 2))));
+        out.push(block_on(copy(1, 2)).to_string());
+        let s = String::from("q");
+        let cl = async move |a: u8| s.len() + a as usize;
+        let cl2 = cl.clone();
+        out.push(format!("{} {} {}", size_of_val(&cl), size_of_val(&cl(1)), block_on(cl2(4))));
+        out
+    }
+}
+
 pub mod async_more {
     use std::cell::RefCell;
     use std::future::Future;
@@ -2498,7 +3109,12 @@ pub mod async_more {
 
 pub mod const_patterns {
     #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-    pub enum Shape { Dot, Line(u8, u8), Named(&'static str), Many(&'static [u16]) }
+    pub enum Shape {
+        Dot,
+        Line(u8, u8),
+        Named(&'static str),
+        Many(&'static [u16]),
+    }
     #[derive(PartialEq, Eq)]
     pub struct Pair(pub i32, pub Option<Shape>);
     const A: Shape = Shape::Line(1, 2);
@@ -2509,25 +3125,67 @@ pub mod const_patterns {
     const F: &Pair = &Pair(1, None);
     const G: (f32, char) = (1.5, 'x');
     fn shape(s: Shape) -> u8 {
-        match s { A => 1, B => 2, Shape::Dot => 3, _ => 4 }
+        match s {
+            A => 1,
+            B => 2,
+            Shape::Dot => 3,
+            _ => 4,
+        }
     }
     fn pair(p: &Pair) -> u8 {
-        match *p { C => 1, _ => match p { F => 2, _ => 3 } }
+        match *p {
+            C => 1,
+            _ => match p {
+                F => 2,
+                _ => 3,
+            },
+        }
     }
     fn bytes(b: &[u8]) -> u8 {
-        match b { D => 1, b"" => 2, _ => 3 }
+        match b {
+            D => 1,
+            b"" => 2,
+            _ => 3,
+        }
     }
-    fn arr(e: [(u8, bool); 2]) -> u8 { match e { E => 1, _ => 0 } }
-    fn fl(e: (f32, char)) -> u8 { match e { G => 1, _ => 0 } }
+    fn arr(e: [(u8, bool); 2]) -> u8 {
+        match e {
+            E => 1,
+            _ => 0,
+        }
+    }
+    fn fl(e: (f32, char)) -> u8 {
+        match e {
+            G => 1,
+            _ => 0,
+        }
+    }
     pub fn run() -> Vec<String> {
         let mut out = Vec::new();
-        out.push(format!("{:?}", [shape(Shape::Line(1, 2)), shape(Shape::Line(1, 3)), shape(Shape::Named("bee")),
-            shape(Shape::Named("be")), shape(Shape::Dot), shape(Shape::Many(&[]))])); 
-        out.push(format!("{:?}", [pair(&Pair(7, Some(Shape::Many(&[1, 2, 3])))), pair(&Pair(7, Some(Shape::Many(&[1, 2])))),
-            pair(&Pair(7, None)), pair(&Pair(1, None)), pair(&Pair(7, Some(Shape::Many(&[1, 2, 4]))))])); 
-        out.push(format!("{:?}", [bytes(b"hello"), bytes(b""), bytes(b"hellp"), bytes(b"hell")])); 
-        out.push(format!("{:?}", [arr(E), arr([(1, true), (2, true)])])); 
-        out.push(format!("{:?}", [fl((1.5, 'x')), fl((1.5, 'y')), fl((f32::NAN, 'x'))])); 
+        out.push(format!(
+            "{:?}",
+            [
+                shape(Shape::Line(1, 2)),
+                shape(Shape::Line(1, 3)),
+                shape(Shape::Named("bee")),
+                shape(Shape::Named("be")),
+                shape(Shape::Dot),
+                shape(Shape::Many(&[]))
+            ]
+        ));
+        out.push(format!(
+            "{:?}",
+            [
+                pair(&Pair(7, Some(Shape::Many(&[1, 2, 3])))),
+                pair(&Pair(7, Some(Shape::Many(&[1, 2])))),
+                pair(&Pair(7, None)),
+                pair(&Pair(1, None)),
+                pair(&Pair(7, Some(Shape::Many(&[1, 2, 4]))))
+            ]
+        ));
+        out.push(format!("{:?}", [bytes(b"hello"), bytes(b""), bytes(b"hellp"), bytes(b"hell")]));
+        out.push(format!("{:?}", [arr(E), arr([(1, true), (2, true)])]));
+        out.push(format!("{:?}", [fl((1.5, 'x')), fl((1.5, 'y')), fl((f32::NAN, 'x'))]));
         out
     }
 }
@@ -2540,6 +3198,7 @@ pub mod array_map {
     }
 }
 
+#[cfg(feature = "nightly")]
 pub mod box_patterns {
     pub struct Noisy(pub &'static str, pub std::rc::Rc<std::cell::RefCell<Vec<String>>>);
     impl Drop for Noisy {
@@ -3119,6 +3778,17 @@ pub mod type_id_hashes {
             id::<dyn FnMut(&str) -> &str>(),
             id::<Box<dyn Fn(&dyn Fn(&u8) -> &u8) -> Box<dyn Iterator<Item = &'static str>>>>(),
             id::<std::iter::Map<std::slice::Iter<'static, u8>, fn(&u8) -> u8>>(),
+            id::<fn(&u8, &u16)>(),
+            id::<fn(&u16, &u8)>(),
+            id::<fn(Borrowed) -> Borrowed>(),
+            id::<fn(Borrowed<'_>, &u8)>(),
+            id::<fn(&'static u8) -> &u8>(),
+            id::<for<'a> fn(&'a u8, &u8) -> &'a u8>(),
+            id::<fn(&dyn Any) -> &dyn Any>(),
+            id::<fn(&mut dyn FnMut(&str) -> &str, Box<dyn Any>) -> &str>(),
+            id::<dyn Fn(&dyn Any, fn(&u8) -> &u8)>(),
+            id::<fn(fn(&u8)) -> fn(&u8) -> &u8>(),
+            id::<&'static dyn Fn(&u8) -> std::slice::Iter<u8>>(),
         ]
     }
 
@@ -3497,7 +4167,8 @@ pub mod boxed_fn_once {
         let b: Box<dyn Fn(u8) -> u8> = Box::new(move |x| x + d.0.len() as u8);
         let once: Box<dyn FnOnce(u8) -> u8> = b;
         log(format!("{}", once(3)));
-        let v: Vec<Box<dyn FnOnce() -> String>> = vec![Box::new(|| "x".into()), Box::new(String::new)];
+        let v: Vec<Box<dyn FnOnce() -> String>> =
+            vec![Box::new(|| "x".into()), Box::new(String::new)];
         for f in v {
             log(f());
         }
@@ -3619,7 +4290,8 @@ pub mod closure_layout {
 
     pub fn run() -> String {
         let edge = |byte, next, link| Edge { byte, next, link };
-        let graph = Graph { heads: vec![1], edges: vec![edge(0, 0, 0), edge(3, 7, 2), edge(9, 8, 0)] };
+        let graph =
+            Graph { heads: vec![1], edges: vec![edge(0, 0, 0), edge(3, 7, 2), edge(9, 8, 0)] };
         format!(
             "{} {} {} {} {} {:?}",
             graph.follow(0, 9),
@@ -3860,6 +4532,129 @@ pub mod simd_x86 {
     }
 }
 
+/// `core::arch` vector functions of AArch64: lanes, immediates that are const generics, table
+/// lookups, reductions across a vector, and the narrowing shift a byte search ends with.
+#[cfg(target_arch = "aarch64")]
+pub mod simd_aarch64 {
+    use core::arch::aarch64::*;
+
+    type Bytes = [u8; 16];
+
+    fn bytes(v: uint8x16_t) -> Bytes {
+        unsafe { core::mem::transmute(v) }
+    }
+    pub fn lanes(v: uint8x16_t) -> (u8, u16, u32, u64, i8) {
+        unsafe {
+            (
+                vgetq_lane_u8::<5>(v),
+                vgetq_lane_u16(vreinterpretq_u16_u8(v), 3),
+                vgetq_lane_u32::<2>(vreinterpretq_u32_u8(v)),
+                vgetq_lane_u64::<1>(vreinterpretq_u64_u8(v)),
+                vgetq_lane_s8::<15>(vreinterpretq_s8_u8(v)),
+            )
+        }
+    }
+    pub fn rotate(v: uint8x16_t, w: uint8x16_t) -> (Bytes, Bytes) {
+        unsafe { (bytes(vextq_u8::<3>(v, w)), bytes(vextq_u8(w, v, 13))) }
+    }
+    pub fn table(v: uint8x16_t, w: uint8x16_t) -> (Bytes, Bytes) {
+        unsafe { (bytes(vqtbl1q_u8(v, w)), bytes(vqtbx1q_u8(v, w, v))) }
+    }
+    pub fn shifts(v: uint8x16_t) -> (Bytes, Bytes, Bytes, Bytes) {
+        unsafe {
+            let wide = vreinterpretq_u16_u8(v);
+            (
+                bytes(vshrq_n_u8::<4>(v)),
+                bytes(vshlq_n_u8::<3>(v)),
+                bytes(vreinterpretq_u8_u16(vshrq_n_u16::<4>(wide))),
+                bytes(vreinterpretq_u8_s8(vshrq_n_s8::<2>(vreinterpretq_s8_u8(v)))),
+            )
+        }
+    }
+    pub fn across(v: uint8x16_t) -> (u8, u8, u8, u16, u32, u8) {
+        unsafe {
+            (
+                vmaxvq_u8(v),
+                vminvq_u8(v),
+                vaddvq_u8(v),
+                vaddvq_u16(vpaddlq_u8(v)),
+                vaddvq_u32(vpaddlq_u16(vpaddlq_u8(v))),
+                vaddvq_u8(vcntq_u8(v)),
+            )
+        }
+    }
+    /// Four bits per byte that is seven: what a search over sixteen bytes reads its match from.
+    pub fn matches(v: uint8x16_t) -> (u64, u32) {
+        unsafe {
+            let equal = vceqq_u8(v, vdupq_n_u8(7));
+            let narrowed = vshrn_n_u16::<4>(vreinterpretq_u16_u8(equal));
+            let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(narrowed));
+            (mask, mask.trailing_zeros() >> 2)
+        }
+    }
+    /// The eight-byte group of a hash table: which bytes match, and which are empty.
+    pub fn group(bytes: &[u8; 8]) -> (u64, u64) {
+        unsafe {
+            let group = vld1_u8(bytes.as_ptr());
+            let matched = vceq_u8(group, vdup_n_u8(0x41));
+            let empty = vcltz_s8(vreinterpret_s8_u8(group));
+            (
+                vget_lane_u64::<0>(vreinterpret_u64_u8(matched)) & 0x8080_8080_8080_8080,
+                vget_lane_u64(vreinterpret_u64_u8(empty), 0),
+            )
+        }
+    }
+    pub fn select(v: uint8x16_t, w: uint8x16_t) -> (Bytes, Bytes, Bytes, Bytes) {
+        unsafe {
+            let greater = vcgtq_u8(v, w);
+            (
+                bytes(vbslq_u8(greater, v, w)),
+                bytes(vmaxq_u8(v, w)),
+                bytes(vqaddq_u8(v, w)),
+                bytes(vqsubq_u8(v, w)),
+            )
+        }
+    }
+    pub fn wide(
+        v: uint8x16_t,
+        w: uint8x16_t,
+    ) -> ([u16; 8], [u32; 4], [u64; 2], [f32; 4], [f64; 2]) {
+        unsafe {
+            let product = vmull_u8(vget_low_u8(v), vget_high_u8(w));
+            let words = vmulq_u32(vreinterpretq_u32_u8(v), vreinterpretq_u32_u8(w));
+            let longs = vaddq_u64(vreinterpretq_u64_u8(v), vreinterpretq_u64_u8(w));
+            let singles = vmulq_f32(vcvtq_f32_u32(vpaddlq_u16(product)), vdupq_n_f32(0.5));
+            let doubles = vsqrtq_f64(vcvtq_f64_u64(vpaddlq_u32(vpaddlq_u16(product))));
+            (
+                core::mem::transmute(product),
+                core::mem::transmute(words),
+                core::mem::transmute(longs),
+                core::mem::transmute(singles),
+                core::mem::transmute(doubles),
+            )
+        }
+    }
+    pub fn run() -> String {
+        let first: Bytes = [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+        let second: Bytes = [6, 15, 4, 3, 2, 11, 1, 9, 248, 7, 6, 5, 14, 3, 0, 255];
+        let (v, w) = unsafe { (vld1q_u8(first.as_ptr()), vld1q_u8(second.as_ptr())) };
+        let mut out =
+            format!("{:?} {:?} {:?} {:?}", lanes(v), rotate(v, w), table(v, w), shifts(w));
+        out += &format!(
+            " {:?} {:?} {:?} {:?}",
+            across(w),
+            matches(v),
+            matches(w),
+            group(b"AbA\xffcdA\x80")
+        );
+        out += &format!(" {:?} {:?}", select(v, w), wide(v, w));
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            out += " neon";
+        }
+        out
+    }
+}
+
 /// An associated constant of an impl that is generic over a lifetime, named from a method of
 /// that impl.
 pub mod lifetime_impl_consts {
@@ -3888,7 +4683,13 @@ pub mod lifetime_impl_consts {
 
     pub fn run() -> String {
         let state = State { trans: &[1, 2, 3] };
-        format!("{} {} {} {}", State::kind(1, false), State::kind(4, true), State::kind(999, false), state.read())
+        format!(
+            "{} {} {} {}",
+            State::kind(1, false),
+            State::kind(4, true),
+            State::kind(999, false),
+            state.read()
+        )
     }
 }
 
@@ -4302,9 +5103,8 @@ pub mod moved_in_break {
                 let a: &AtomicU8;
                 break {
                     a = unsafe { &*(dst as *const AtomicU8) };
-                    let res = unsafe {
-                        mem::transmute_copy(&a.swap(mem::transmute_copy(&val), SeqCst))
-                    };
+                    let res =
+                        unsafe { mem::transmute_copy(&a.swap(mem::transmute_copy(&val), SeqCst)) };
                     mem::forget(val);
                     res
                 };
@@ -4394,16 +5194,24 @@ pub mod stringified {
     pub fn run() -> [&'static str; 14] {
         [
             body!(x y),
-            tts!(x,y),
+            tts!(x, y),
             tts!(+,-),
-            fragments!(x+1, Vec<u8>),
+            fragments!(x + 1, Vec<u8>),
             stringify!(0 as int! {...} != 0),
-            stringify!(1 + 'a: loop { break 'a 1 } == 1),
-            stringify!(E::U::<>>E::U::<u8>),
+            stringify!(
+                1 + 'a: loop {
+                    break 'a 1;
+                } == 1
+            ),
+            stringify!(E::U > E::U::<u8>),
             stringify!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1),
             all!(0 as int! {...} != 0),
-            all!(1 + 'a: loop { break 'a 1 } == 1),
-            all!(E::U::<>>E::U::<u8>),
+            all!(
+                1 + 'a: loop {
+                    break 'a 1;
+                } == 1
+            ),
+            all!(E::U > E::U::<u8>),
             all!(a +-b; x<<=y; &&z; {} { } {a} { a } {a } { a}; f::<'a>(); |&'a x| 1),
             munch!(() (E::U::<>>E::U::<u8>) E::U::<>>E::U::<u8>),
             munch!(() (a; &b + 'c: loop {}>>d) a; &b + 'c: loop {}>>d),
@@ -4597,6 +5405,8 @@ pub mod trivial_bounds {
 
 /// One variadic function called with different numbers of arguments.
 pub mod variadic {
+    // The C runtime of MSVC has `snprintf` in its headers, and in this library for the rest.
+    #[cfg_attr(target_env = "msvc", link(name = "legacy_stdio_definitions"))]
     unsafe extern "C" {
         fn snprintf(buf: *mut u8, len: usize, format: *const u8, ...) -> i32;
     }
@@ -4610,14 +5420,15 @@ pub mod variadic {
     pub fn two(a: i32, b: u64) -> String {
         let mut buf = [0u8; 32];
         let len =
-            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"%d-%lu".as_ptr().cast(), a, b) };
+            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"%d-%llu".as_ptr().cast(), a, b) };
         String::from_utf8_lossy(&buf[..len as usize]).into_owned()
     }
 
     pub fn string(text: &std::ffi::CStr) -> String {
         let mut buf = [0u8; 32];
-        let len =
-            unsafe { snprintf(buf.as_mut_ptr(), buf.len(), c"<%s>".as_ptr().cast(), text.as_ptr()) };
+        let len = unsafe {
+            snprintf(buf.as_mut_ptr(), buf.len(), c"<%s>".as_ptr().cast(), text.as_ptr())
+        };
         String::from_utf8_lossy(&buf[..len as usize]).into_owned()
     }
 }
@@ -4649,7 +5460,10 @@ pub mod const_pointer_into_const {
         const NEW: Self = Inner::new();
 
         const fn new() -> Self {
-            Self { ctrl: unsafe { std::ptr::NonNull::new_unchecked(tags().as_ptr().cast_mut()) }, mask: 0 }
+            Self {
+                ctrl: unsafe { std::ptr::NonNull::new_unchecked(tags().as_ptr().cast_mut()) },
+                mask: 0,
+            }
         }
     }
 
@@ -4864,8 +5678,13 @@ second "quoted"
 "#
         )
         .unwrap();
-        writeln!(out, r"plain
- {}", 1).unwrap();
+        writeln!(
+            out,
+            r"plain
+ {}",
+            1
+        )
+        .unwrap();
         writeln!(out, "escaped\n {name}\n").unwrap();
         out
     }
@@ -5122,14 +5941,25 @@ pub mod move_closure_fields {
                         )?;
                         visitor.seen.push(value);
                     }
-                    let value = evaluated.named.remove(&func.into()).map_or_else(|| Ok(7), Result::<u32, String>::Ok)?;
+                    let value = evaluated
+                        .named
+                        .remove(&func.into())
+                        .map_or_else(|| Ok(7), Result::<u32, String>::Ok)?;
                     visitor.seen.push(value);
                     let num_named = evaluated.named.len();
                     let has_rest = if positional_len > 2 {
-                        let rest = if !evaluated.positional.is_empty() { evaluated.positional } else { Vec::new() };
+                        let rest = if !evaluated.positional.is_empty() {
+                            evaluated.positional
+                        } else {
+                            Vec::new()
+                        };
                         visitor.seen.extend(rest);
                         visitor.seen.extend(evaluated.named.clone().into_values());
-                        visitor.seen.push(if evaluated.separator == Separator::Undecided { 100 } else { 200 });
+                        visitor.seen.push(if evaluated.separator == Separator::Undecided {
+                            100
+                        } else {
+                            200
+                        });
                         true
                     } else {
                         false
@@ -5146,7 +5976,11 @@ pub mod move_closure_fields {
     }
 
     fn verify(len: usize, named: &BTreeMap<u32, u32>, span: (u32, u32)) -> Result<(), String> {
-        if len + named.len() > span.1 as usize { Err(format!("too many at {}", span.0)) } else { Ok(()) }
+        if len + named.len() > span.1 as usize {
+            Err(format!("too many at {}", span.0))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn run(positional: Vec<u32>, separator: Separator) -> Result<Vec<u32>, String> {
@@ -5159,5 +5993,810 @@ pub mod move_closure_fields {
         })?;
         visitor.seen.push(extra);
         Ok(visitor.seen)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub mod inline_asm {
+    use std::arch::asm;
+
+    fn add(a: u64, b: u64) -> u64 {
+        let out: u64;
+        unsafe {
+            asm!("lea {out}, [{a} + {b}]", a = in(reg) a, b = in(reg) b, out = lateout(reg) out)
+        };
+        out
+    }
+
+    fn in_place(mut x: u32) -> u32 {
+        unsafe { asm!("shl {0:e}, 3", "add {0:e}, {1}", inout(reg) x, const 5) };
+        x
+    }
+
+    fn divide(n: u64, d: u64) -> (u64, u64) {
+        let (quotient, remainder);
+        unsafe {
+            asm!(
+                "div {d}",
+                d = in(reg) d,
+                inout("rax") n => quotient,
+                inout("rdx") 0u64 => remainder,
+                options(pure, nomem, nostack),
+            )
+        };
+        (quotient, remainder)
+    }
+
+    fn vendor() -> [u8; 12] {
+        let (b, c, d): (u32, u32, u32);
+        unsafe {
+            asm!(
+                "mov {saved}, rbx",
+                "cpuid",
+                "xchg {saved}, rbx",
+                saved = out(reg) b,
+                inout("eax") 0 => _,
+                out("ecx") c,
+                out("edx") d,
+            )
+        };
+        let mut name = [0; 12];
+        name[..4].copy_from_slice(&b.to_le_bytes());
+        name[4..8].copy_from_slice(&d.to_le_bytes());
+        name[8..].copy_from_slice(&c.to_le_bytes());
+        name
+    }
+
+    fn bytes(low: u8, high: u8) -> u16 {
+        let out: u16;
+        unsafe {
+            asm!(
+                "mov {out:l}, {low}",
+                "mov {out:h}, {high}",
+                low = in(reg_byte) low,
+                high = in(reg_byte) high,
+                out = out(reg_abcd) out,
+            )
+        };
+        out
+    }
+
+    fn floats(a: f64, b: f64) -> (f64, f32) {
+        let sum: f64;
+        let mut single = a as f32;
+        unsafe {
+            asm!(
+                "addsd {a}, {b}",
+                "sqrtss {s}, {s}",
+                a = inout(xmm_reg) a => sum,
+                b = in(xmm_reg) b,
+                s = inout(xmm_reg) single,
+            )
+        };
+        (sum, single)
+    }
+
+    fn att(a: u64) -> u64 {
+        let out: u64;
+        unsafe {
+            asm!("movq {0}, {1}", "addq $7, {1}", in(reg) a, out(reg) out, options(att_syntax))
+        };
+        out
+    }
+
+    /// Registers a function has to restore, and many operands at once.
+    fn kept(values: [u64; 6]) -> u64 {
+        let [a, b, c, d, e, f] = values;
+        let out: u64;
+        unsafe {
+            asm!(
+                "add {a}, {b}", "add {a}, {c}", "add {a}, {d}", "add {a}, {e}", "add {a}, {f}",
+                "mov r12, {a}", "mov r13, r12", "mov r14, r13", "mov r15, r14",
+                a = inout(reg) a => _, b = in(reg) b, c = in(reg) c, d = in(reg) d,
+                e = in(reg) e, f = in(reg) f,
+                out("r12") _, out("r13") _, out("r14") _, out("r15") out,
+            )
+        };
+        out
+    }
+
+    fn memory(values: &mut [u32; 4]) -> u32 {
+        let total: u32;
+        unsafe {
+            asm!(
+                "mov {total:e}, [{p}]",
+                "add {total:e}, [{p} + 4]",
+                "mov dword ptr [{p} + 8], {total:e}",
+                "/* a comment */",
+                p = in(reg) values.as_mut_ptr(),
+                total = out(reg) total,
+            )
+        };
+        total + values[2]
+    }
+
+    fn stops(go: bool) -> u8 {
+        if go {
+            unsafe { asm!("ud2", options(noreturn)) }
+        }
+        unsafe { asm!("nop") };
+        3
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (
+            add(40, 2),
+            in_place(4),
+            divide(47, 5),
+            vendor().iter().all(u8::is_ascii_graphic),
+            bytes(0x34, 0x12),
+            floats(1.5, 2.25),
+            att(35),
+            kept([1, 2, 3, 4, 5, 6]),
+            memory(&mut [10, 20, 0, 0]),
+            stops(false),
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub mod inline_asm {
+    use std::arch::asm;
+
+    fn add(a: u64, b: u64) -> u64 {
+        let out: u64;
+        unsafe {
+            asm!("add {out}, {a}, {b}", a = in(reg) a, b = in(reg) b, out = lateout(reg) out)
+        };
+        out
+    }
+
+    fn in_place(mut x: u32) -> u32 {
+        unsafe { asm!("lsl {0:w}, {0:w}, #3", "add {0:w}, {0:w}, #{1}", inout(reg) x, const 5) };
+        x
+    }
+
+    fn divide(n: u64, d: u64) -> (u64, u64) {
+        let (quotient, remainder);
+        unsafe {
+            asm!(
+                "udiv x2, x0, {d}",
+                "msub x1, x2, {d}, x0",
+                d = in(reg) d,
+                in("x0") n,
+                out("x1") remainder,
+                out("x2") quotient,
+                options(pure, nomem, nostack),
+            )
+        };
+        (quotient, remainder)
+    }
+
+    fn halves(low: u8, high: u8) -> u16 {
+        let out: u16;
+        unsafe {
+            asm!(
+                "and {out:w}, {low:w}, #0xff",
+                "orr {out:w}, {out:w}, {high:w}, lsl #8",
+                low = in(reg) low,
+                high = in(reg) high,
+                out = out(reg) out,
+            )
+        };
+        out
+    }
+
+    fn floats(a: f64, b: f64) -> (f64, f32) {
+        let sum: f64;
+        let mut single = a as f32;
+        unsafe {
+            asm!(
+                "fadd {a:d}, {a:d}, {b:d}",
+                "fsqrt {s:s}, {s:s}",
+                a = inout(vreg) a => sum,
+                b = in(vreg) b,
+                s = inout(vreg) single,
+            )
+        };
+        (sum, single)
+    }
+
+    fn named_vector(a: f64) -> f64 {
+        let out: f64;
+        unsafe { asm!("fneg d1, d0", "fadd d1, d1, d1", in("v0") a, out("v1") out) };
+        out
+    }
+
+    /// Registers a function has to restore, and many operands at once.
+    fn kept(values: [u64; 6]) -> u64 {
+        let [a, b, c, d, e, f] = values;
+        let out: u64;
+        unsafe {
+            asm!(
+                "add {a}, {a}, {b}", "add {a}, {a}, {c}", "add {a}, {a}, {d}",
+                "add {a}, {a}, {e}", "add {a}, {a}, {f}",
+                "mov x20, {a}", "mov x21, x20", "mov x22, x21", "mov x23, x22",
+                "fmov d8, x23", "fmov x28, d8",
+                a = inout(reg) a => _, b = in(reg) b, c = in(reg) c, d = in(reg) d,
+                e = in(reg) e, f = in(reg) f,
+                out("x20") _, out("x21") _, out("x22") _, out("x23") _, out("v8") _,
+                out("x28") out,
+            )
+        };
+        out
+    }
+
+    fn memory(values: &mut [u32; 4]) -> u32 {
+        let total: u32;
+        unsafe {
+            asm!(
+                "ldr {total:w}, [{p}]",
+                "ldr {scratch:w}, [{p}, #4]",
+                "add {total:w}, {total:w}, {scratch:w}",
+                "str {total:w}, [{p}, #8]",
+                "/* a comment */",
+                p = in(reg) values.as_mut_ptr(),
+                total = out(reg) total,
+                scratch = out(reg) _,
+            )
+        };
+        total + values[2]
+    }
+
+    /// The thread pointer, which nothing but an instruction reads.
+    #[cfg(not(target_vendor = "apple"))]
+    fn thread_pointer() -> bool {
+        let (first, second): (u64, u64);
+        unsafe {
+            asm!("mrs {0}, tpidr_el0", out(reg) first, options(nomem, nostack, preserves_flags));
+            asm!("mrs {0}, tpidr_el0", out(reg) second);
+        }
+        first != 0 && first == second
+    }
+
+    /// Apple keeps the thread pointer in the read-only register; the other one holds the
+    /// number of the core the thread is on, which is zero on one core and changes.
+    #[cfg(target_vendor = "apple")]
+    fn thread_pointer() -> bool {
+        let (first, second): (u64, u64);
+        unsafe {
+            asm!("mrs {0}, tpidrro_el0", out(reg) first, options(nomem, nostack, preserves_flags));
+            asm!("mrs {0}, tpidrro_el0", out(reg) second);
+        }
+        first != 0 && first == second
+    }
+
+    fn stops(go: bool) -> u8 {
+        if go {
+            unsafe { asm!("brk #1", options(noreturn)) }
+        }
+        unsafe { asm!("nop") };
+        3
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (
+            add(40, 2),
+            in_place(4),
+            divide(47, 5),
+            halves(0x34, 0x12),
+            floats(1.5, 2.25),
+            named_vector(1.25),
+            kept([1, 2, 3, 4, 5, 6]),
+            memory(&mut [10, 20, 0, 0]),
+            thread_pointer(),
+            stops(false),
+        )
+    }
+}
+
+/// Constants that hold another constant's value: what that value points to is copied, and
+/// the pointers in it have to follow, through a type that is written as an associated type
+/// and through a union.
+pub mod const_in_const {
+    pub trait Marker {
+        type Data: 'static;
+    }
+    pub struct Table {
+        names: &'static [&'static str],
+        bytes: *const [u8],
+        count: u32,
+    }
+    unsafe impl Sync for Table {}
+    pub struct Baked;
+    impl Marker for Baked {
+        type Data = Table;
+    }
+    impl Baked {
+        pub const TABLE: &'static <Baked as Marker>::Data = &Table {
+            names: &["one", "two", "three"],
+            bytes: b"\x01\x02\x03\x04" as &[u8],
+            count: 3,
+        };
+    }
+    #[derive(Clone, Copy)]
+    pub union Either {
+        text: &'static str,
+        number: u128,
+    }
+    pub struct Held {
+        before: &'static [u16],
+        table: &'static Table,
+        either: Either,
+        after: &'static str,
+    }
+    const fn padding() -> &'static [u16] {
+        &[7, 8, 9, 10, 11, 12, 13]
+    }
+    const WORD: Either = Either { text: "a word behind a union" };
+    const fn held() -> Held {
+        let before = padding();
+        Held { before, table: Baked::TABLE, either: WORD, after: "after" }
+    }
+    const HELD: Held = held();
+    const AGAIN: (&[u16], Held) = (&[1, 2], held());
+
+    #[inline(never)]
+    fn read(held: &Held) -> (usize, String, Vec<u8>, u32, &'static str, &'static str) {
+        let table = std::hint::black_box(held).table;
+        (
+            held.before.len(),
+            table.names.concat(),
+            unsafe { &*table.bytes }.to_vec(),
+            table.count,
+            unsafe { held.either.text },
+            held.after,
+        )
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (read(&HELD), read(&AGAIN.1), AGAIN.0.len())
+    }
+}
+
+/// A binding declared without a value takes a field out of what a match arm binds, as
+/// `syn::braced!` does: the field is dropped once, where the binding goes out of scope.
+pub mod moved_out_field {
+    use std::cell::RefCell;
+
+    struct Buffer<'a>(&'a RefCell<Vec<&'static str>>, &'static str);
+    impl Drop for Buffer<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+    struct Braces<'a> {
+        token: u32,
+        content: Buffer<'a>,
+    }
+    #[inline(never)]
+    fn braces<'a>(log: &'a RefCell<Vec<&'static str>>, fails: bool) -> Result<Braces<'a>, u8> {
+        if fails { Err(3) } else { Ok(Braces { token: 7, content: Buffer(log, "content") }) }
+    }
+    fn parse(log: &RefCell<Vec<&'static str>>, fails: bool) -> Result<u32, u8> {
+        let content: Buffer;
+        let token = match braces(log, fails) {
+            Ok(braces) => {
+                content = braces.content;
+                _ = content;
+                braces.token
+            }
+            Err(error) => return Err(error),
+        };
+        log.borrow_mut().push("parsed");
+        Ok(token + content.1.len() as u32)
+    }
+    pub fn run() -> impl std::fmt::Debug {
+        let log = RefCell::new(Vec::new());
+        let (taken, failed) = (parse(&log, false), parse(&log, true));
+        (taken, failed, log.into_inner())
+    }
+}
+
+/// `type_name` of a function written in another's body, which is how a test names a component.
+pub mod local_type_names {
+    fn name_of<T>(_: T) -> &'static str {
+        std::any::type_name::<T>()
+    }
+    pub fn run() -> impl std::fmt::Debug {
+        fn inner() {}
+        struct Local;
+        let nested = {
+            fn deeper() -> &'static str {
+                fn deepest() {}
+                name_of(deepest)
+            }
+            (name_of(deeper), deeper())
+        };
+        let in_closure = (|| {
+            fn enclosed() {}
+            let twice = || {
+                struct Twice;
+                std::any::type_name::<Twice>()
+            };
+            (name_of(enclosed), twice())
+        })();
+        (name_of(inner), std::any::type_name::<Local>(), nested, in_closure, name_of(run))
+    }
+}
+
+/// Unsizing a value that holds its pointer somewhere other than first, as a hook's
+/// `RefCell<Box<dyn FnMut>>` is made.
+pub mod unsized_in_struct {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    pub fn run() -> impl std::fmt::Debug {
+        let mut count = 3;
+        let boxed: RefCell<Box<dyn FnMut() -> i32>> = RefCell::new(Box::new(move || {
+            count += 1;
+            count
+        }));
+        let first = (boxed.borrow_mut())();
+        let cell: Cell<&[u8]> = Cell::new(&[1u8, 2, 3]);
+        let shared: Rc<RefCell<Box<dyn Fn(i32) -> i32>>> =
+            Rc::new(RefCell::new(Box::new(move |it| it * first)));
+        let slices: RefCell<Box<[u16]>> = RefCell::new(Box::new([7u16, 8]));
+        (
+            first,
+            (boxed.borrow_mut())(),
+            cell.get().len(),
+            (shared.borrow())(5),
+            slices.borrow().len(),
+        )
+    }
+}
+
+/// `&(function as fn())` lives for `'static`, which a `Deref` to a function pointer returns.
+pub mod promoted_fn_cast {
+    use std::marker::PhantomData;
+    use std::ops::Deref;
+
+    struct Callable<T>(PhantomData<T>);
+    impl<T: std::fmt::Debug + Default> Callable<T> {
+        fn run(by: u32) -> String {
+            format!("{:?} by {by}", T::default())
+        }
+    }
+    impl<T: std::fmt::Debug + Default> Deref for Callable<T> {
+        type Target = fn(u32) -> String;
+        #[inline(never)]
+        fn deref(&self) -> &Self::Target {
+            &(Self::run as fn(u32) -> String)
+        }
+    }
+    #[inline(never)]
+    fn clobber() -> [u64; 16] {
+        std::hint::black_box([0x5555_5555_5555_5555; 16])
+    }
+    pub fn run() -> impl std::fmt::Debug {
+        let callable = Callable::<u8>(PhantomData);
+        let function = callable.deref();
+        let clobbered = clobber();
+        (function(3), Callable::<bool>(PhantomData)(4), clobbered[3] as u8)
+    }
+}
+
+/// What the `warnings` crate's attribute writes: a struct, an enum variant and a function of
+/// one name, which a path names by where it stands.
+pub mod same_name_callable {
+    pub trait Warning: 'static {
+        const ID: Id;
+    }
+    pub struct Id {
+        name: fn() -> &'static str,
+    }
+    impl Id {
+        pub const fn of<W: Warning + ?Sized>() -> Self {
+            Self { name: std::any::type_name::<W> }
+        }
+        fn if_enabled(&self, f: impl FnOnce()) {
+            if (self.name)().ends_with("hoisted") {
+                f()
+            }
+        }
+    }
+
+    #[allow(non_camel_case_types)]
+    pub struct hoisted {}
+    mod __hoisted {
+        use super::*;
+        pub(crate) enum __Callable<T: 'static> {
+            #[allow(non_camel_case_types)]
+            hoisted,
+            #[allow(dead_code)]
+            PhantomData(std::marker::PhantomData<T>),
+        }
+        impl<T: 'static> __Callable<T> {
+            fn __run_if_enabled(arg0: &std::cell::Cell<T>, arg1: T) {
+                <hoisted as Warning>::ID.if_enabled(|| {
+                    fn hoisted<T: 'static>(value: &std::cell::Cell<T>, with: T) {
+                        value.set(with);
+                    }
+                    hoisted(arg0, arg1);
+                });
+            }
+        }
+        impl<T: 'static> std::ops::Deref for __Callable<T> {
+            type Target = fn(&std::cell::Cell<T>, T);
+            fn deref(&self) -> &Self::Target {
+                &(Self::__run_if_enabled as fn(&std::cell::Cell<T>, T))
+            }
+        }
+    }
+    pub use __hoisted::__Callable::*;
+    impl Warning for hoisted {
+        const ID: Id = Id::of::<hoisted>();
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        let (number, text) = (std::cell::Cell::new(1u8), std::cell::Cell::new("before"));
+        hoisted(&number, 9);
+        hoisted(&text, "after");
+        (number.get(), text.get())
+    }
+}
+
+/// Two statics of one name in one function, the second inside a closure, as `#[instrument]`
+/// around a `trace_span!` leaves them.
+pub mod same_name_statics {
+    struct Site {
+        name: &'static str,
+        id: &'static std::sync::atomic::AtomicUsize,
+    }
+
+    fn enter<R>(site: &'static Site, f: impl FnOnce() -> R) -> (R, &'static str, usize) {
+        let was = site.id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (f(), site.name, was)
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        let outer = {
+            static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10);
+            static SITE: Site = Site { name: "outer", id: &COUNT };
+            &SITE
+        };
+        enter(outer, || {
+            let inner = {
+                static COUNT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(20);
+                static SITE: Site = Site { name: "inner", id: &COUNT };
+                &SITE
+            };
+            (enter(inner, || 1), enter(inner, || 2), enter(outer, || 3))
+        })
+    }
+}
+
+/// A static in a method of a generic `impl` of a trait whose parameter is left at its default.
+pub mod static_in_defaulted_impl {
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub trait Parse<P = ()>: Sized {
+        fn parse(text: &str) -> (Option<Self>, usize);
+    }
+
+    pub struct Marker;
+
+    impl<T: FromStr> Parse for T {
+        fn parse(text: &str) -> (Option<Self>, usize) {
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            (text.parse().ok(), CALLS.fetch_add(1, Ordering::Relaxed))
+        }
+    }
+
+    impl<T: FromStr> Parse<Marker> for Option<T> {
+        fn parse(text: &str) -> (Option<Self>, usize) {
+            static CALLS: AtomicUsize = AtomicUsize::new(100);
+            (Some(text.parse().ok()), CALLS.fetch_add(1, Ordering::Relaxed))
+        }
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        (
+            <u8 as Parse>::parse("7"),
+            <i16 as Parse>::parse("x"),
+            <Option<u8> as Parse<Marker>>::parse("3"),
+            <Option<bool> as Parse<Marker>>::parse("true"),
+        )
+    }
+}
+
+/// A `#[track_caller]` method called through a vtable reports where it is declared.
+pub mod track_caller_in_vtable {
+    pub trait Here {
+        fn here(&self, by: u32) -> (u32, u32, u32);
+        #[track_caller]
+        fn provided(&self) -> u32 {
+            std::panic::Location::caller().line()
+        }
+    }
+
+    pub struct Tracked(u32);
+    pub struct Plain(u32);
+
+    impl Here for Tracked {
+        #[track_caller]
+        fn here(&self, by: u32) -> (u32, u32, u32) {
+            let caller = std::panic::Location::caller();
+            (self.0 * by, caller.line(), caller.column())
+        }
+    }
+
+    impl Here for Plain {
+        fn here(&self, by: u32) -> (u32, u32, u32) {
+            let caller = std::panic::Location::caller();
+            (self.0 + by, caller.line(), caller.column())
+        }
+    }
+
+    pub fn run() -> impl std::fmt::Debug {
+        let all: [&dyn Here; 2] = [&Tracked(3), &Plain(4)];
+        let through: Vec<_> = all.iter().map(|it| (it.here(5), it.provided())).collect();
+        (through, Tracked(6).here(7), Tracked(1).provided())
+    }
+}
+
+/// Values whose variant is told by a niche, made on one side of the crate boundary and read
+/// on the other: the two sides must agree on which value of the niche means which variant.
+pub mod niche_values {
+    use std::ptr::NonNull;
+
+    #[derive(Copy, Clone)]
+    pub enum Position {
+        Major,
+        Minor,
+        Patch,
+        Pre,
+        Build,
+    }
+    #[derive(Copy, Clone)]
+    pub enum Op {
+        Exact,
+        Greater,
+        GreaterEq,
+        Less,
+        LessEq,
+        Tilde,
+        Caret,
+        Wildcard,
+    }
+    pub struct Prerelease {
+        pub head: NonNull<u8>,
+    }
+    pub struct Comparator {
+        pub op: Op,
+        pub major: u64,
+        pub minor: Option<u64>,
+        pub patch: Option<u64>,
+        pub pre: Prerelease,
+    }
+    pub enum ErrorKind {
+        Empty,
+        UnexpectedEnd(Position),
+        UnexpectedChar(Position, char),
+        UnexpectedCharAfter(Position, char),
+        ExpectedCommaFound(Position, char),
+        LeadingZero(Position),
+        Overflow(Position),
+        EmptySegment(Position),
+        IllegalCharacter(Position),
+        WildcardNotTheOnlyComparator(char),
+        UnexpectedAfterWildcard,
+        ExcessiveComparators,
+    }
+    pub struct Error {
+        pub kind: ErrorKind,
+    }
+    /// What semver's parser of a comparator returns.
+    pub type Parsed = Result<(Comparator, Position, &'static str), Error>;
+
+    pub enum Signed {
+        A = -3,
+        B = -1,
+        C = 2,
+    }
+    #[repr(i8)]
+    pub enum Wrap {
+        A = -128,
+        B = 127,
+        C = 5,
+    }
+    #[repr(u8)]
+    pub enum High {
+        A = 200,
+        B = 255,
+        C = 0,
+    }
+    pub enum Gap {
+        A = 0,
+        B = 1,
+        C = 250,
+        D = 255,
+    }
+    pub struct Two {
+        pub a: Option<u64>,
+        pub b: Option<u64>,
+        pub c: bool,
+        pub d: Position,
+    }
+    pub struct Ends {
+        pub a: bool,
+        pub b: u64,
+        pub c: bool,
+    }
+    pub enum Data {
+        A(u32, Position),
+        B(u8),
+        C,
+    }
+    pub enum Nested {
+        X(Data),
+        Y(Position),
+        Z,
+    }
+
+    /// For each type: a value, that value under `depth` of two `Option`s, and the depth read
+    /// back.
+    macro_rules! probes {
+        ($($value:ident $make:ident $depth:ident: $ty:ty = $it:expr;)*) => {$(
+            pub fn $value() -> $ty {
+                $it
+            }
+            pub fn $make(depth: u8) -> Option<Option<$ty>> {
+                match depth {
+                    0 => None,
+                    1 => Some(None),
+                    _ => Some(Some($value())),
+                }
+            }
+            pub fn $depth(value: &Option<Option<$ty>>) -> u8 {
+                match value {
+                    None => 0,
+                    Some(None) => 1,
+                    Some(Some(_)) => 2,
+                }
+            }
+        )*};
+    }
+
+    probes! {
+        parsed_err make_parsed_err depth_parsed_err: Parsed =
+            Err(Error { kind: ErrorKind::UnexpectedChar(Position::Pre, 'x') });
+        parsed_ok make_parsed_ok depth_parsed_ok: Parsed = Ok((
+            Comparator {
+                op: Op::Caret,
+                major: 1,
+                minor: Some(2),
+                patch: None,
+                pre: Prerelease { head: NonNull::dangling() },
+            },
+            Position::Patch,
+            "",
+        ));
+        error make_error depth_error: Error = Error { kind: ErrorKind::ExcessiveComparators };
+        kind make_kind depth_kind: ErrorKind = ErrorKind::Overflow(Position::Build);
+        signed make_signed depth_signed: Signed = Signed::B;
+        wrap make_wrap depth_wrap: Wrap = Wrap::C;
+        high make_high depth_high: High = High::B;
+        gap make_gap depth_gap: Gap = Gap::C;
+        two make_two depth_two: Two = Two { a: None, b: Some(7), c: true, d: Position::Minor };
+        ends make_ends depth_ends: Ends = Ends { a: true, b: 9, c: false };
+        data make_data depth_data: Data = Data::C;
+        nested make_nested depth_nested: Nested = Nested::Y(Position::Pre);
+        nested_data make_nested_data depth_nested_data: Nested = Nested::X(Data::B(3));
+        pair make_pair depth_pair: (bool, Op) = (true, Op::Tilde);
+        triple make_triple depth_triple: (Position, Op, char) = (Position::Pre, Op::Less, 'q');
+        letter make_letter depth_letter: char = 'z';
+        ordering make_ordering depth_ordering: std::cmp::Ordering = std::cmp::Ordering::Less;
+        nonzero make_nonzero depth_nonzero: std::num::NonZeroI8 = std::num::NonZeroI8::MIN;
+        flag make_flag depth_flag: bool = true;
+        text make_text depth_text: String = String::from("text");
+        boxed make_boxed depth_boxed: Box<u8> = Box::new(4);
+    }
+
+    pub fn is_ok(parsed: &Parsed) -> bool {
+        parsed.is_ok()
     }
 }

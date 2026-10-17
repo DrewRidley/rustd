@@ -10,11 +10,19 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+memchr = "2"
 anyhow.workspace = true
+memmap2 = "0.9"
+wasmparser = { version = "0.236", default-features = false, features = ["std"] }
+wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 mimalloc = { version = "0.1.46", default-features = false }
-object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf", "macho"] }
+object = { version = "0.37", default-features = false, features = ["read", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 rustc-demangle = "0.1.28"
 rustc-hash.workspace = true
+same-file = "1"
+dunce = "1"
+pdb = "0.8"
+sha2 = "0.10"
 
 hir.workspace = true
 hir-def.workspace = true
@@ -26,6 +34,22 @@ vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
+rusty-s3 = "0.10.2"
+ureq = "3.4.2"
+tar = "0.4.44"
+zstd = "0.13.3"
+tikv-jemallocator = { version = "0.5.4", optional = true, features = ["profiling"] }
+tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1"
+
+[features]
+# Allocate with jemalloc, which can profile the heap: see `memory.rs`.
+heap-profile = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
+# Adds LLVM as a code producer, chosen with `RUSTD_BACKEND=llvm`.
+llvm = ["hir-ty/llvm"]
 
 [lints]
 workspace = true

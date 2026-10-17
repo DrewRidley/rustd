@@ -3208,3 +3208,28 @@ fn main() {
     "#,
     );
 }
+
+#[test]
+fn glob_of_a_variant_named_as_a_struct_of_the_importing_module() {
+    check_types(
+        r#"
+#[allow(non_camel_case_types)]
+pub struct hoisted {}
+impl hoisted {
+    fn id(&self) -> u8 { 0 }
+}
+mod inner {
+    use super::*;
+    pub enum Callable {
+        hoisted,
+        Other,
+    }
+    fn f(it: hoisted) {
+        it.id();
+      //^^^^^^^ u8
+    }
+}
+pub use inner::Callable::*;
+"#,
+    );
+}

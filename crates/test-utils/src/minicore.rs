@@ -1489,6 +1489,7 @@ pub mod fmt {
         message: Option<&'a str>,
     }
 
+    #[unstable(feature = "fmt_internals", issue = "none")]
     impl<'a> Arguments<'a> {
         pub unsafe fn new<const N: usize, const M: usize>(
             _template: &'a [u8; N],

@@ -258,10 +258,37 @@ struct MethodAutoderefBadTy<'db> {
 impl<'a, 'db> MethodResolutionContext<'a, 'db> {
     #[instrument(level = "debug", skip(self))]
     pub fn probe_for_name(&self, mode: Mode, item_name: Name, self_ty: Ty<'db>) -> PickResult<'db> {
+        self.probe_for_name_with(mode, item_name, self_ty, false)
+    }
+
+    /// As `probe_for_name`, for a path a desugaring wrote: the `new` of `format_args!` is behind
+    /// a feature, as rustc's expansion of the macro is allowed to be, and a stable `new` of a
+    /// trait in scope must not be taken for it.
+    pub fn probe_for_desugared_name(
+        &self,
+        mode: Mode,
+        item_name: Name,
+        self_ty: Ty<'db>,
+    ) -> PickResult<'db> {
+        self.probe_for_name_with(mode, item_name, self_ty, true)
+    }
+
+    fn probe_for_name_with(
+        &self,
+        mode: Mode,
+        item_name: Name,
+        self_ty: Ty<'db>,
+        allow_unstable: bool,
+    ) -> PickResult<'db> {
         self.probe_op(
             mode,
             self_ty,
-            ProbeForNameChoice { private_candidate: None, item_name, stable_only: false },
+            ProbeForNameChoice {
+                private_candidate: None,
+                item_name,
+                stable_only: false,
+                allow_unstable,
+            },
         )
     }
 
@@ -583,6 +610,8 @@ struct ProbeForNameChoice<'db> {
     /// Whether items behind a feature the crate did not enable are left out, which they are
     /// until no other item is found.
     stable_only: bool,
+    /// Whether such items are as good as the others: the path was not written by the user.
+    allow_unstable: bool,
 }
 
 impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
@@ -1176,7 +1205,7 @@ impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
 
     fn pick_core(&mut self) -> Option<PickResult<'db>> {
         // Pick stable methods only first, and consider unstable candidates if not found.
-        self.choice.stable_only = true;
+        self.choice.stable_only = !self.choice.allow_unstable;
         let stable = self.pick_all_method().break_value();
         self.choice.stable_only = false;
         stable.or_else(|| self.pick_all_method().break_value())

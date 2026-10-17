@@ -6,13 +6,15 @@ usage: dxedits.py CHECKOUT crate[,crate...] SYMBOLS_FILE
 Starts the daemon on the crates, waits for the first build, applies each edit and reports the
 time the daemon took to rebuild and how many functions it compiled again.
 """
-import json, os, re, shlex, subprocess, sys, time
+import json, os, re, shlex, subprocess, sys, tempfile, time
+import linkline
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["RUSTD_STATS"] = "1"
 RUSTD = os.environ.get("RUSTD_BIN") or os.path.join(HERE, "../target/release/rustd")
 BODY = "let _rustd_edit = 1u32;"
+ASYNC_MAIN = "async fn main() -> ExitCode {\n"
 NEW_FN = "\nfn rustd_new_item(x: u32) -> u32 { x + 1 }\n"
 # The first function in a file that is written plainly.
 PLAIN_FN = re.compile(r"^ *(?:pub(?:\([a-z]+\))? )?fn \w+\([^)]*\)[^{;]*\{\n", re.M)
@@ -41,6 +43,10 @@ def main():
             ("new private fn", f"{cli}/build/builder.rs", lambda t: t + NEW_FN),
             ("new private fn in main.rs", f"{cli}/main.rs", lambda t: t + NEW_FN),
             ("what `dx doctor --help` prints", f"{cli}/cli/mod.rs", lambda t: t.replace("/// Diagnose installed", "/// Diagnose (edited) installed", 1)),
+            ("a static's value", f"{cli}/cli/create.rs", lambda t: t.replace('"gh:dioxuslabs/dioxus-template"', '"gh:dioxuslabs/edited-template"', 1)),
+            # `main` is an `async fn`: tokio's functions are instantiated with its future.
+            ("async main: a statement", f"{cli}/main.rs", lambda t: t.replace(ASYNC_MAIN, ASYNC_MAIN + "    std::hint::black_box(1u32);\n", 1)),
+            ("async main: a local", f"{cli}/main.rs", lambda t: t.replace(ASYNC_MAIN, ASYNC_MAIN + "    " + BODY + "\n", 1)),
         ]
     if "dx" in crates and len(crates) > 1:
         # The crates of the workspace that dx is built from: edits far from the program's top.
@@ -64,15 +70,16 @@ def main():
     binary = os.path.join(work, "dx-rustd-bin")
     if os.environ.get("DXEDITS_PATCH"):
         link = list(json.load(open(os.path.join(work, "fixture.json")))["link_args"])
-        first = next(i for i, a in enumerate(link) if a.endswith((".rlib", ".rcgu.o")))
         patch = os.path.join(work, "dx.patch.o")
-        link[first:first] = [patch, os.path.join(work, "dx.o"), "-Wl,--allow-multiple-definition"]
+        link = linkline.ahead(link, [patch, os.path.join(work, "dx.o")], RUSTD)
         link[link.index("-o") + 1] = binary
         # DXEDITS_LD: a directory holding the `ld` to link with, instead of rustc's lld.
         if ld := os.environ.get("DXEDITS_LD"):
             link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
             link[link.index("-fuse-ld=lld")] = "-B" + ld
         args += ["--patch", patch, "--link-cmd", shlex.join(link)]
+        # Edits are added to the linked binary where that can be done; RUSTD_SPLICE=0 links each in full.
+        args += ["--binary", binary]
     # DXEDITS_REQUEST: `sync` or `patch`; each build is then asked for once the file is written.
     request = os.environ.get("DXEDITS_REQUEST")
     socket = os.path.join(work, "rustd.sock")
@@ -144,6 +151,12 @@ def main():
                 if "--patch" in args and "doctor" in name:
                     ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)
                     print("    doctor --help:", ran.returncode, ran.stdout.splitlines()[:1])
+                if "--patch" in args and "static" in name:
+                    # `dx new` logs the default template, which is the edited static, before it asks anything.
+                    with tempfile.TemporaryDirectory() as scratch:
+                        ran = subprocess.run(["timeout", "5", "script", "-qc", f"{binary} new app --yes --verbose", "/dev/null"],
+                                             capture_output=True, text=True, cwd=scratch)
+                    print("    dx new:", re.findall(r'"gh:[^"]*"', ran.stdout)[:1])
         if whole:
             whole.send_signal(2)
             whole.wait()

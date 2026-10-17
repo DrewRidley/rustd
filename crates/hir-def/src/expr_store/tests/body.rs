@@ -161,6 +161,21 @@ mod m {
 }
 
 #[test]
+fn unresolved_macro_at_the_end_of_a_block_is_missing() {
+    pretty_print(
+        r#"
+fn main() -> u8 {
+    nothing_of_this_name!()
+}
+"#,
+        expect![[r#"
+            fn main() {
+                �
+            }"#]],
+    );
+}
+
+#[test]
 fn desugar_for_loop() {
     pretty_print(
         r#"

@@ -1,10 +1,7 @@
-//! High-level `rustd` Cargo-style CLI (`rustd build`, `rustd run`, `rustd patch`, `rustd sync`,
-//! `rustd status`, `rustd stop`).
-//!
-//! Works on any Cargo workspace by capturing the `rustc` linker invocation into
-//! `<target_dir>/rustd/<bin>/link_args.txt`, linking with `wild --allow-multiple-definition`,
-//! and keeping a background `rustd --watch` daemon warm so edits hot-patch running binaries
-//! in-place via `hotpatch_rt.rs` (~0.2–4 ms) and subsequent `rustd run` invocations start in ~7 ms.
+//! Cargo-style CLI (`rustd build`, `rustd test`, `rustd check`, `rustd clippy`, `rustd fmt`,
+//! `rustd run`, `rustd start`, `rustd status`, `rustd stop`) built on top of `rustd`'s
+//! multi-program, multi-worktree daemon (`Request::Sync` / `Request::Patch`, `splice.rs`,
+//! `weaken.rs`, and `store.rs`).
 
 use std::{
     env, fs,
@@ -28,8 +25,6 @@ pub(crate) fn is_subcommand(arg: &str) -> bool {
             | "rebase"
             | "run"
             | "test"
-            | "patch"
-            | "sync"
             | "start"
             | "warm"
             | "status"
@@ -42,34 +37,33 @@ pub(crate) fn is_subcommand(arg: &str) -> bool {
 
 pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
     match sub {
-        "build" => cmd_build(&args),
-        "check" => cmd_check(&args, "check"),
+        "build" | "rebase" => cmd_build(&args),
+        "check" => cmd_check(&args),
         "clippy" => cmd_clippy(&args),
         "fmt" => cmd_fmt(&args),
-        "rebase" => cmd_rebase(&args),
         "run" => cmd_run(&args),
         "test" => cmd_test(&args),
-        "patch" => cmd_request("patch", &args),
-        "sync" => cmd_request("sync", &args),
         "start" | "warm" => cmd_start(&args),
         "status" => cmd_status(&args),
-        "stop" => cmd_stop(&args, false),
+        "stop" => cmd_stop(&args),
         _ => {
             eprintln!(
                 "Usage:\n  \
+                 rustd build  [-p PACKAGE] [--bin NAME] [--features FEATURES] [--watch]\n  \
+                 rustd test   [FILTER] [-p PACKAGE] [--since SHA] [--junit PATH] [--json] [--also-run FILE] [--retries N] [--explain TEST] [--list-changed] [--backtest] [--faults N] [--watch] [-- ARGS...]\n  \
                  rustd check  [-p PACKAGE] [--bin NAME] [--test NAME] [--watch]\n  \
-                 rustd clippy [-p PACKAGE] [--since SHA] [--watch] [-- ARGS...]\n  \
+                 rustd clippy [-p PACKAGE] [--tests] [--watch] [-- ARGS...]\n  \
                  rustd fmt    [--check] [--since SHA]\n  \
-                 rustd rebase [-p PACKAGE] [--bin NAME] [--test NAME]\n  \
-                 rustd build  [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [--watch]\n  \
-                 rustd run    [--manifest-path PATH] [--bin NAME] [--crate CRATE]... [--target TRIPLE] [-- ARGS...]\n  \
-                 rustd test   [FILTER] [-p PACKAGE] [--since SHA] [--junit PATH] [--json] [--also-run FILE] [--retries N] [--explain TEST] [--backtest] [--faults N] [--watch] [-- ARGS...]\n  \
-                 rustd patch  [--manifest-path PATH] [--bin NAME]\n  \
-                 rustd sync   [--manifest-path PATH] [--bin NAME]\n  \
-                 rustd status [--manifest-path PATH] [--bin NAME]\n  \
-                 rustd stop   [--manifest-path PATH] [--bin NAME]\n\n\
-                 Low-level daemon invocation:\n  \
-                 rustd <Cargo.toml> [--crate <CRATE>] --out <BASE.O> [--patch <PATCH.O>] [--symbols <RLIB>]... [--watch]"
+                 rustd run    [-p PACKAGE] [--bin NAME] [-- ARGS...]\n  \
+                 rustd start  [-p PACKAGE] [--bin NAME]\n  \
+                 rustd status [--manifest-path PATH]\n  \
+                 rustd stop   [--manifest-path PATH]\n\n\
+                 Low-level / harness subcommands:\n  \
+                 rustd sync <SOCKET> [--project <PATH> --crate <CRATE> --out <OBJ> --patch <PATCH> --link-cmd <CMD> --binary <BIN> --symbols <RLIB>...]\n  \
+                 rustd patch <SOCKET> [...]\n  \
+                 rustd weaken <FILE>...\n  \
+                 rustd cache push|pull <REMOTE> [PROJECT]\n  \
+                 rustd deps <PROJECT>"
             );
             Ok(())
         }
@@ -101,52 +95,53 @@ struct CliOpts {
     backtest: bool,
     faults: usize,
     cfg_test: bool,
+    full: bool,
     run_args: Vec<String>,
 }
 
 struct TargetPaths {
     dir: PathBuf,
     base_o: PathBuf,
-    rt_o: PathBuf,
     patch_o: PathBuf,
-    ack: PathBuf,
     out_bin: PathBuf,
     rustd_sock: PathBuf,
     rustd_log: PathBuf,
     pid_file: PathBuf,
+    store_dir: PathBuf,
     link_args_txt: PathBuf,
     link_sh: PathBuf,
-    hotpatch_map: PathBuf,
+    rlibs_txt: PathBuf,
 }
 
 impl TargetPaths {
     fn new(workspace_root: &Path, bin_name: &str) -> Self {
         let rustd_root = workspace_root.join("target").join("rustd");
         let dir = rustd_root.join(bin_name);
-        let base_o = dir.join("base.o");
-        let rt_o = dir.join("base.rt.o");
-        let patch_o = dir.join("patch.o");
-        let ack = dir.join("patch.ack");
+        let rustd_sock = env::var_os("RUSTD_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| rustd_root.join("rustd.sock"));
+        let store_dir = env::var_os("RUSTD_CACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| rustd_root.join("store"));
         Self {
+            base_o: dir.join("base.o"),
+            patch_o: dir.join("patch.o"),
             out_bin: dir.join(bin_name),
-            rustd_sock: rustd_root.join("rustd.sock"),
+            rustd_sock,
             rustd_log: rustd_root.join("rustd.log"),
             pid_file: rustd_root.join("rustd.pid"),
+            store_dir,
             link_args_txt: dir.join("link_args.txt"),
             link_sh: dir.join("link.sh"),
-            hotpatch_map: dir.join("hotpatch_map.json"),
+            rlibs_txt: dir.join("rlibs.txt"),
             dir,
-            base_o,
-            rt_o,
-            patch_o,
-            ack,
         }
     }
 }
 
 fn find_manifest_path(explicit: Option<PathBuf>) -> anyhow::Result<(PathBuf, PathBuf)> {
     if let Some(p) = explicit {
-        let abs = fs::canonicalize(&p).with_context(|| format!("finding {}", p.display()))?;
+        let abs = dunce::canonicalize(&p).with_context(|| format!("finding {}", p.display()))?;
         let manifest = if abs.is_dir() { abs.join("Cargo.toml") } else { abs };
         let root = manifest.parent().context("invalid manifest path")?.to_path_buf();
         return Ok((manifest, root));
@@ -180,17 +175,12 @@ fn infer_default_bin(workspace_root: &Path) -> Option<String> {
     let rustd_dir = workspace_root.join("target").join("rustd");
     if let Ok(entries) = fs::read_dir(&rustd_dir) {
         let mut all_dirs = Vec::new();
-        let mut active_dirs = Vec::new();
         for e in entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
-            if let Ok(name) = e.file_name().into_string() {
-                if e.path().join("rustd.sock").exists() {
-                    active_dirs.push(name.clone());
-                }
+            if let Ok(name) = e.file_name().into_string()
+                && name != "store"
+            {
                 all_dirs.push(name);
             }
-        }
-        if active_dirs.len() == 1 {
-            return active_dirs.pop();
         }
         if all_dirs.len() == 1 {
             return all_dirs.pop();
@@ -248,6 +238,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
     let mut explain = None;
     let mut backtest = false;
     let mut faults = 20usize;
+    let mut full = false;
     let mut run_args = Vec::new();
 
     let mut it = args.iter();
@@ -265,7 +256,8 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                 bin_name = Some(it.next().context("--bin requires a name")?.clone());
             }
             "--test" => {
-                test_target = Some(it.next().context("--test requires a test target name")?.clone());
+                test_target =
+                    Some(it.next().context("--test requires a test target name")?.clone());
             }
             "-p" | "--package" if cfg_test => {
                 pkg_name = Some(it.next().context("-p requires a package name")?.clone());
@@ -275,6 +267,9 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                 if cfg_test && pkg_name.is_none() {
                     pkg_name = Some(val.clone());
                 } else {
+                    if pkg_name.is_none() {
+                        pkg_name = Some(val.clone());
+                    }
                     for c in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                         crates.push(c.replace('-', "_"));
                     }
@@ -288,6 +283,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
                     }
                 }
             }
+            "--full" => full = true,
             "--workspace"
             | "--all-targets"
             | "--lib"
@@ -295,7 +291,6 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             | "--tests"
             | "--link-only"
             | "--cargo"
-            | "--full"
             | "--fast" => {}
             "-F" | "--features" => {
                 let val = it.next().context("--features requires feature name(s)")?;
@@ -322,7 +317,8 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             }
             "--json" => json = true,
             "--also-run" => {
-                also_run = Some(PathBuf::from(it.next().context("--also-run requires a file path")?));
+                also_run =
+                    Some(PathBuf::from(it.next().context("--also-run requires a file path")?));
             }
             "--retries" => {
                 retries = Some(
@@ -361,10 +357,11 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         && let Some(sha) = &since
     {
         let diff_files = crate::ci::analyze_git_diff_since(&workspace_root, sha)?;
-        let inferred: Vec<String> = crate::ci::infer_packages_from_diff(&workspace_root, &diff_files)
-            .into_iter()
-            .filter(|p| !exclude.iter().any(|ex| ex == p))
-            .collect();
+        let inferred: Vec<String> =
+            crate::ci::infer_packages_from_diff(&workspace_root, &diff_files)
+                .into_iter()
+                .filter(|p| !exclude.iter().any(|ex| ex == p))
+                .collect();
         if let Some(first_pkg) = inferred.into_iter().next() {
             pkg_name = Some(first_pkg);
         }
@@ -387,9 +384,12 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             format!("test-{}", pkg.replace('-', "_"))
         }
     } else {
-        match bin_name.or_else(|| infer_default_bin(&workspace_root)) {
+        match bin_name
+            .or_else(|| pkg_name.clone())
+            .or_else(|| infer_default_bin(&workspace_root))
+        {
             Some(b) => b,
-            None => bail!("could not infer binary target; pass `--bin <NAME>`"),
+            None => bail!("could not infer binary target; pass `--bin <NAME>` or `-p <PACKAGE>`"),
         }
     };
     Ok(CliOpts {
@@ -416,6 +416,7 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
         backtest,
         faults,
         cfg_test,
+        full,
         run_args,
     })
 }
@@ -424,17 +425,20 @@ fn parse_opts(args: &[String]) -> anyhow::Result<CliOpts> {
     parse_opts_with_mode(args, false)
 }
 
-fn find_wild() -> anyhow::Result<PathBuf> {
+fn find_wild() -> Option<PathBuf> {
     if let Some(p) = env::var_os("WILD_BIN") {
-        return Ok(PathBuf::from(p));
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
     }
     if let Some(home) = env::var_os("HOME") {
         let cargo_wild = PathBuf::from(home).join(".cargo/bin/wild");
         if cargo_wild.exists() {
-            return Ok(cargo_wild);
+            return Some(cargo_wild);
         }
     }
-    Ok(PathBuf::from("wild"))
+    None
 }
 
 fn shell_words(line: &str) -> Vec<String> {
@@ -474,17 +478,28 @@ fn collect_rlibs_in(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
     entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|ext| ext == "rlib"))
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "rlib")
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("libcore-")
+                        || n.starts_with("liballoc-")
+                        || n.starts_with("libstd-")
+                })
+        })
         .collect()
 }
 
-fn sysroot_rlibs(workspace_root: &Path, target: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
+fn sysroot_path(workspace_root: &Path) -> anyhow::Result<String> {
     let out = Command::new("rustc")
         .current_dir(workspace_root)
         .args(["--print", "sysroot"])
         .output()
         .context("running `rustc --print sysroot`")?;
-    let sysroot = String::from_utf8(out.stdout)?.trim().to_owned();
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+fn sysroot_rlibs(workspace_root: &Path, target: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
+    let sysroot = sysroot_path(workspace_root)?;
     let triple = match target {
         Some(t) => t.to_owned(),
         None => {
@@ -502,7 +517,9 @@ fn sysroot_rlibs(workspace_root: &Path, target: Option<&str>) -> anyhow::Result<
                 .to_owned()
         }
     };
-    Ok(collect_rlibs_in(&PathBuf::from(format!("{sysroot}/lib/rustlib/{triple}/lib"))))
+    Ok(collect_rlibs_in(&PathBuf::from(format!(
+        "{sysroot}/lib/rustlib/{triple}/lib"
+    ))))
 }
 
 fn apply_feature_args(cmd: &mut Command, opts: &CliOpts) {
@@ -543,7 +560,7 @@ fn ensure_features_consistent(opts: &CliOpts, paths: &TargetPaths) {
         if prev_pkg_feat.is_some() {
             let _ = fs::remove_file(&paths.link_args_txt);
             let _ = fs::remove_file(paths.dir.join("clippy.sh"));
-            let _ = fs::remove_file(paths.out_bin.with_extension("base"));
+            let _ = fs::remove_file(&paths.out_bin);
         }
         let _ = fs::create_dir_all(&paths.dir);
         let _ = fs::write(&feat_file, &expected);
@@ -568,7 +585,7 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
         {
             let objs_exist = txt
                 .lines()
-                .rfind(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang")))
+                .rfind(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang") || l.contains("rust-lld")))
                 .is_some_and(|line| {
                     shell_words(line)
                         .into_iter()
@@ -579,7 +596,6 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
                 return Ok(txt);
             }
         }
-        let _ = fs::remove_file(paths.out_bin.with_extension("base"));
     }
     let debug_dir = opts.workspace_root.join("target").join("debug");
     if opts.cfg_test {
@@ -613,7 +629,7 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
         if let Some(t) = &opts.target {
             cmd.args(["--target", t]);
         }
-        cmd.args(["--", "-C", "save-temps"]);
+        cmd.args(["--", "--print", "link-args", "-C", "save-temps"]);
         let out = cmd.output().context("running cargo rustc --profile test to capture link args")?;
         let combined = format!(
             "{}\n{}",
@@ -624,12 +640,13 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
             combined
                 .lines()
                 .any(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang"))),
-            "cargo test --no-run did not emit a linker command for `{pkg}`"
+            "cargo rustc --profile test did not emit a linker command for `{pkg}`:\n{}",
+            combined
         );
         fs::write(&paths.link_args_txt, &combined)?;
         return Ok(combined);
     }
-    eprintln!("Capturing linker arguments via `cargo build --bin {}`...", opts.bin_name);
+    eprintln!("Capturing linker arguments via `cargo rustc --bin {}`...", opts.bin_name);
     let _ = fs::remove_file(debug_dir.join(&opts.bin_name));
     if let Ok(entries) = fs::read_dir(debug_dir.join("deps")) {
         let prefix = format!("{}-", opts.bin_name.replace('-', "_"));
@@ -644,14 +661,18 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
         }
     }
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&opts.workspace_root)
-        .args(["rustc", "--bin", &opts.bin_name])
-        .env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
+    cmd.current_dir(&opts.workspace_root);
+    if let Some(pkg) = &opts.pkg_name {
+        cmd.args(["rustc", "-p", pkg, "--bin", &opts.bin_name]);
+    } else {
+        cmd.args(["rustc", "--bin", &opts.bin_name]);
+    }
+    cmd.env("RUSTC_LOG", "rustc_codegen_ssa::back::link=info");
     apply_feature_args(&mut cmd, opts);
     if let Some(t) = &opts.target {
         cmd.args(["--target", t]);
     }
-    cmd.args(["--", "-C", "save-temps"]);
+    cmd.args(["--", "--print", "link-args", "-C", "save-temps"]);
     let out = cmd.output().context("running cargo rustc to capture link args")?;
     let combined = format!(
         "{}\n{}",
@@ -659,7 +680,8 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
         String::from_utf8_lossy(&out.stderr)
     );
     ensure!(
-        combined.lines().any(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang") || l.contains("rust-lld"))),
+        combined.lines().any(|l| l.contains("-o")
+            && (l.contains("cc") || l.contains("clang") || l.contains("rust-lld"))),
         "cargo build did not emit a linker command for `{}`",
         opts.bin_name
     );
@@ -667,144 +689,175 @@ fn ensure_link_args(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Strin
     Ok(combined)
 }
 
+fn ensure_empty_objects(
+    paths: &TargetPaths,
+    target_triple: Option<&str>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let emits = match target_triple {
+        Some(triple) => hir_ty::mir::codegen::Target::select(triple),
+        None => hir_ty::mir::codegen::Target::selected(),
+    }
+    .map_err(anyhow::Error::msg)?;
+    let _ = emits;
+    if force || !paths.base_o.exists() {
+        let empty = hir_ty::mir::codegen::empty_object().map_err(anyhow::Error::msg)?;
+        fs::write(&paths.base_o, empty)?;
+    }
+    if force || !paths.patch_o.exists() {
+        let empty = hir_ty::mir::codegen::empty_object().map_err(anyhow::Error::msg)?;
+        fs::write(&paths.patch_o, empty)?;
+    }
+    Ok(())
+}
+
+/// Follows `harness/linkline.py::ahead` in upstream `rustd`:
+/// - On macOS: weakens non-sysroot `.rlib` and `.rcgu.o` files via `weaken::weaken_file` and
+///   inserts `[patch.o, base.o, "-Wl,-headerpad,0x200"]` ahead of rustc's objects.
+/// - On Linux: inserts `[patch.o, base.o, "-Wl,--allow-multiple-definition"]` (and uses `wild`
+///   when available).
 fn prepare_link_script_and_symbols(
     opts: &CliOpts,
     paths: &TargetPaths,
 ) -> anyhow::Result<Vec<PathBuf>> {
     fs::create_dir_all(&paths.dir)?;
-    let wild_bin = find_wild()?;
-    let wild_str = wild_bin.display().to_string();
+    ensure_empty_objects(paths, opts.target.as_deref(), !paths.out_bin.exists())?;
     let link_text = ensure_link_args(opts, paths)?;
-    let is_wasm = opts.target.as_deref().is_some_and(|t| t.starts_with("wasm32"));
+    let sysroot = sysroot_path(&opts.workspace_root)?;
+    let sys_rlibs = sysroot_rlibs(&opts.workspace_root, opts.target.as_deref())?;
+
+    let line = link_text
+        .lines()
+        .rfind(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang") || l.contains("rust-lld")))
+        .context("no linker invocation found in link_args.txt")?;
+    let words = shell_words(line);
+    let idx = words
+        .iter()
+        .position(|w| !w.contains('=') && (w.ends_with("cc") || w.ends_with("clang") || w.contains("rust-lld")))
+        .context("no compiler driver token in link line")?;
+    let link_args: Vec<String> = words[idx..]
+        .iter()
+        .filter(|a| !a.ends_with("symbols.o"))
+        .cloned()
+        .collect();
+    let first_obj = link_args
+        .iter()
+        .position(|a| a.ends_with(".rlib") || a.ends_with(".rcgu.o") || a.ends_with(".o"))
+        .context("no .rlib/.rcgu.o in link args")?;
 
     let mut rlibs = Vec::new();
-    if is_wasm {
-        let line = link_text
-            .lines()
-            .find(|l| l.contains("rust-lld"))
-            .context("no rust-lld invocation found in link_args.txt")?;
-        let words = shell_words(line);
-        let idx = words.iter().position(|w| w == "rust-lld").context("no rust-lld")?;
-        let link_args = &words[idx..];
-        let first_obj = link_args
-            .iter()
-            .position(|a| a.ends_with(".o") || a.ends_with(".rlib"))
-            .context("no .o/.rlib in wasm link args")?;
-        let mut wild_cmd = vec![wild_str];
-        wild_cmd.extend_from_slice(&link_args[1..first_obj]);
-        wild_cmd.push("--allow-multiple-definition".to_owned());
-        wild_cmd.push(paths.patch_o.display().to_string());
-        wild_cmd.push(paths.base_o.display().to_string());
-        wild_cmd.extend_from_slice(&link_args[first_obj..]);
-        if let Some(o_pos) = wild_cmd.iter().position(|x| x == "-o") {
-            wild_cmd[o_pos + 1] = paths.out_bin.display().to_string();
+    for a in &link_args {
+        if (a.ends_with(".rlib") || a.ends_with(".rcgu.o") || a.ends_with(".o"))
+            && Path::new(a).exists()
+        {
+            rlibs.push(PathBuf::from(a));
         }
-        let sh = format!(
-            "#!/bin/sh\nexport WILD_HOTPATCH_MAP={}\nexec {}\n",
-            quote_sh(&paths.hotpatch_map.display().to_string()),
-            wild_cmd.iter().map(|s| quote_sh(s)).collect::<Vec<_>>().join(" ")
-        );
-        fs::write(&paths.link_sh, sh)?;
-        fs::set_permissions(&paths.link_sh, fs::Permissions::from_mode(0o755))?;
-        for a in link_args {
-            if (a.ends_with(".rlib") || a.ends_with(".o")) && Path::new(a).exists() {
-                rlibs.push(PathBuf::from(a));
+    }
+    rlibs.extend(sys_rlibs.clone());
+
+    let mut cmd_args = Vec::new();
+    cmd_args.push(link_args[0].clone());
+
+    if cfg!(target_os = "linux")
+        && let Some(wild_bin) = find_wild()
+    {
+        let ld_wrapper = paths.dir.join("ld");
+        let _ = fs::remove_file(&ld_wrapper);
+        fs::write(
+            &ld_wrapper,
+            format!("#!/bin/sh\nexec {} \"$@\"\n", quote_sh(&wild_bin.display().to_string())),
+        )?;
+        fs::set_permissions(&ld_wrapper, fs::Permissions::from_mode(0o755))?;
+        cmd_args.push(format!("-B{}", paths.dir.display()));
+    }
+
+    cmd_args.extend_from_slice(&link_args[1..first_obj]);
+    cmd_args.push(paths.patch_o.display().to_string());
+    cmd_args.push(paths.base_o.display().to_string());
+
+    if cfg!(target_os = "macos") {
+        cmd_args.push("-Wl,-headerpad,0x200".to_owned());
+        cmd_args.push("-Wl,-w".to_owned());
+        for arg in &link_args[first_obj..] {
+            if (arg.ends_with(".rlib") || arg.ends_with(".rcgu.o"))
+                && !arg.starts_with(&sysroot)
+                && Path::new(arg).exists()
+            {
+                let weak_copy = crate::weaken::weaken_file(Path::new(arg))?;
+                cmd_args.push(weak_copy.display().to_string());
+            } else {
+                cmd_args.push(arg.clone());
             }
         }
     } else {
-        let line = link_text
-            .lines()
-            .rfind(|l| l.contains("-o") && (l.contains("cc") || l.contains("clang")))
-            .context("no cc/clang invocation found in link_args.txt")?;
-        let words = shell_words(line);
-        let idx = words
-            .iter()
-            .position(|w| w.ends_with("cc") || w.ends_with("clang"))
-            .context("no cc/clang token in link line")?;
-        let link_args: Vec<String> = words[idx..]
-            .iter()
-            .filter(|a| !(a.ends_with("symbols.o") && a.contains("rustc")))
-            .cloned()
-            .collect();
-        let first_obj = link_args
-            .iter()
-            .position(|a| a.ends_with(".o") || a.ends_with(".rlib"))
-            .context("no .o/.rlib in native link args")?;
-
-        let ld_wrapper = paths.dir.join("ld");
-        let _ = fs::remove_file(&ld_wrapper);
-        let flavor = if cfg!(target_os = "macos") { "-flavor darwin " } else { "" };
-        fs::write(
-            &ld_wrapper,
-            format!("#!/bin/sh\nexec {} {flavor}\"$@\"\n", quote_sh(&wild_str)),
-        )?;
-        fs::set_permissions(&ld_wrapper, fs::Permissions::from_mode(0o755))?;
-
-        let sys_rlibs = sysroot_rlibs(&opts.workspace_root, opts.target.as_deref())?;
-        let mut wild_cc = vec![
-            link_args[0].clone(),
-            format!("-B{}", paths.dir.display()),
-            "-Wl,--allow-multiple-definition".to_owned(),
-        ];
-        if !cfg!(target_os = "macos") {
-            wild_cc.push("-Wl,--export-dynamic".to_owned());
-        }
-        wild_cc.extend_from_slice(&link_args[1..first_obj]);
-        wild_cc.push(paths.rt_o.display().to_string());
-        wild_cc.push(paths.patch_o.display().to_string());
-        wild_cc.push(paths.base_o.display().to_string());
-        wild_cc.extend_from_slice(&link_args[first_obj..]);
-        if cfg!(target_os = "macos") {
-            for sr in &sys_rlibs {
-                if let Some(fname) = sr.file_name().and_then(|n| n.to_str())
-                    && (fname.starts_with("libcore-") || fname.starts_with("liballoc-"))
-                {
-                    wild_cc.push(format!("-Wl,-force_load,{}", sr.display()));
-                }
+        cmd_args.push("-Wl,--allow-multiple-definition".to_owned());
+        cmd_args.extend_from_slice(&link_args[first_obj..]);
+        for sr in &sys_rlibs {
+            if let Some(fname) = sr.file_name().and_then(|n| n.to_str())
+                && (fname.starts_with("libcore-") || fname.starts_with("liballoc-"))
+            {
+                cmd_args.push(format!(
+                    "-Wl,--whole-archive,{},--no-whole-archive",
+                    sr.display()
+                ));
             }
-        } else {
-            for sr in &sys_rlibs {
-                if let Some(fname) = sr.file_name().and_then(|n| n.to_str())
-                    && (fname.starts_with("libcore-") || fname.starts_with("liballoc-"))
-                {
-                    wild_cc.push(format!(
-                        "-Wl,--whole-archive,{},--no-whole-archive",
-                        sr.display()
-                    ));
-                }
-            }
-        }
-        wild_cc.push(format!("-Wl,{}", paths.base_o.with_extension("cave.o").display()));
-        if let Some(o_pos) = wild_cc.iter().position(|x| x == "-o") {
-            wild_cc[o_pos + 1] = paths.out_bin.display().to_string();
-        }
-        let sh = format!(
-            "#!/bin/sh\nexec {}\n",
-            wild_cc.iter().map(|s| quote_sh(s)).collect::<Vec<_>>().join(" ")
-        );
-        fs::write(&paths.link_sh, sh)?;
-        fs::set_permissions(&paths.link_sh, fs::Permissions::from_mode(0o755))?;
-        for a in &link_args {
-            if (a.ends_with(".rlib") || a.ends_with(".o")) && Path::new(a).exists() {
-                rlibs.push(PathBuf::from(a));
-            }
-        }
-        let base_bin = paths.out_bin.with_extension("base");
-        if let Ok(bm) = fs::metadata(&base_bin).and_then(|m| m.modified())
-            && rlibs.iter().any(|r| {
-                fs::metadata(r).and_then(|m| m.modified()).is_ok_and(|rm| rm > bm)
-            })
-        {
-            let _ = fs::remove_file(&base_bin);
         }
     }
-    rlibs.extend(sysroot_rlibs(&opts.workspace_root, opts.target.as_deref())?);
-    let rlibs_txt: String = rlibs
-        .iter()
-        .map(|p| format!("{}\n", p.display()))
-        .collect();
-    let _ = fs::write(paths.dir.join("rlibs.txt"), rlibs_txt);
+
+    let mut cargo_out_bin = None;
+    if let Some(o_pos) = cmd_args.iter().position(|x| x == "-o")
+        && o_pos + 1 < cmd_args.len()
+    {
+        cargo_out_bin = Some(PathBuf::from(&cmd_args[o_pos + 1]));
+        cmd_args[o_pos + 1] = paths.out_bin.display().to_string();
+    }
+
+    let sh = format!(
+        "#!/bin/sh\nexec {}\n",
+        cmd_args.iter().map(|s| quote_sh(s)).collect::<Vec<_>>().join(" ")
+    );
+    fs::write(&paths.link_sh, sh)?;
+    fs::set_permissions(&paths.link_sh, fs::Permissions::from_mode(0o755))?;
+
+    let rlibs_txt: String = rlibs.iter().map(|p| format!("{}\n", p.display())).collect();
+    let _ = fs::write(&paths.rlibs_txt, rlibs_txt);
+
+    // Ensure `paths.out_bin` is linked once with `-Wl,-headerpad,0x200` / `rustd-weak` so
+    // `splice.rs` can splice into it immediately on the first edit.
+    if !paths.out_bin.exists() {
+        let linked = Command::new("sh")
+            .arg("-c")
+            .arg(&paths.link_sh)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !linked
+            && let Some(cb) = cargo_out_bin
+            && cb.exists()
+        {
+            let _ = fs::copy(&cb, &paths.out_bin);
+        }
+    }
+
     Ok(rlibs)
+}
+
+fn load_cached_rlibs(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Vec<PathBuf>> {
+    if paths.link_sh.exists()
+        && paths.rlibs_txt.exists()
+        && paths.out_bin.exists()
+        && let Ok(txt) = fs::read_to_string(&paths.rlibs_txt)
+    {
+        let list: Vec<PathBuf> = txt
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !list.is_empty() && list.iter().all(|p| p.exists()) {
+            ensure_empty_objects(paths, opts.target.as_deref(), false)?;
+            return Ok(list);
+        }
+    }
+    prepare_link_script_and_symbols(opts, paths)
 }
 
 fn send_unix_line(sock: &Path, line: &str) -> anyhow::Result<String> {
@@ -819,7 +872,30 @@ fn send_unix_line(sock: &Path, line: &str) -> anyhow::Result<String> {
     Ok(reply.trim().to_owned())
 }
 
-fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<String>> {
+fn target_request_line(
+    req_kind: &str,
+    opts: &CliOpts,
+    paths: &TargetPaths,
+    bin_crate: &str,
+    rlibs: &[PathBuf],
+) -> String {
+    let target = crate::Target {
+        project: Some(opts.manifest_path.clone()),
+        krate: bin_crate.to_owned(),
+        out: paths.base_o.clone(),
+        patch: Some(paths.patch_o.clone()),
+        link_cmd: Some(paths.link_sh.display().to_string()),
+        splice: Some(paths.out_bin.clone()),
+        symbol_files: rlibs.to_vec(),
+    };
+    format!("{req_kind}{}", target.fields())
+}
+
+fn ensure_daemon(
+    opts: &CliOpts,
+    paths: &TargetPaths,
+    req_kind: &str,
+) -> anyhow::Result<Option<String>> {
     ensure_features_consistent(opts, paths);
     let bin_crate = opts
         .test_target
@@ -827,16 +903,10 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
         .or(opts.pkg_name.as_deref())
         .unwrap_or(&opts.bin_name)
         .replace('-', "_");
+    let rlibs = load_cached_rlibs(opts, paths)?;
+
     if paths.rustd_sock.exists() {
-        if !paths.link_sh.exists() || !paths.dir.join("rlibs.txt").exists() {
-            let _ = prepare_link_script_and_symbols(opts, paths)?;
-        }
-        let req = format!(
-            "switch\t{bin_crate}\t{}\t{}\t{}",
-            paths.base_o.display(),
-            paths.patch_o.display(),
-            paths.link_sh.display()
-        );
+        let req = target_request_line(req_kind, opts, paths, &bin_crate, &rlibs);
         if let Ok(reply) = send_unix_line(&paths.rustd_sock, &req) {
             if !reply.starts_with("error: unknown request") {
                 return Ok(Some(reply));
@@ -844,9 +914,9 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
         }
         stop_target_daemon(paths);
     }
+
     let _ = fs::remove_file(&paths.rustd_sock);
-    let _ = fs::remove_file(&paths.ack);
-    let rlibs = prepare_link_script_and_symbols(opts, paths)?;
+    fs::create_dir_all(&paths.store_dir)?;
 
     let exe = env::current_exe()?;
     let mut cmd = Command::new(&exe);
@@ -854,45 +924,40 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
     if let Some(t) = &opts.target {
         cmd.args(["--target", t]);
     }
+    cmd.args(["--crate", &bin_crate]);
     for c in &opts.crates {
-        cmd.args(["--crate", c]);
+        if c != &bin_crate {
+            cmd.args(["--crate", c]);
+        }
     }
     if opts.cfg_test {
-        cmd.arg("--cfg-test");
+        cmd.arg("--cfg-test").arg("--dev-deps");
     }
     if !opts.features.is_empty() {
         cmd.args(["--features", &opts.features.join(",")]);
-    }
-    if let Some(pkg) = &opts.pkg_name {
-        cmd.env("RUSTD_PKG", pkg);
     }
     cmd.arg("--out")
         .arg(&paths.base_o)
         .arg("--patch")
         .arg(&paths.patch_o)
-        .arg("--watch")
         .arg("--socket")
         .arg(&paths.rustd_sock)
         .arg("--link-cmd")
         .arg(&paths.link_sh)
+        .arg("--binary")
+        .arg(&paths.out_bin)
         .env("RUSTD_BIN_CRATE", &bin_crate)
-        .env("RUSTD_STATS", "1");
-    if opts.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
-        cmd.env("RUSTD_WASM_TRAMPOLINES", "1");
-    } else if !opts.crates.is_empty() {
-        cmd.env("RUSTD_NATIVE_TRAMPOLINES", "1");
+        .env("RUSTD_CACHE", &paths.store_dir)
+        .env("RUSTD_SKIP_COLD_LINK", "1");
+    if !opts.full && env::var_os("RUSTD_ALONE").is_none() {
+        cmd.env("RUSTD_INCREMENTAL_ONLY", "1");
     }
     for r in &rlibs {
         cmd.arg("--symbols").arg(r);
     }
 
-    let scope_desc = if opts.crates.is_empty() {
-        "all workspace crates".to_owned()
-    } else {
-        format!("crates: {}", opts.crates.join(", "))
-    };
     eprintln!(
-        "[rustd] starting hot-patch daemon for `{}` ({scope_desc})...",
+        "[rustd] starting daemon for `{}` (crate `{bin_crate}`)...",
         opts.bin_name,
     );
     let t0 = Instant::now();
@@ -918,77 +983,24 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
         child.id(),
         paths.out_bin.display()
     );
-    let reply = send_unix_line(&paths.rustd_sock, "patch").ok();
+    let req = target_request_line(req_kind, opts, paths, &bin_crate, &rlibs);
+    let reply = send_unix_line(&paths.rustd_sock, &req).ok();
     Ok(reply)
 }
 
-fn check_compile_error(opts: &CliOpts, paths: &TargetPaths, reply: Option<&str>) -> bool {
+fn check_compile_error(_opts: &CliOpts, _paths: &TargetPaths, reply: Option<&str>) -> bool {
     let Some(r) = reply else { return false };
     if !r.starts_with("error:") {
         return false;
     }
-    let check_txt = paths.base_o.with_extension("check.txt");
-    if print_check_file(opts, &check_txt, None) == 0 {
-        eprintln!(
-            "\x1b[1;31merror\x1b[0m\x1b[1m: {}\x1b[0m",
-            r.trim_start_matches("error:").trim()
-        );
-    }
+    eprintln!(
+        "\x1b[1;31merror\x1b[0m\x1b[1m: {}\x1b[0m",
+        r.trim_start_matches("error:").trim()
+    );
     true
 }
 
-fn print_check_file(opts: &CliOpts, check_txt: &Path, fallback_elapsed: Option<Duration>) -> usize {
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
-    let mut us = 0u64;
-    if let Ok(content) = fs::read_to_string(check_txt) {
-        let (header, body) = content.split_once('\n').unwrap_or((&content, ""));
-        for word in header.split_whitespace() {
-            if let Some(val) = word.strip_prefix("errors=") {
-                errors = val.parse().unwrap_or(0);
-            } else if let Some(val) = word.strip_prefix("warnings=") {
-                warnings = val.parse().unwrap_or(0);
-            } else if let Some(val) = word.strip_prefix("us=") {
-                us = val.parse().unwrap_or(0);
-            }
-        }
-        if !body.is_empty() {
-            eprint!("{body}");
-        }
-    }
-    let elapsed = fallback_elapsed.unwrap_or_else(|| Duration::from_micros(us));
-    let raw_label = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
-    let target_label = raw_label.strip_prefix("test-").unwrap_or(raw_label);
-    if warnings > 0 {
-        let w_plural = if warnings == 1 { "" } else { "s" };
-        eprintln!(
-            "\x1b[1;33mwarning\x1b[0m\x1b[1m: `{target_label}` generated {warnings} warning{w_plural}\x1b[0m"
-        );
-    }
-    if errors > 0 {
-        let plural = if errors == 1 { "" } else { "s" };
-        eprintln!(
-            "\x1b[1;31merror\x1b[0m\x1b[1m: could not compile `{target_label}` due to {errors} previous error{plural}\x1b[0m"
-        );
-    } else {
-        eprintln!(
-            "    \x1b[1;32mFinished\x1b[0m `dev` profile [unoptimized + debuginfo] target(s) in {:.2}s ({:.1?})",
-            elapsed.as_secs_f64(),
-            elapsed
-        );
-    }
-    errors
-}
-
-fn run_one_check(opts: &CliOpts, paths: &TargetPaths, req_cmd: &str) -> anyhow::Result<usize> {
-    let t0 = Instant::now();
-    let _reply = send_unix_line(&paths.rustd_sock, req_cmd)?;
-    let elapsed = t0.elapsed();
-    let check_txt = paths.base_o.with_extension("check.txt");
-    Ok(print_check_file(opts, &check_txt, Some(elapsed)))
-}
-
-fn cmd_check(args: &[String], req_cmd: &str) -> anyhow::Result<()> {
+fn cmd_check(args: &[String]) -> anyhow::Result<()> {
     let has_test_flag = args
         .iter()
         .any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests" || a == "--since");
@@ -997,46 +1009,18 @@ fn cmd_check(args: &[String], req_cmd: &str) -> anyhow::Result<()> {
         opts.cfg_test = true;
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    if let Some(sha) = &opts.since {
-        let diff_files = crate::ci::analyze_git_diff_since(&opts.workspace_root, sha)?;
-        fs::create_dir_all(&paths.dir)?;
-        let baseline_cache = paths.base_o.with_extension("baseline.cache");
-        crate::ci::write_since_baseline_cache(
-            &baseline_cache,
-            &format!("SINCE:{sha}"),
-            &diff_files,
-        )?;
+    let t0 = Instant::now();
+    let reply = ensure_daemon(&opts, &paths, "patch")?;
+    let elapsed = t0.elapsed();
+    if check_compile_error(&opts, &paths, reply.as_deref()) {
+        std::process::exit(101);
     }
-    ensure_daemon(&opts, &paths)?;
-    let errors = run_one_check(&opts, &paths, req_cmd)?;
-    if !opts.watch {
-        if errors > 0 {
-            std::process::exit(101);
-        }
-        return Ok(());
-    }
-    let max_runs = env::var("RUSTD_WATCH_MAX_RUNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let mut runs = 1usize;
-    if max_runs.is_some_and(|m| runs >= m) {
-        return Ok(());
-    }
-    let check_txt = paths.base_o.with_extension("check.txt");
-    let mut last_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
-    eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
-    loop {
-        thread::sleep(Duration::from_millis(20));
-        let cur_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
-        if cur_mtime.is_some() && cur_mtime != last_mtime {
-            last_mtime = cur_mtime;
-            print_check_file(&opts, &check_txt, None);
-            runs += 1;
-            if max_runs.is_some_and(|m| runs >= m) {
-                return Ok(());
-            }
-        }
-    }
+    eprintln!(
+        "    \x1b[1;32mFinished\x1b[0m `dev` profile [unoptimized + debuginfo] target(s) in {:.2}s ({:.1?})",
+        elapsed.as_secs_f64(),
+        elapsed
+    );
+    Ok(())
 }
 
 fn ensure_clippy_script(
@@ -1132,7 +1116,6 @@ fn ensure_clippy_script(
     let mut env_pairs = Vec::new();
     let mut argv = Vec::new();
     let mut in_env = true;
-    let mut skip_next = false;
     let mut saw_incr = false;
     let incr_dir = paths.dir.join(if with_tests {
         "clippy-incr-tests"
@@ -1140,10 +1123,6 @@ fn ensure_clippy_script(
         "clippy-incr"
     });
     for w in words {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
         if in_env && w.contains('=') && !w.starts_with('-') {
             env_pairs.push(w);
             continue;
@@ -1173,6 +1152,8 @@ fn ensure_clippy_script(
         argv.push("-C".to_owned());
         argv.push(format!("incremental={}", incr_dir.display()));
     }
+    argv.push("--remap-path-prefix".to_owned());
+    argv.push(format!("{}=.", opts.workspace_root.display()));
     argv.push("--color=always".to_owned());
 
     let mut script = String::from("#!/bin/sh\n");
@@ -1187,9 +1168,6 @@ fn ensure_clippy_script(
     ));
     fs::write(&clippy_sh, script)?;
     fs::set_permissions(&clippy_sh, fs::Permissions::from_mode(0o755))?;
-    let _ = Command::new(&clippy_sh)
-        .current_dir(&opts.workspace_root)
-        .output();
     Ok(clippy_sh)
 }
 
@@ -1229,7 +1207,6 @@ fn workspace_source_fingerprint(workspace_root: &Path, extra: &str) -> u64 {
 }
 
 fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
-    let fast = args.iter().any(|a| a == "--fast");
     let with_tests = args.iter().any(|a| a == "--tests" || a == "--test");
     let mut opts = parse_opts_with_mode(args, true)?;
     opts.cfg_test = true;
@@ -1241,9 +1218,6 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
         eprintln!("[rustd] package excluded by --exclude; skipping clippy");
         return Ok(());
     }
-    if fast {
-        return cmd_check(args, "clippy");
-    }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     let clippy_sh = ensure_clippy_script(&opts, &paths, with_tests)?;
     let clippy_cache = paths.dir.join(if with_tests {
@@ -1251,9 +1225,33 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
     } else {
         "clippy.cache"
     });
+    let deny_warnings = opts.run_args.windows(2).any(|w| (w[0] == "-D" || w[0] == "--deny") && w[1] == "warnings")
+        || opts.run_args.iter().any(|a| a == "-Dwarnings" || a == "--deny=warnings");
+    let filtered_args: Vec<String> = {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < opts.run_args.len() {
+            if (opts.run_args[i] == "-D" || opts.run_args[i] == "--deny")
+                && opts.run_args.get(i + 1).is_some_and(|v| v == "warnings")
+            {
+                out.push("-W".to_owned());
+                out.push("warnings".to_owned());
+                i += 2;
+                continue;
+            }
+            if opts.run_args[i] == "-Dwarnings" || opts.run_args[i] == "--deny=warnings" {
+                out.push("-Wwarnings".to_owned());
+                i += 1;
+                continue;
+            }
+            out.push(opts.run_args[i].clone());
+            i += 1;
+        }
+        out
+    };
     let run_once = || -> anyhow::Result<bool> {
         let t0 = Instant::now();
-        let extra_key = format!("{}:{:?}", clippy_sh.display(), opts.run_args);
+        let extra_key = format!("{}:{:?}:{deny_warnings}", clippy_sh.display(), opts.run_args);
         let fp = workspace_source_fingerprint(&opts.workspace_root, &extra_key);
         let fp_prefix = format!("{fp:016x} ");
         if let Ok(cached) = fs::read_to_string(&clippy_cache)
@@ -1276,12 +1274,13 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
         }
         let out = Command::new(&clippy_sh)
             .current_dir(&opts.workspace_root)
-            .args(&opts.run_args)
+            .args(&filtered_args)
             .output()
             .context("running cached clippy-driver")?;
         let elapsed = t0.elapsed();
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let ok = out.status.success();
+        let has_warning = stderr.contains("warning:") && !stderr.contains("0 warnings emitted");
+        let ok = out.status.success() && (!deny_warnings || !has_warning);
         let _ = fs::write(
             &clippy_cache,
             format!("{fp:016x} {}\n{stderr}", if ok { 1 } else { 0 }),
@@ -1299,44 +1298,10 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
         Ok(ok)
     };
     let ok = run_once()?;
-    if !opts.watch {
-        if !ok {
-            std::process::exit(101);
-        }
-        return Ok(());
+    if !ok {
+        std::process::exit(101);
     }
-    eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
-    let pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
-    let mut last_max_mtime: Option< std::time::SystemTime> = None;
-    loop {
-        thread::sleep(Duration::from_millis(50));
-        let mut cur_max: Option<std::time::SystemTime> = None;
-        let mut stack = vec![opts.workspace_root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if !p.ends_with("target") && !p.ends_with(".git") {
-                        stack.push(p);
-                    }
-                } else if p.extension().is_some_and(|ext| ext == "rs")
-                    && let Ok(m) = p.metadata().and_then(|m| m.modified())
-                {
-                    cur_max = Some(cur_max.map_or(m, |prev| prev.max(m)));
-                }
-            }
-        }
-        if last_max_mtime.is_none() {
-            last_max_mtime = cur_max;
-            continue;
-        }
-        if cur_max != last_max_mtime {
-            last_max_mtime = cur_max;
-            eprintln!("    \x1b[1;32mChecking\x1b[0m {pkg}...");
-            let _ = run_once()?;
-        }
-    }
+    Ok(())
 }
 
 fn cmd_fmt(args: &[String]) -> anyhow::Result<()> {
@@ -1383,7 +1348,10 @@ fn cmd_fmt(args: &[String]) -> anyhow::Result<()> {
     {
         for l in String::from_utf8_lossy(&out.stdout).lines() {
             let p = l.trim();
-            if p.ends_with(".rs") && !rs_files.iter().any(|x| x == p) && workspace_root.join(p).exists() {
+            if p.ends_with(".rs")
+                && !rs_files.iter().any(|x| x == p)
+                && workspace_root.join(p).exists()
+            {
                 rs_files.push(p.to_owned());
             }
         }
@@ -1426,82 +1394,13 @@ fn cmd_fmt(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_rebase(args: &[String]) -> anyhow::Result<()> {
-    let has_test_flag = args
-        .iter()
-        .any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests");
-    let force_cargo = args.iter().any(|a| a == "--cargo");
-    let link_only = args.iter().any(|a| a == "--link-only");
-    let mut opts = parse_opts_with_mode(args, has_test_flag)?;
-    if opts.bin_name.starts_with("test-") {
-        opts.cfg_test = true;
-    }
-    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    if !force_cargo {
-        let _ = ensure_daemon(&opts, &paths)?;
-        let t0 = Instant::now();
-        if let Ok(reply) = send_unix_line(&paths.rustd_sock, "rebase\n")
-            && reply.starts_with("ok")
-        {
-            eprintln!(
-                "[rustd] rebased `{}` via wild full link in {:.2?} ({reply})",
-                opts.bin_name,
-                t0.elapsed()
-            );
-            return Ok(());
-        } else if link_only {
-            anyhow::bail!("--link-only rebase failed; run `rustd rebase --cargo` for full rebuild");
-        }
-    }
-    eprintln!(
-        "[rustd] rebasing `{}` with full LLVM/cargo optimization...",
-        opts.bin_name
-    );
-    stop_target_daemon(&paths);
-    let _ = fs::remove_file(&paths.link_args_txt);
-    let _ = fs::remove_file(paths.out_bin.with_extension("base"));
-    let _ = fs::remove_file(paths.base_o.with_extension("baseline.cache"));
-    let _ = fs::remove_file(&paths.patch_o);
-    ensure_daemon(&opts, &paths)?;
-    eprintln!(
-        "[rustd] rebase complete for `{}` (dirty patches folded into LLVM base binary)",
-        opts.bin_name
-    );
-    Ok(())
-}
-
 fn cmd_build(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    if opts.watch || paths.rustd_sock.exists() {
-        let reply = ensure_daemon(&opts, &paths)?;
-        if !opts.watch && check_compile_error(&opts, &paths, reply.as_deref()) {
-            std::process::exit(101);
-        }
-        println!("{}", paths.out_bin.display());
-        return Ok(());
+    let reply = ensure_daemon(&opts, &paths, "sync")?;
+    if check_compile_error(&opts, &paths, reply.as_deref()) {
+        std::process::exit(101);
     }
-    let rlibs = prepare_link_script_and_symbols(&opts, &paths)?;
-    let exe = env::current_exe()?;
-    let mut cmd = Command::new(&exe);
-    cmd.current_dir(&opts.workspace_root).arg(&opts.manifest_path);
-    if let Some(t) = &opts.target {
-        cmd.args(["--target", t]);
-    }
-    for c in &opts.crates {
-        cmd.args(["--crate", c]);
-    }
-    cmd.arg("--out")
-        .arg(&paths.base_o)
-        .arg("--patch")
-        .arg(&paths.patch_o)
-        .arg("--link-cmd")
-        .arg(&paths.link_sh);
-    for r in &rlibs {
-        cmd.arg("--symbols").arg(r);
-    }
-    let status = cmd.status()?;
-    ensure!(status.success(), "rustd build failed ({status})");
     println!("{}", paths.out_bin.display());
     Ok(())
 }
@@ -1509,7 +1408,7 @@ fn cmd_build(args: &[String]) -> anyhow::Result<()> {
 fn cmd_run(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    let reply = ensure_daemon(&opts, &paths)?;
+    let reply = ensure_daemon(&opts, &paths, "sync")?;
     if check_compile_error(&opts, &paths, reply.as_deref()) {
         std::process::exit(101);
     }
@@ -1561,24 +1460,7 @@ fn ensure_integration_test_bin(
     if !t_paths.out_bin.exists() {
         let _ = prepare_link_script_and_symbols(&t_opts, &t_paths)?;
         let _ = fs::copy(&lib_paths.base_o, &t_paths.base_o);
-        let _ = fs::copy(&lib_paths.rt_o, &t_paths.rt_o);
-        let _ = fs::copy(
-            lib_paths.base_o.with_extension("cave.o"),
-            t_paths.base_o.with_extension("cave.o"),
-        );
         let _ = fs::copy(&lib_paths.patch_o, &t_paths.patch_o);
-        if let Ok(sh_txt) = fs::read_to_string(&t_paths.link_sh) {
-            let patched_sh = sh_txt
-                .replace(
-                    &t_paths.rt_o.display().to_string(),
-                    &lib_paths.rt_o.display().to_string(),
-                )
-                .replace(
-                    &t_paths.patch_o.display().to_string(),
-                    &lib_paths.patch_o.display().to_string(),
-                );
-            let _ = fs::write(&t_paths.link_sh, patched_sh);
-        }
         let linked_ok = Command::new("sh")
             .arg("-c")
             .arg(&t_paths.link_sh)
@@ -1672,7 +1554,7 @@ fn cmd_start(args: &[String]) -> anyhow::Result<()> {
         opts.cfg_test = true;
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    ensure_daemon(&opts, &paths)?;
+    ensure_daemon(&opts, &paths, "sync")?;
     let pid = fs::read_to_string(&paths.pid_file).unwrap_or_default();
     eprintln!(
         "[rustd] daemon warm and ready: bin={} pid={} socket={}",
@@ -1701,22 +1583,23 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    let baseline_cache = paths.base_o.with_extension("baseline.cache");
 
     if let Some(sha) = &opts.since {
         let diff_files = crate::ci::analyze_git_diff_since(&opts.workspace_root, sha)?;
         fs::create_dir_all(&paths.dir)?;
-        let baseline_cache = paths.base_o.with_extension("baseline.cache");
         crate::ci::write_since_baseline_cache(
             &baseline_cache,
             &format!("SINCE:{sha}"),
             &diff_files,
         )?;
-        let since_sha_file = paths.base_o.with_extension("since.sha");
-        let _ = fs::write(&since_sha_file, format!("{sha}\n"));
+        let _ = fs::remove_file(paths.base_o.with_extension("tests.txt"));
+    } else if baseline_cache.exists() {
+        let _ = fs::remove_file(&baseline_cache);
+        let _ = fs::remove_file(paths.base_o.with_extension("tests.txt"));
     }
 
-    let reply = ensure_daemon(&opts, &paths)?;
-    let cleanup_oneshot = || {};
+    let reply = ensure_daemon(&opts, &paths, "sync")?;
 
     if opts.backtest {
         let bt_reply =
@@ -1726,7 +1609,6 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         if let Ok(report) = fs::read_to_string(&bt_txt) {
             print!("{report}");
         }
-        cleanup_oneshot();
         let mut caught = 0usize;
         let mut total = 0usize;
         for w in bt_reply.split_whitespace() {
@@ -1763,7 +1645,6 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
                 }
             }
         }
-        cleanup_oneshot();
         if !matched {
             println!("explain `{query}`: not selected (no path from modified items to `{query}`)");
         }
@@ -1783,7 +1664,6 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
                 }
             }
         }
-        cleanup_oneshot();
         return Ok(());
     }
 
@@ -1795,7 +1675,6 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
 
     if is_ci_runner && !opts.watch {
         if check_compile_error(&opts, &paths, reply.as_deref()) {
-            cleanup_oneshot();
             std::process::exit(101);
         }
         let lib_only = args.iter().any(|a| a == "--lib");
@@ -1923,7 +1802,6 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
                 }
             );
         }
-        cleanup_oneshot();
         if zero_matched_count > 0 {
             std::process::exit(2);
         }
@@ -1933,159 +1811,44 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !opts.watch {
-        if check_compile_error(&opts, &paths, reply.as_deref()) {
-            std::process::exit(101);
-        }
-        let test_args = resolve_test_args(&opts, &paths);
-        let mut cmd = Command::new(&paths.out_bin);
-        cmd.args(&test_args);
-        let err = cmd.exec();
-        return Err(err.into());
+    if check_compile_error(&opts, &paths, reply.as_deref()) {
+        std::process::exit(101);
     }
-    let max_runs = env::var("RUSTD_WATCH_MAX_RUNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let mut runs = 0usize;
-    let check_txt = paths.base_o.with_extension("check.txt");
-    if !check_compile_error(&opts, &paths, reply.as_deref()) {
-        let t0 = Instant::now();
-        let initial_args = resolve_test_args(&opts, &paths);
-        let status = Command::new(&paths.out_bin).args(&initial_args).status()?;
-        eprintln!("[rustd] initial test run finished in {:.1?} ({status})", t0.elapsed());
-    }
-    runs += 1;
-    if max_runs.is_some_and(|m| runs >= m) {
-        return Ok(());
-    }
-    let mut last_patch_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
-    let mut last_check_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
-    eprintln!("[rustd] watching for changes... (Ctrl-C to exit)");
-    loop {
-        thread::sleep(Duration::from_millis(20));
-        let cur_patch_mtime = fs::metadata(&paths.patch_o).and_then(|m| m.modified()).ok();
-        let cur_check_mtime = fs::metadata(&check_txt).and_then(|m| m.modified()).ok();
-        if (cur_patch_mtime.is_some() && cur_patch_mtime != last_patch_mtime)
-            || (cur_check_mtime.is_some() && cur_check_mtime != last_check_mtime)
-        {
-            last_patch_mtime = cur_patch_mtime;
-            last_check_mtime = cur_check_mtime;
-            let has_compile_errors = fs::read_to_string(&check_txt).is_ok_and(|content| {
-                content
-                    .split_once('\n')
-                    .is_some_and(|(h, _)| h.contains("errors=") && !h.starts_with("errors=0 "))
-            });
-            if has_compile_errors {
-                print_check_file(&opts, &check_txt, None);
-            } else {
-                let t0 = Instant::now();
-                let next_args = resolve_test_args(&opts, &paths);
-                let status = Command::new(&paths.out_bin).args(&next_args).status()?;
-                eprintln!("[rustd] re-ran tests in {:.1?} ({status})", t0.elapsed());
-            }
-            runs += 1;
-            if max_runs.is_some_and(|m| runs >= m) {
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn cmd_request(req: &str, args: &[String]) -> anyhow::Result<()> {
-    let opts = parse_opts(args)?;
-    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    let _ = fs::remove_file(&paths.ack);
-    let t0 = Instant::now();
-    let reply = send_unix_line(&paths.rustd_sock, req).with_context(|| {
-        format!(
-            "no running rustd daemon at {}; run `rustd build --watch` or `rustd run` first",
-            paths.rustd_sock.display()
-        )
-    })?;
-    let compile_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    ensure!(!reply.starts_with("error:"), "rustd: {reply}");
-    println!("{reply} (client_ms={compile_ms:.2})");
-    if req == "patch" && reply.contains("patch=") {
-        let deadline = Instant::now() + Duration::from_millis(50);
-        while Instant::now() < deadline {
-            if let Ok(txt) = fs::read_to_string(&paths.ack) {
-                let mut parts = txt.split_whitespace();
-                if let (Some(us), Some(cnt)) = (
-                    parts.next().and_then(|s| s.parse::<u64>().ok()),
-                    parts.next().and_then(|s| s.parse::<usize>().ok()),
-                ) {
-                    println!(
-                        "[rustd] live process hot-swapped {cnt} fn(s) in {:.3} ms",
-                        us as f64 / 1000.0
-                    );
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_micros(500));
-        }
-    }
-    Ok(())
+    let test_args = resolve_test_args(&opts, &paths);
+    let mut cmd = Command::new(&paths.out_bin);
+    cmd.args(&test_args);
+    let err = cmd.exec();
+    Err(err.into())
 }
 
 fn cmd_status(args: &[String]) -> anyhow::Result<()> {
-    let opts = parse_opts(args)?;
-    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    if !paths.rustd_sock.exists() {
-        println!("not running ({})", paths.dir.display());
-        return Ok(());
+    let (_, workspace_root) = find_manifest_path(
+        args.windows(2)
+            .find(|w| w[0] == "--manifest-path")
+            .map(|w| PathBuf::from(&w[1])),
+    )?;
+    let paths = TargetPaths::new(&workspace_root, "default");
+    if paths.rustd_sock.exists() {
+        let pid = fs::read_to_string(&paths.pid_file).unwrap_or_default();
+        println!(
+            "running: pid={} socket={}",
+            pid.trim(),
+            paths.rustd_sock.display()
+        );
+    } else {
+        println!("stopped");
     }
-    let pid = fs::read_to_string(&paths.pid_file).unwrap_or_default();
-    println!(
-        "running: bin={} pid={} socket={} binary={}",
-        opts.bin_name,
-        pid.trim(),
-        paths.rustd_sock.display(),
-        paths.out_bin.display()
-    );
     Ok(())
 }
 
-fn cmd_stop(args: &[String], quiet: bool) -> anyhow::Result<()> {
-    let opts = parse_opts(args)?;
-    let rustd_dir = opts.workspace_root.join("target").join("rustd");
-    let mut stopped = Vec::new();
-    if rustd_dir.join("rustd.sock").exists() || rustd_dir.join("rustd.pid").exists() {
-        if let Ok(pid_str) = fs::read_to_string(rustd_dir.join("rustd.pid"))
-            && let Ok(pid) = pid_str.trim().parse::<u32>()
-            && pid > 0
-        {
-            let _ = Command::new("kill").arg("-15").arg(pid.to_string()).status();
-        }
-        let _ = fs::remove_file(rustd_dir.join("rustd.sock"));
-        let _ = fs::remove_file(rustd_dir.join("rustd.pid"));
-        stopped.push("workspace".to_owned());
-    }
-    if let Ok(entries) = fs::read_dir(&rustd_dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() && (p.join("rustd.sock").exists() || p.join("rustd.pid").exists()) {
-                if let Ok(pid_str) = fs::read_to_string(p.join("rustd.pid"))
-                    && let Ok(pid) = pid_str.trim().parse::<u32>()
-                    && pid > 0
-                {
-                    let _ = Command::new("kill").arg("-15").arg(pid.to_string()).status();
-                }
-                let _ = fs::remove_file(p.join("rustd.sock"));
-                let _ = fs::remove_file(p.join("rustd.pid"));
-                if let Ok(name) = e.file_name().into_string() {
-                    stopped.push(name);
-                }
-            }
-        }
-    }
-    if stopped.is_empty() {
-        let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-        let _ = fs::remove_file(&paths.rustd_sock);
-        let _ = fs::remove_file(&paths.pid_file);
-        stopped.push(opts.bin_name);
-    }
-    if !quiet {
-        println!("stopped rustd daemon for `{}`", stopped.join("`, `"));
-    }
+fn cmd_stop(args: &[String]) -> anyhow::Result<()> {
+    let (_, workspace_root) = find_manifest_path(
+        args.windows(2)
+            .find(|w| w[0] == "--manifest-path")
+            .map(|w| PathBuf::from(&w[1])),
+    )?;
+    let paths = TargetPaths::new(&workspace_root, "default");
+    stop_target_daemon(&paths);
+    println!("stopped");
     Ok(())
 }

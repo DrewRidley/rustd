@@ -10,7 +10,10 @@ use tt::TextRange;
 
 use crate::{
     expr_store::lower::{ExprCollector, FxIndexSet},
-    hir::{AsmOperand, AsmOptions, Expr, ExprId, InlineAsm, InlineAsmKind, InlineAsmRegOrRegClass},
+    hir::{
+        AsmOperand, AsmOptions, AsmPiece, Expr, ExprId, InlineAsm, InlineAsmKind,
+        InlineAsmRegOrRegClass,
+    },
 };
 
 impl ExprCollector<'_> {
@@ -110,8 +113,13 @@ impl ExprCollector<'_> {
                                     let in_expr = self.collect_expr_opt(op_expr.in_expr());
                                     match op_expr.fat_arrow_token().is_some() {
                                         true => {
+                                            // `out_expr` of the generated AST is the first
+                                            // expression, which is the one going in.
                                             let out_expr = op_expr
-                                                .out_expr()
+                                                .syntax()
+                                                .children()
+                                                .filter_map(ast::Expr::cast)
+                                                .nth(1)
                                                 .filter(|it| {
                                                     !matches!(it, ast::Expr::UnderscoreExpr(_))
                                                 })
@@ -133,8 +141,13 @@ impl ExprCollector<'_> {
                                     let in_expr = self.collect_expr_opt(op_expr.in_expr());
                                     match op_expr.fat_arrow_token().is_some() {
                                         true => {
+                                            // `out_expr` of the generated AST is the first
+                                            // expression, which is the one going in.
                                             let out_expr = op_expr
-                                                .out_expr()
+                                                .syntax()
+                                                .children()
+                                                .filter_map(ast::Expr::cast)
+                                                .nth(1)
                                                 .filter(|it| {
                                                     !matches!(it, ast::Expr::UnderscoreExpr(_))
                                                 })
@@ -181,16 +194,39 @@ impl ExprCollector<'_> {
 
         let mut mappings = vec![];
         let mut curarg = 0;
+        let mut template = Some(Vec::new());
+        if options.contains(AsmOptions::RAW) {
+            for it in asm.template() {
+                if !self.check_cfg(&it) {
+                    continue;
+                }
+                let text = self
+                    .expand_macros_to_string(it)
+                    .and_then(|(s, _)| s.value().ok().map(|it| it.into_owned()));
+                match (&mut template, text) {
+                    (Some(pieces), Some(text)) => {
+                        pieces.push(AsmPiece::Lit(format!("{text}\n").into()))
+                    }
+                    _ => template = None,
+                }
+            }
+        }
         let mut comment_only = !options.contains(AsmOptions::RAW);
         if !options.contains(AsmOptions::RAW) {
             // Don't treat raw asm as a format string.
             asm.template()
                 .enumerate()
-                .filter_map(|(idx, it)| Some((idx, it.clone(), self.expand_macros_to_string(it)?)))
+                .filter_map(|(idx, it)| {
+                    if !self.check_cfg(&it) {
+                        return None;
+                    }
+                    Some((idx, it.clone(), self.expand_macros_to_string(it)?))
+                })
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
                     mappings.resize_with(idx + 1, Vec::default);
                     let Ok(text) = s.value() else {
                         comment_only = false;
+                        template = None;
                         return;
                     };
                     let line = text.trim();
@@ -233,6 +269,9 @@ impl ExprCollector<'_> {
                             unverified_pieces.push(piece);
                         }
                     }
+                    if !parser.errors.is_empty() {
+                        template = None;
+                    }
 
                     curarg = parser.curarg;
 
@@ -246,7 +285,11 @@ impl ExprCollector<'_> {
                     };
                     for piece in unverified_pieces {
                         match piece {
-                            rustc_parse_format::Piece::Lit(_) => {}
+                            rustc_parse_format::Piece::Lit(lit) => {
+                                if let Some(pieces) = &mut template {
+                                    pieces.push(AsmPiece::Lit(lit.into()));
+                                }
+                            }
                             rustc_parse_format::Piece::NextArgument(arg) => {
                                 // let span = arg_spans.next();
 
@@ -271,6 +314,13 @@ impl ExprCollector<'_> {
                                     }
                                 };
 
+                                match (&mut template, operand_idx) {
+                                    (Some(pieces), Some(index)) => pieces.push(AsmPiece::Operand {
+                                        index,
+                                        modifier: arg.format.ty.chars().next(),
+                                    }),
+                                    _ => template = None,
+                                }
                                 if let Some(operand_idx) = operand_idx
                                     && let Some(position_span) = to_span(arg.position_span)
                                 {
@@ -278,6 +328,9 @@ impl ExprCollector<'_> {
                                 }
                             }
                         }
+                    }
+                    if let Some(pieces) = &mut template {
+                        pieces.push(AsmPiece::Lit("\n".into()));
                     }
                 })
         };
@@ -293,6 +346,7 @@ impl ExprCollector<'_> {
         let idx = self.alloc_expr(
             Expr::InlineAsm(InlineAsm {
                 operands: operands.into_boxed_slice(),
+                template: template.map(Vec::into_boxed_slice),
                 options,
                 kind,
                 comment_only,

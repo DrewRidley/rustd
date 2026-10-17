@@ -1847,10 +1847,7 @@ fn sysroot_to_crate_graph(
                 rustc_cfg,
                 &CfgOverrides {
                     global: if sysroot_as_built() {
-                        CfgDiff::new(
-                            vec![CfgAtom::Flag(sym::bootstrap)],
-                            vec![CfgAtom::Flag(sym::test)],
-                        )
+                        CfgDiff::new(vec![], vec![CfgAtom::Flag(sym::test)])
                     } else {
                         CfgDiff::new(
                             vec![

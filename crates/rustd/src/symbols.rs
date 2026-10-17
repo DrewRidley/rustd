@@ -2,8 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default)]
 pub(crate) struct SymbolTable {
@@ -20,6 +21,10 @@ pub(crate) struct SymbolTable {
     /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
     /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
     by_root: FxHashMap<PathBuf, u64>,
+    /// The crates of the link, each by its name and the file it starts at.
+    linked: FxHashSet<(String, PathBuf)>,
+    /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
+    names: FxHashSet<u64>,
 }
 
 struct NestedSymbol {
@@ -46,106 +51,63 @@ struct Symbol {
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
-        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut per_file: Vec<(Option<(String, PathBuf)>, Vec<String>)> =
-            (0..files.len()).map(|_| (None, Vec::new())).collect();
-        std::thread::scope(|scope| {
-            let chunk_size = files.len().div_ceil(threads).max(1);
-            for (idx, chunk) in per_file.chunks_mut(chunk_size).enumerate() {
-                let start = idx * chunk_size;
-                scope.spawn(move || {
-                    let mut local_seen = rustc_hash::FxHashSet::default();
-                    for (offset, slot) in chunk.iter_mut().enumerate() {
-                        let file = &files[start + offset];
-                        let Ok(data) = std::fs::read(file) else { continue };
-                        let mut names = Vec::new();
-                        match ArchiveFile::parse(&*data) {
-                            Ok(archive) => {
-                                for member in archive.members().flatten() {
-                                    if let Ok(member_data) = member.data(&*data) {
-                                        Self::collect_names(
-                                            member_data,
-                                            &mut names,
-                                            &mut local_seen,
-                                        );
-                                    }
-                                }
-                            }
-                            Err(_) => Self::collect_names(&data, &mut names, &mut local_seen),
-                        }
-                        *slot = (crate_root(file, root), names);
-                    }
-                });
-            }
-        });
-        let _ = next;
-        let mut seen = rustc_hash::FxHashSet::default();
-        let mut unique_names = Vec::new();
-        let mut owners = Vec::new();
-        for (owner, names) in per_file {
-            let first = unique_names.len();
-            for name in names {
-                if seen.insert(without_instantiating_crate(&name).to_owned()) {
-                    unique_names.push(name);
-                }
-            }
-            if let Some((name, source)) = owner {
-                owners.push((name, source, first..unique_names.len()));
-            }
-        }
-        let mut symbols: Vec<Option<Symbol>> = (0..unique_names.len()).map(|_| None).collect();
-        std::thread::scope(|scope| {
-            let chunk_size = unique_names.len().div_ceil(threads).max(1);
-            for (idx, chunk) in symbols.chunks_mut(chunk_size).enumerate() {
-                let start = idx * chunk_size;
-                let unique_names = &unique_names;
-                scope.spawn(move || {
-                    for (offset, slot) in chunk.iter_mut().enumerate() {
-                        let name = &unique_names[start + offset];
-                        let Ok(demangled) = rustc_demangle::try_demangle(name) else { continue };
-                        let with_ids = demangled.to_string();
-                        let raw_path = format!("{demangled:#}");
-                        let path = if name.starts_with("_ZN") {
-                            normalize_legacy_path(&raw_path)
-                        } else {
-                            raw_path
-                        };
-                        *slot = Some(Symbol {
-                            name: name.clone(),
-                            place: V0::place(name),
-                            with_ids,
-                            path,
-                        });
-                    }
-                });
-            }
-        });
         let mut table = SymbolTable::default();
-        for sym in symbols.iter().flatten() {
-            for (krate, id) in crate_ids(&sym.with_ids) {
-                match table.crates.get_mut(krate) {
-                    Some(known) if *known != Some(id) => *known = None,
-                    Some(_) => {}
-                    None => {
-                        table.crates.insert(krate.to_owned(), Some(id));
+        let mut symbols = Vec::new();
+        let mut owners = Vec::new();
+        for file in files {
+            let data =
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            let first = symbols.len();
+            match ArchiveFile::parse(&*data) {
+                Ok(archive) => {
+                    for member in archive.members() {
+                        table.add_object(member?.data(&*data)?, &mut symbols);
                     }
                 }
+                Err(_) => table.add_object(&data, &mut symbols),
+            }
+            if let Some((name, source)) = crate_root(file, root) {
+                owners.push((name, source, first..symbols.len()));
             }
         }
+        // A crate's symbols mention the crates of its name that it depends on (a binary
+        // instantiates the generics of its library) besides itself, and never one that depends
+        // on it: the id that is left once the others have theirs is its own. A crate may be
+        // several files, when it is linked from its objects.
+        let mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>> = FxHashMap::default();
         for (name, source, range) in owners {
+            table.linked.insert((name.clone(), source.clone()));
             if table.crates.get(&name) != Some(&None) {
                 continue;
             }
-            // Nothing a crate defines mentions the other crate of its name.
-            let id = symbols[range].iter().flatten().find_map(|symbol| {
-                crate_ids(&symbol.with_ids).find(|it| it.0 == name).map(|it| it.1)
-            });
-            if let Some(id) = id {
-                table.by_root.insert(source, id);
+            let mentions = unplaced.entry(source).or_default();
+            for symbol in &symbols[range] {
+                for (_, id) in crate_ids(&symbol.with_ids).filter(|it| it.0 == name) {
+                    *mentions.entry(id).or_default() += 1;
+                }
             }
         }
-        for Symbol { name, place, with_ids, path } in symbols.into_iter().flatten() {
+        table.place(unplaced);
+        table.index(symbols);
+        Ok(table)
+    }
+
+    /// The table of the symbols named, for a link that is not read from files.
+    #[allow(dead_code)] // `rustd-wasm` builds this file too, and has no files to read.
+    pub(crate) fn of_names<'a>(names: impl IntoIterator<Item = &'a str>) -> SymbolTable {
+        let mut table = SymbolTable::default();
+        let mut symbols = Vec::new();
+        for name in names {
+            table.add_name(name, &mut symbols);
+        }
+        table.index(symbols);
+        table
+    }
+
+    /// Files the symbols under their paths, once every crate named in one is known.
+    fn index(&mut self, symbols: Vec<Symbol>) {
+        let table = self;
+        for Symbol { name, place, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
@@ -158,472 +120,81 @@ impl SymbolTable {
                 let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
                 let closures = path
                     .split("::")
-                    .filter_map(|it| {
-                        if it == "{{closure}}" {
-                            Some(0)
-                        } else {
-                            it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok()
-                        }
-                    })
+                    .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
                     .collect();
                 let symbols = table.nested.entry(named.join("::")).or_default();
                 if symbols.iter().all(|it| it.name != name) {
                     symbols.push(NestedSymbol { name: name.clone(), closures, place });
                 }
             }
-            table.by_path.entry(path).or_default().push(Placed { name, place });
-        }
-        Ok(table)
-    }
-
-    pub(crate) fn merge(&mut self, other: SymbolTable) {
-        for (k, v) in other.by_path {
-            let list = self.by_path.entry(k).or_default();
-            for item in v {
-                if !list.iter().any(|x| x.name == item.name) {
-                    list.push(item);
-                }
+            let known = table.by_path.entry(path).or_default();
+            let same = |it: &Placed| {
+                without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
+            };
+            if !known.iter().any(same) {
+                known.push(Placed { name, place });
             }
-        }
-        for (k, v) in other.nested {
-            let list = self.nested.entry(k).or_default();
-            for item in v {
-                if !list.iter().any(|x| x.name == item.name) {
-                    list.push(item);
-                }
-            }
-        }
-        for (k, v) in other.crates {
-            self.crates.entry(k).or_insert(v);
-        }
-        for (k, v) in other.by_root {
-            self.by_root.entry(k).or_insert(v);
         }
     }
 
-    pub(crate) fn load_cached(
-        files: &[PathBuf],
-        root: &Path,
-        cache_path: Option<&Path>,
-    ) -> anyhow::Result<SymbolTable> {
-        let fp = Self::files_fingerprint(files);
-        if let Some(cp) = cache_path
-            && let Ok(bytes) = std::fs::read(cp)
-            && let Some(table) = Self::from_cache_bytes(&bytes, fp)
-        {
-            return Ok(table);
-        }
-        let table = Self::load(files, root)?;
-        if let Some(cp) = cache_path {
-            let _ = std::fs::write(cp, table.to_cache_bytes(fp));
-        }
-        Ok(table)
+    fn hashed(symbol: &str) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(symbol)
     }
 
-    pub(crate) fn files_fingerprint(files: &[PathBuf]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = rustc_hash::FxHasher::default();
-        files.len().hash(&mut h);
-        for f in files {
-            f.hash(&mut h);
-            if let Ok(m) = std::fs::metadata(f) {
-                m.len().hash(&mut h);
-                if let Ok(t) = m.modified()
-                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
-                {
-                    d.as_nanos().hash(&mut h);
-                }
-            }
-        }
-        h.finish()
+    pub(crate) fn defines(&self, symbol: &str) -> bool {
+        self.names.contains(&Self::hashed(symbol))
     }
 
-    fn to_cache_bytes(&self, fp: u64) -> Vec<u8> {
-        fn put_u32(out: &mut Vec<u8>, v: u32) {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        fn put_u64(out: &mut Vec<u8>, v: u64) {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        fn put_str(out: &mut Vec<u8>, s: &str) {
-            put_u32(out, s.len() as u32);
-            out.extend_from_slice(s.as_bytes());
-        }
-        fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
-            match v {
-                Some(x) => {
-                    out.push(1);
-                    put_u64(out, x);
-                }
-                None => out.push(0),
-            }
-        }
-        let mut out = Vec::with_capacity(256 * 1024);
-        out.extend_from_slice(b"RUSTDSYM");
-        put_u64(&mut out, fp);
-        put_u32(&mut out, self.by_path.len() as u32);
-        for (k, list) in &self.by_path {
-            put_str(&mut out, k);
-            put_u32(&mut out, list.len() as u32);
-            for item in list {
-                put_str(&mut out, &item.name);
-                put_opt_u64(&mut out, item.place);
-            }
-        }
-        put_u32(&mut out, self.nested.len() as u32);
-        for (k, list) in &self.nested {
-            put_str(&mut out, k);
-            put_u32(&mut out, list.len() as u32);
-            for item in list {
-                put_str(&mut out, &item.name);
-                put_u32(&mut out, item.closures.len() as u32);
-                for &c in &item.closures {
-                    put_u32(&mut out, c);
-                }
-                put_opt_u64(&mut out, item.place);
-            }
-        }
-        put_u32(&mut out, self.crates.len() as u32);
-        for (k, &v) in &self.crates {
-            put_str(&mut out, k);
-            put_opt_u64(&mut out, v);
-        }
-        put_u32(&mut out, self.by_root.len() as u32);
-        for (k, &v) in &self.by_root {
-            put_str(&mut out, &k.to_string_lossy());
-            put_u64(&mut out, v);
-        }
-        out
-    }
-
-    fn from_cache_bytes(buf: &[u8], expected_fp: u64) -> Option<Self> {
-        if buf.len() < 16 || &buf[0..8] != b"RUSTDSYM" {
-            return None;
-        }
-        let mut pos = 8usize;
-        let get_u8 = |pos: &mut usize| -> Option<u8> {
-            let v = *buf.get(*pos)?;
-            *pos += 1;
-            Some(v)
-        };
-        let get_u32 = |pos: &mut usize| -> Option<u32> {
-            let v = u32::from_le_bytes(buf.get(*pos..*pos + 4)?.try_into().ok()?);
-            *pos += 4;
-            Some(v)
-        };
-        let get_u64 = |pos: &mut usize| -> Option<u64> {
-            let v = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
-            *pos += 8;
-            Some(v)
-        };
-        let get_str = |pos: &mut usize| -> Option<String> {
-            let len = get_u32(pos)? as usize;
-            let s = std::str::from_utf8(buf.get(*pos..*pos + len)?).ok()?.to_owned();
-            *pos += len;
-            Some(s)
-        };
-        let get_opt_u64 = |pos: &mut usize| -> Option<Option<u64>> {
-            match get_u8(pos)? {
-                0 => Some(None),
-                1 => Some(Some(get_u64(pos)?)),
-                _ => None,
-            }
-        };
-        if get_u64(&mut pos)? != expected_fp {
-            return None;
-        }
-        let mut table = SymbolTable::default();
-        let n_path = get_u32(&mut pos)? as usize;
-        table.by_path.reserve(n_path);
-        for _ in 0..n_path {
-            let k = get_str(&mut pos)?;
-            let count = get_u32(&mut pos)? as usize;
-            let mut list = Vec::with_capacity(count);
-            for _ in 0..count {
-                let name = get_str(&mut pos)?;
-                let place = get_opt_u64(&mut pos)?;
-                list.push(Placed { name, place });
-            }
-            table.by_path.insert(k, list);
-        }
-        let n_nested = get_u32(&mut pos)? as usize;
-        table.nested.reserve(n_nested);
-        for _ in 0..n_nested {
-            let k = get_str(&mut pos)?;
-            let count = get_u32(&mut pos)? as usize;
-            let mut list = Vec::with_capacity(count);
-            for _ in 0..count {
-                let name = get_str(&mut pos)?;
-                let c_len = get_u32(&mut pos)? as usize;
-                let mut closures = Vec::with_capacity(c_len);
-                for _ in 0..c_len {
-                    closures.push(get_u32(&mut pos)?);
-                }
-                let place = get_opt_u64(&mut pos)?;
-                list.push(NestedSymbol { name, closures, place });
-            }
-            table.nested.insert(k, list);
-        }
-        let n_crates = get_u32(&mut pos)? as usize;
-        table.crates.reserve(n_crates);
-        for _ in 0..n_crates {
-            let k = get_str(&mut pos)?;
-            let v = get_opt_u64(&mut pos)?;
-            table.crates.insert(k, v);
-        }
-        let n_roots = get_u32(&mut pos)? as usize;
-        table.by_root.reserve(n_roots);
-        for _ in 0..n_roots {
-            let k = PathBuf::from(get_str(&mut pos)?);
-            let v = get_u64(&mut pos)?;
-            table.by_root.insert(k, v);
-        }
-        Some(table)
-    }
-
-    pub(crate) fn filter_to_binary(&mut self, bin_path: &Path) {
-        let Ok(data) = std::fs::read(bin_path) else { return };
-        let Ok(object) = object::File::parse(&*data) else { return };
-        let is_macho = object.format() == object::BinaryFormat::MachO;
-        let mut defined_by_base = rustc_hash::FxHashMap::default();
-        for symbol in object.symbols() {
-            let defined = symbol.section_index().is_some() || symbol.is_common();
-            if !(defined && (symbol.is_global() || symbol.kind() == object::SymbolKind::Text)) {
-                continue;
-            }
-            let Ok(name) = symbol.name() else { continue };
-            let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
-            let key = without_instantiating_crate(name).to_owned();
-            if symbol.is_global() {
-                defined_by_base.insert(key, name.to_owned());
-            } else {
-                defined_by_base.entry(key).or_insert_with(|| name.to_owned());
-            }
-        }
-        if defined_by_base.is_empty() {
-            return;
-        }
-        self.by_path.retain(|_, list| {
-            list.retain_mut(|it| {
-                if let Some(actual) =
-                    defined_by_base.get(without_instantiating_crate(&it.name))
-                {
-                    it.name = actual.clone();
-                    true
-                } else {
-                    it.name.ends_with("STATIC_INNER_SLICE")
-                }
-            });
-            !list.is_empty()
-        });
-        self.nested.retain(|_, list| {
-            list.retain_mut(|it| {
-                if let Some(actual) =
-                    defined_by_base.get(without_instantiating_crate(&it.name))
-                {
-                    it.name = actual.clone();
-                    true
-                } else {
-                    false
-                }
-            });
-            !list.is_empty()
-        });
-    }
-
-    fn collect_names(
-        data: &[u8],
-        names: &mut Vec<String>,
-        seen: &mut rustc_hash::FxHashSet<String>,
-    ) {
-        if data.starts_with(b"\0asm\x01\x00\x00\x00") {
-            Self::collect_wasm_names(data, names, seen);
-            return;
-        }
+    fn add_object(&mut self, data: &[u8], symbols: &mut Vec<Symbol>) {
         // rlibs also hold `lib.rmeta`, which isn't an object file.
         let Ok(object) = object::File::parse(data) else { return };
-        let is_macho = object.format() == object::BinaryFormat::MachO;
         for symbol in object.symbols() {
             // A reference is as good as a definition: something in the link defines it.
             // Not `is_definition`, which leaves out thread locals.
-            let defined = symbol.section_index().is_some() || symbol.is_common();
-            let linkable = symbol.is_undefined()
-                || (defined && (symbol.is_global() || symbol.kind() == object::SymbolKind::Text));
+            // A wasm object's data is in segments, which are not sections.
+            let in_segment = object.format() == object::BinaryFormat::Wasm
+                && symbol.section() == object::SymbolSection::Unknown;
+            let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
+            let linkable = symbol.is_undefined() || (defined && symbol.is_global());
             if !linkable {
                 continue;
             }
             let Ok(name) = symbol.name() else { continue };
-            let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
-            Self::push_rust_symbol(name, names, seen);
+            // Mach-O spells every name of C and Rust with an underscore in front, which the
+            // writer of an object adds back.
+            let name = match object.format() {
+                object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
+                _ => name,
+            };
+            self.add_name(name, symbols);
         }
     }
 
-    fn push_rust_symbol(
-        name: &str,
-        names: &mut Vec<String>,
-        seen: &mut rustc_hash::FxHashSet<String>,
-    ) {
+    fn add_name(&mut self, name: &str, symbols: &mut Vec<Symbol>) {
+        self.names.insert(Self::hashed(name));
         // The memory a static points to is a symbol that demangles to the static's path.
-        let is_v0 = name.starts_with("_R") && !name.starts_with("_RNn");
-        let is_legacy = name.starts_with("_ZN")
-            && name.ends_with('E')
-            && name.len() > 20
-            && &name.as_bytes()[name.len() - 20..name.len() - 17] == b"17h";
-        if !is_v0 && !is_legacy {
+        if name.starts_with("_RNn") {
             return;
         }
-        let base = without_instantiating_crate(name);
-        if seen.insert(base.to_owned()) {
-            names.push(name.to_owned());
-        }
-    }
-
-    fn collect_wasm_names(
-        data: &[u8],
-        names: &mut Vec<String>,
-        seen: &mut rustc_hash::FxHashSet<String>,
-    ) {
-        fn read_uleb(buf: &[u8], pos: &mut usize) -> Option<u32> {
-            let mut res = 0u32;
-            let mut shift = 0u32;
-            loop {
-                let &byte = buf.get(*pos)?;
-                *pos += 1;
-                res |= u32::from(byte & 0x7f).checked_shl(shift)?;
-                if byte & 0x80 == 0 {
-                    return Some(res);
-                }
-                shift += 7;
-                if shift >= 35 {
-                    return None;
+        let Ok(demangled) = rustc_demangle::try_demangle(name) else { return };
+        let with_ids = demangled.to_string();
+        for (krate, id) in crate_ids(&with_ids) {
+            match self.crates.get_mut(krate) {
+                Some(known) if *known != Some(id) => *known = None,
+                Some(_) => {}
+                None => {
+                    self.crates.insert(krate.to_owned(), Some(id));
                 }
             }
         }
-        fn read_str<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a str> {
-            let len = read_uleb(buf, pos)? as usize;
-            let s = std::str::from_utf8(buf.get(*pos..*pos + len)?).ok()?;
-            *pos += len;
-            Some(s)
-        }
-
-        let mut pos = 8;
-        let mut func_imports = Vec::new();
-        let mut global_imports = Vec::new();
-        while pos < data.len() {
-            let Some(&sec_id) = data.get(pos) else { break };
-            pos += 1;
-            let Some(sec_len) = read_uleb(data, &mut pos) else { break };
-            let sec_end = pos.saturating_add(sec_len as usize);
-            if sec_end > data.len() {
-                break;
-            }
-            if sec_id == 2 {
-                // Import section
-                let mut p = pos;
-                if let Some(count) = read_uleb(data, &mut p) {
-                    for _ in 0..count {
-                        let Some(_mod_name) = read_str(data, &mut p) else { break };
-                        let Some(field_name) = read_str(data, &mut p) else { break };
-                        let Some(&kind) = data.get(p) else { break };
-                        p += 1;
-                        match kind {
-                            0 => {
-                                let _ = read_uleb(data, &mut p);
-                                func_imports.push(field_name);
-                            }
-                            1 => {
-                                p += 1; // elem_type
-                                let Some(flags) = read_uleb(data, &mut p) else { break };
-                                let _ = read_uleb(data, &mut p);
-                                if flags & 1 != 0 {
-                                    let _ = read_uleb(data, &mut p);
-                                }
-                            }
-                            2 => {
-                                let Some(flags) = read_uleb(data, &mut p) else { break };
-                                let _ = read_uleb(data, &mut p);
-                                if flags & 1 != 0 {
-                                    let _ = read_uleb(data, &mut p);
-                                }
-                            }
-                            3 => {
-                                p += 2; // valtype + mutability
-                                global_imports.push(field_name);
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            } else if sec_id == 0 {
-                let mut p = pos;
-                if let Some(sec_name) = read_str(data, &mut p)
-                    && sec_name == "linking"
-                {
-                    let _version = read_uleb(data, &mut p);
-                    while p < sec_end {
-                        let Some(&sub_ty) = data.get(p) else { break };
-                        p += 1;
-                        let Some(sub_len) = read_uleb(data, &mut p) else { break };
-                        let sub_end = p.saturating_add(sub_len as usize);
-                        if sub_end > sec_end {
-                            break;
-                        }
-                        if sub_ty == 8 {
-                            // WASM_SYMBOL_TABLE
-                            let mut sp = p;
-                            if let Some(count) = read_uleb(data, &mut sp) {
-                                for _ in 0..count {
-                                    let Some(&kind) = data.get(sp) else { break };
-                                    sp += 1;
-                                    let Some(flags) = read_uleb(data, &mut sp) else { break };
-                                    let is_undef = (flags & 0x10) != 0;
-                                    let is_local = (flags & 0x02) != 0;
-                                    let explicit_name = (flags & 0x40) != 0;
-                                    let sym_name = match kind {
-                                        0 | 2 | 4 | 5 => {
-                                            let Some(idx) = read_uleb(data, &mut sp) else { break };
-                                            if !is_undef || explicit_name {
-                                                let Some(s) = read_str(data, &mut sp) else {
-                                                    break;
-                                                };
-                                                Some(s)
-                                            } else if kind == 0 {
-                                                func_imports.get(idx as usize).copied()
-                                            } else if kind == 2 {
-                                                global_imports.get(idx as usize).copied()
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        1 => {
-                                            let Some(s) = read_str(data, &mut sp) else { break };
-                                            if !is_undef {
-                                                let _ = read_uleb(data, &mut sp);
-                                                let _ = read_uleb(data, &mut sp);
-                                                let _ = read_uleb(data, &mut sp);
-                                            }
-                                            Some(s)
-                                        }
-                                        3 => {
-                                            let _ = read_uleb(data, &mut sp);
-                                            None
-                                        }
-                                        _ => break,
-                                    };
-                                    if (!is_local || is_undef)
-                                        && let Some(name) = sym_name
-                                    {
-                                        Self::push_rust_symbol(name, names, seen);
-                                    }
-                                }
-                            }
-                        }
-                        p = sub_end;
-                    }
-                }
-            }
-            pos = sec_end;
-        }
+        // `{:#}` drops the crate disambiguator hashes.
+        symbols.push(Symbol {
+            name: name.to_owned(),
+            place: V0::place(name),
+            with_ids,
+            path: format!("{demangled:#}"),
+        });
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
@@ -635,6 +206,41 @@ impl SymbolTable {
         }
     }
 
+    /// Gives each crate that shares its name the id that is its own, from how often its symbols
+    /// mention each id of that name.
+    fn place(&mut self, mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>>) {
+        loop {
+            let taken: FxHashSet<u64> = self.by_root.values().copied().collect();
+            let before = unplaced.len();
+            unplaced.retain(|source, mentions| {
+                let mut free = mentions.keys().filter(|id| !taken.contains(id));
+                match (free.next(), free.next()) {
+                    (Some(&id), None) => {
+                        self.by_root.insert(source.clone(), id);
+                        false
+                    }
+                    _ => true,
+                }
+            });
+            if unplaced.len() == before {
+                break;
+            }
+        }
+        // The other crate of the name is none of these files (a test named `test`, and the
+        // sysroot's): a guess, that a crate mentions itself more than it does the other.
+        for (source, mentions) in unplaced {
+            if let Some((&id, _)) = mentions.iter().max_by_key(|(_, count)| **count) {
+                self.by_root.insert(source, id);
+            }
+        }
+    }
+
+    /// Whether the crate named `name` whose source starts at `root` is one of the link. A
+    /// bench may be named as the library, start where a test does, and be another program.
+    pub(crate) fn links(&self, name: &str, root: &Path) -> bool {
+        self.linked.contains(&(name.to_owned(), root.to_owned()))
+    }
+
     pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {
         match *self.crates.get(name)? {
             Some(id) => Some(id),
@@ -643,11 +249,7 @@ impl SymbolTable {
     }
 
     pub(crate) fn get(&self, path: &str) -> Option<&str> {
-        let entries = match self.by_path.get(path) {
-            Some(entries) => entries,
-            None => self.by_path.get(&strip_inherent_angles(path)?)?,
-        };
-        match &**entries {
+        match &**self.by_path.get(path)? {
             [only] => Some(&only.name),
             _ => None,
         }
@@ -656,11 +258,7 @@ impl SymbolTable {
     /// The symbol of the item at `path` that is the `place`th of its name in what it is
     /// written in.
     pub(crate) fn get_at(&self, path: &str, place: u64) -> Option<&str> {
-        let entries = match self.by_path.get(path) {
-            Some(entries) => entries,
-            None => self.by_path.get(&strip_inherent_angles(path)?)?,
-        };
-        let mut symbols = match &**entries {
+        let mut symbols = match &**self.by_path.get(path)? {
             [only] => {
                 return Some(only)
                     .filter(|it| it.place.is_none_or(|it| it == place))
@@ -680,12 +278,14 @@ impl SymbolTable {
     /// no symbol here.
     pub(crate) fn get_nested(&self, named: &str, closures: &[u32], place: u64) -> Option<&str> {
         let here = |it: &&NestedSymbol| it.place.is_none_or(|known| known == place);
-        let entries = match self.nested.get(named) {
-            Some(entries) => entries,
-            None => self.nested.get(&strip_inherent_angles(named)?)?,
-        };
-        let mut symbols = match &**entries {
-            [only] => return Some(only).filter(here).map(|it| &*it.name),
+        let mut symbols = match &**self.nested.get(named)? {
+            // Its closures may be numbered otherwise than here, but are as many.
+            [only] => {
+                return Some(only)
+                    .filter(here)
+                    .filter(|it| it.closures.len() == closures.len())
+                    .map(|it| &*it.name);
+            }
             symbols => symbols.iter().filter(here).filter(|it| it.closures == closures),
         };
         let symbol = symbols.next()?;
@@ -712,89 +312,6 @@ fn crate_root(rlib: &Path, root: &Path) -> Option<(String, PathBuf)> {
     // FIXME: a path with a space in it is escaped.
     let source = sources.split(' ').next()?;
     Some((name.to_owned(), root.join(source)))
-}
-
-/// Normalizes legacy (`_ZN`) demangled `<module>::<impl Trait for Type>::item` and
-/// `<module>::<impl Type>::item` paths into the v0 `<Type as Trait>::item` / `<Type>::item` form.
-fn normalize_legacy_path(s: &str) -> String {
-    let mut result = s.to_owned();
-    while let Some(impl_pos) = result.find("::<impl ") {
-        let mod_start = result[..impl_pos]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-            .map_or(0, |i| i + 1);
-        let open_pos = impl_pos + 2;
-        let mut depth = 0usize;
-        let mut close_pos = None;
-        for (off, ch) in result[open_pos..].char_indices() {
-            match ch {
-                '<' => depth += 1,
-                '>' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close_pos = Some(open_pos + off);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(close_pos) = close_pos else { break };
-        let inner = normalize_legacy_path(&result[open_pos + 6..close_pos]);
-        let mut d = 0usize;
-        let mut for_pos = None;
-        for (i, ch) in inner.char_indices() {
-            match ch {
-                '<' | '(' | '[' => d += 1,
-                '>' | ')' | ']' => d = d.saturating_sub(1),
-                ' ' if d == 0 && inner[i..].starts_with(" for ") => {
-                    for_pos = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let replacement = match for_pos {
-            Some(fp) => {
-                let trait_part = &inner[..fp];
-                let type_part = &inner[fp + 5..];
-                format!("<{type_part} as {trait_part}>")
-            }
-            None => format!("<{inner}>"),
-        };
-        result.replace_range(mod_start..=close_pos, &replacement);
-    }
-    result
-}
-
-/// Converts v0 inherent paths like `<a::b::Type>::method` into legacy `a::b::Type::method`.
-fn strip_inherent_angles(path: &str) -> Option<String> {
-    if !path.starts_with('<') {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut has_top_as = false;
-    let mut close_pos = None;
-    for (i, ch) in path.char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    close_pos = Some(i);
-                    break;
-                }
-            }
-            ' ' if depth == 1 && path[i..].starts_with(" as ") => {
-                has_top_as = true;
-            }
-            _ => {}
-        }
-    }
-    let close = close_pos?;
-    if has_top_as || !path[close + 1..].starts_with("::") {
-        return None;
-    }
-    Some(format!("{}{}", &path[1..close], &path[close + 1..]))
 }
 
 /// A v0 symbol without the crate that instantiated it, which ends the symbol of a generic
@@ -1060,7 +577,36 @@ impl V0<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::V0;
+    use std::path::PathBuf;
+
+    use rustc_hash::FxHashMap;
+
+    use super::{SymbolTable, V0};
+
+    fn placed(crates: &[(&str, &[(u64, usize)])]) -> Vec<(String, u64)> {
+        let mut table = SymbolTable::default();
+        let unplaced: FxHashMap<_, _> = crates
+            .iter()
+            .map(|(root, mentions)| (PathBuf::from(root), mentions.iter().copied().collect()))
+            .collect();
+        table.place(unplaced);
+        let mut placed: Vec<_> =
+            table.by_root.iter().map(|(root, id)| (root.display().to_string(), *id)).collect();
+        placed.sort();
+        placed
+    }
+
+    #[test]
+    fn a_binary_that_mentions_its_library_more_than_itself() {
+        let placed = placed(&[("src/lib.rs", &[(1, 5)]), ("src/main.rs", &[(1, 9), (2, 3)])]);
+        assert_eq!(placed, [("src/lib.rs".to_owned(), 1), ("src/main.rs".to_owned(), 2)]);
+    }
+
+    #[test]
+    fn a_test_named_as_a_crate_of_the_sysroot() {
+        let placed = placed(&[("tests/test.rs", &[(7, 6), (8, 300)])]);
+        assert_eq!(placed, [("tests/test.rs".to_owned(), 8)]);
+    }
 
     #[test]
     fn place_of_a_static_in_a_closure() {

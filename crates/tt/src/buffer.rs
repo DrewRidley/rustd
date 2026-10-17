@@ -109,6 +109,33 @@ impl<'a> Cursor<'a> {
         self.advance();
     }
 
+    /// Steps out of the token trees without delimiters that end here, which a parser that
+    /// counts tokens does not see.
+    pub fn leave_invisible(&mut self) {
+        while let Some((last_subtree_idx, last_subtree)) = self.last_subtree()
+            && last_subtree.delimiter.kind == crate::DelimiterKind::Invisible
+            && last_subtree_idx + last_subtree.usize_len() + 1 == self.advances_count
+        {
+            self.subtrees_stack.pop();
+        }
+    }
+
+    /// Steps over the starts and ends of token trees without delimiters, up to the next token
+    /// that a parser sees.
+    pub fn skip_invisible(&mut self) {
+        loop {
+            self.leave_invisible();
+            match self.token_tree() {
+                Some(TokenTree::Subtree(subtree))
+                    if subtree.delimiter.kind == crate::DelimiterKind::Invisible =>
+                {
+                    self.advance()
+                }
+                _ => break,
+            }
+        }
+    }
+
     pub fn peek_two_leaves(&self) -> Option<[Leaf; 2]> {
         if let Some((last_subtree_idx, last_subtree)) = self.last_subtree() {
             // +1 because `Subtree.len` excludes the subtree itself.

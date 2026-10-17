@@ -415,12 +415,14 @@ pub fn expect_fragment<'t>(
                     n_input_tokens = 2;
                 }
                 for _ in 0..n_input_tokens {
+                    cursor.skip_invisible();
                     cursor.bump_or_end();
                 }
             }
             parser::Step::FloatSplit { .. } => {
                 // FIXME: We need to split the tree properly here, but mutating the token trees
                 // in the buffer is somewhat tricky to pull off.
+                cursor.skip_invisible();
                 cursor.bump_or_end();
             }
             parser::Step::Enter { .. } | parser::Step::Exit => (),
@@ -428,6 +430,7 @@ pub fn expect_fragment<'t>(
         }
     }
 
+    cursor.leave_invisible();
     let err = if error || !cursor.is_root() {
         Some(ExpandError::binding_error(
             buffer.cursor().token_tree().map_or(delim_span.close, |tt| tt.first_span()),

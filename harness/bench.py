@@ -6,15 +6,23 @@ usage: bench.py [name ...] [--edits N]
 Benchmarks are listed in benches.json. For each one the daemon is started in watch mode, a
 literal in a function body is flipped back and forth N times, and the daemon's own timings are
 collected. Then the same edits are timed against cargo. Results go to bench.json and BENCH.md.
+
+RUSTD_SPLICE: edits are added to the linked binary where that can be done, and the results go
+to bench-splice.json and BENCH-splice.md instead.
+
+The `regex` bench is of bench2, which builds the regex-automata and regex-syntax that
+`vendor.sh regex-automata-<version>` and `vendor.sh regex-syntax-<version>` unpack.
 """
-import json, os, re, shlex, statistics, subprocess, sys, time
+import json, os, re, statistics, subprocess, sys, time
 
 # rustd computes layouts with rust-analyzer's copy of rustc_abi, so everything it links against
 # has to come from the rustc that copy was taken from.
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
-from difftest import Fixture, RUSTD, sysroot_rlibs
+import linkline
+from difftest import Fixture, RUSTD, WINDOWS, sysroot_rlibs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SPLICE = bool(os.environ.get("RUSTD_SPLICE"))
 UNITS = {"ns": 1e-6, "µs": 1e-3, "ms": 1, "s": 1000}
 
 
@@ -39,35 +47,54 @@ class Edit:
         open(self.path, "w").write(self.original)
 
 
+def resident_mb(pid):
+    """The process's resident set, as the platform reports it."""
+    if WINDOWS:
+        import ctypes, ctypes.wintypes as wt
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD)] + [
+                (name, ctypes.c_size_t) for name in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        counters = Counters(cb=ctypes.sizeof(Counters))
+        ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return counters.WorkingSetSize // (1024 * 1024)
+    return int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{pid}/status").read())[1]) // 1024
+
+
 def rustd_loop(fx, crate, edit, n):
-    obj = os.path.join(fx.work, "rustd.o")
-    args = list(fx.link_args)
-    first = next(i for i, a in enumerate(args) if a.endswith(".rlib"))
-    args[first:first] = [obj] if sys.platform == "darwin" else [obj, "-Wl,--allow-multiple-definition"]
-    args[args.index("-o") + 1] = os.path.join(fx.work, "bin-rustd")
+    obj, patch, binary = (os.path.join(fx.work, f"rustd.{ext}") for ext in ("o", "patch.o", "bin"))
+    args = linkline.with_output(linkline.ahead(fx.link_args, [patch, obj] if SPLICE else [obj], RUSTD), binary)
+    splice = ["--patch", patch, "--splice", binary] if SPLICE else []
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    log = open(os.path.join(fx.work, "daemon.log"), "w+")
+    # The daemon and the linker it runs share this handle's file position, so read through another one.
+    log_path = os.path.join(fx.work, "daemon.log")
+    log = open(log_path, "a", encoding="utf-8")
     daemon = subprocess.Popen(
-        [RUSTD, fx.ws, "--crate", crate, "--out", obj, "--watch", "--link-cmd", shlex.join(args), *symbols],
+        [RUSTD, fx.ws, "--crate", crate, "--out", obj, "--watch", "--link-cmd", linkline.join(args), *splice, *symbols],
         stderr=log, stdout=log)
+
+    def read_log():
+        return open(log_path, encoding="utf-8", errors="replace").read()
 
     def wait_for(pattern, seen):
         deadline = time.time() + 300
         while time.time() < deadline:
-            log.seek(0)
-            found = re.findall(pattern, log.read())
+            found = re.findall(pattern, read_log())
             if len(found) > seen:
                 return found
             if daemon.poll() is not None:
-                log.seek(0)
-                raise SystemExit(f"daemon died:\n{log.read()[-2000:]}")
+                raise SystemExit(f"daemon died:\n{read_log()[-2000:]}")
             time.sleep(0.002)
         raise SystemExit("daemon timed out")
 
     try:
         wait_for(r"watching \d+ files", 0)
-        log.seek(0)
-        text = log.read()
+        text = read_log()
         cold = {"load_ms": millis(re.search(r"load workspace: (\S+)", text)[1]),
                 "codegen_ms": millis(re.search(r"cold: compiled .* in (\S+) \(", text)[1])}
         coverage = re.search(r"cold: compiled (\d+) of (\d+)", text)
@@ -75,12 +102,8 @@ def rustd_loop(fx, crate, edit, n):
             time.sleep(0.05)
             edit.flip()
             wait_for(r"edit-to-binary: \S+", i)
-        log.seek(0)
-        text = log.read()
-        if sys.platform == "darwin":
-            rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(daemon.pid)], text=True).strip()) // 1024
-        else:
-            rss = int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
+        text = read_log()
+        rss = resident_mb(daemon.pid)
     finally:
         daemon.kill()
         edit.restore()
@@ -92,7 +115,8 @@ def rustd_loop(fx, crate, edit, n):
     }
     return {"cold": cold, "rss_mb": rss, "compiled": int(coverage[1]), "functions": int(coverage[2]),
             **{f"{k}_ms": statistics.median(v) for k, v in series.items()},
-            "first_edit_ms": series["total"][0]}
+            "first_edit_ms": series["total"][0], "spliced": len(re.findall(r"^link: .*\(spliced", text, re.M)),
+            "edits": n}
 
 
 def cargo_loop(fx, edit, n, cargo_args):
@@ -112,7 +136,8 @@ def main():
     names = [a for a in sys.argv[1:] if not a.startswith("--")]
     n = int(sys.argv[sys.argv.index("--edits") + 1]) if "--edits" in sys.argv else 10
     benches = json.load(open(os.path.join(HERE, "benches.json")))
-    out_path = os.path.join(HERE, "bench.json")
+    suffix = "-splice" if SPLICE else ""
+    out_path = os.path.join(HERE, f"bench{suffix}.json")
     results = json.load(open(out_path)) if os.path.exists(out_path) else {}
     for name, b in benches.items():
         if names and name not in names:
@@ -127,15 +152,17 @@ def main():
         results[name] = result
         print(name, json.dumps(result))
     json.dump(results, open(out_path, "w"), indent=1, sort_keys=True)
-    lines = ["# rustd edit-loop bench", "", "Generated by `harness/bench.py`. Medians over the edits; times in ms.", "",
+    how = " with `RUSTD_SPLICE`" if SPLICE else ""
+    lines = ["# rustd edit-loop bench", "", f"Generated by `harness/bench.py`{how}. Medians over the edits; times in ms.", "",
              "| Bench | Fast-tier functions | Apply edit | Re-analysis + codegen | Link | rustd total | cargo | Daemon RSS | Cold load + codegen |",
              "|---|---|---|---|---|---|---|---|---|"]
     for name, r in results.items():
+        spliced = f" ({r['spliced']}/{r['edits']} spliced)" if "spliced" in r else ""
         lines.append(
             f"| {name} | {r['compiled']} / {r['functions']} | {r['apply_ms']:.2f} | {r['codegen_ms']:.1f} | "
-            f"{r['link_ms']:.0f} | {r['total_ms']:.0f} | {r['cargo_ms']:.0f} | {r['rss_mb']} MB | "
+            f"{r['link_ms']:.0f}{spliced} | {r['total_ms']:.0f} | {r['cargo_ms']:.0f} | {r['rss_mb']} MB | "
             f"{r['cold']['load_ms'] + r['cold']['codegen_ms']:.0f} |")
-    open(os.path.join(HERE, "BENCH.md"), "w").write("\n".join(lines) + "\n")
+    open(os.path.join(HERE, f"BENCH{suffix}.md"), "w").write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

@@ -657,6 +657,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             }
 
             // `Fn()`-style generics are treated like functions for the purpose of lifetime elision.
+            self.ctx.bound_is_signature();
             self.ctx.lifetime_elision =
                 LifetimeElisionKind::AnonymousCreateParameter { report_in_path: false };
         }
@@ -762,6 +763,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 }
             }
 
+            fn elided_lifetime(&mut self) -> Option<Region<'db>> {
+                self.ctx.ctx.elided_lifetime()
+            }
+
             fn inferred_kind(
                 &mut self,
                 def: GenericDefId,
@@ -780,7 +785,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 let span = if !infer_args || had_count_error { Span::Dummy } else { self.span };
                 match param {
                     GenericParamDataRef::LifetimeParamData(_) => {
-                        self.ctx.ctx.next_region_var(span).into()
+                        match self.ctx.ctx.elided_lifetime() {
+                            Some(region) => region.into(),
+                            None => self.ctx.ctx.next_region_var(span).into(),
+                        }
                     }
                     GenericParamDataRef::TypeParamData(param) => {
                         if !infer_args
@@ -951,8 +959,13 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                 _,
                                 ImplTraitLoweringMode::Disallowed | ImplTraitLoweringMode::Opaque,
                             ) => {
-                                let ty = this.ctx.lower_ty(type_ref);
-                                let bound_vars = this.ctx.peek_bound_vars();
+                                let ty = match args_and_bindings.parenthesized {
+                                    GenericArgsParentheses::ParenSugar => {
+                                        this.ctx.in_return_type(|ctx| ctx.lower_ty(type_ref))
+                                    }
+                                    _ => this.ctx.lower_ty(type_ref),
+                                };
+                                let bound_vars = this.ctx.bound_vars_with_elided();
                                 let pred = Clause(Predicate::new(
                                     interner,
                                     Binder::bind_with_vars(
@@ -1053,6 +1066,11 @@ pub(crate) trait GenericArgsLowerer<'db> {
     ) -> GenericArg<'db>;
 
     fn parent_arg(&mut self, param_idx: u32, param_id: GenericParamId) -> GenericArg<'db>;
+
+    /// The lifetime a path leaves out, when a signature around it binds that.
+    fn elided_lifetime(&mut self) -> Option<Region<'db>> {
+        None
+    }
 }
 
 /// Returns true if there was an error.
@@ -1361,7 +1379,9 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                         LifetimeElisionKind::StaticIfNoLifetimeInScope { only_lint: _ } => {
                             Region::new_static(interner).into()
                         }
-                        LifetimeElisionKind::Elided(lifetime) => (*lifetime).into(),
+                        LifetimeElisionKind::Elided(lifetime) => {
+                            ctx.elided_lifetime().unwrap_or(*lifetime).into()
+                        }
                         LifetimeElisionKind::AnonymousCreateParameter { report_in_path: false }
                         | LifetimeElisionKind::Infer => {
                             // FIXME: With `AnonymousCreateParameter`, we need to create a new lifetime parameter here

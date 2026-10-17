@@ -184,7 +184,10 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             ItemContainerId::ExternBlockId(_) => return None,
         };
         let name = &FunctionSignature::of(db, func).name;
-        Some(parent.child(DefPathData::ValueNs(name.as_str())))
+        // `#[test]` and `#[bench]` put a constant of the function's name ahead of it.
+        let flags = AttrFlags::query(db, func.into());
+        let earlier = u32::from(flags.intersects(AttrFlags::IS_TEST | AttrFlags::IS_BENCH));
+        Some(parent.child_at(DefPathData::ValueNs(name.as_str()), earlier))
     }
 
     fn assoc_type_path(&self, alias: TypeAliasId) -> Option<Fingerprint> {
@@ -299,6 +302,15 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 });
             }
             TyKind::Adt(adt, args) => {
+                // `Ref<'a, dyn Trait>` is `Ref<'a, dyn Trait + 'a>` to rustc and `+ 'static`
+                // here, which only matters where a signature binds the `'a`.
+                let lifetimes = args.iter().any(|arg| arg.region().is_some());
+                let object = args
+                    .iter()
+                    .any(|arg| matches!(arg.ty().map(|ty| ty.kind()), Some(TyKind::Dynamic(..))));
+                if self.signatures > 0 && lifetimes && object {
+                    return None;
+                }
                 hasher.write_isize(5);
                 self.adt_def(adt.def_id())?.hash(hasher);
                 self.args(args)?.hash(hasher);
@@ -332,7 +344,11 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                     return None;
                 }
                 self.function_path(func)?.hash(hasher);
-                self.args(args)?.hash(hasher);
+                // The arguments are under a binder, which binds nothing.
+                self.binder(hasher, |this, hasher| {
+                    this.args(args)?.hash(hasher);
+                    Some(())
+                })?;
             }
             TyKind::Closure(id, args) => {
                 hasher.write_isize(17);
@@ -340,9 +356,19 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                 self.args(parent)?.hash(hasher);
             }
+            TyKind::CoroutineClosure(id, args) => {
+                hasher.write_isize(18);
+                self.closure(hasher, id.0.loc(self.db))?;
+                let parent = args.as_coroutine_closure().parent_args();
+                self.args(GenericArgs::new_from_slice(parent))?.hash(hasher);
+            }
             TyKind::Coroutine(id, args) => {
                 hasher.write_isize(19);
                 self.closure(hasher, id.0.loc(self.db))?;
+                // The future of an `async` closure is another type when it owns what the
+                // closure captured.
+                let by_move = crate::mir::is_by_move_coroutine(self.db, id.0, args.as_coroutine());
+                hasher.write_u8(by_move.into());
                 let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
                 self.args(parent)?.hash(hasher);
             }
@@ -365,6 +391,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 let safe = u8::from(header.safety().is_safe()) << 6;
                 let variadic = u8::from(header.c_variadic()) << 7;
                 hasher.write_u8(abi | safe | variadic);
+                // No argument is splatted: the syntax is unstable.
+                hasher.write_u8(u8::MAX);
             }
             TyKind::Dynamic(predicates, region) => {
                 hasher.write_isize(16);
@@ -468,7 +496,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// A lifetime, which is erased unless a binder in the type binds it.
     fn region(&mut self, hasher: &mut StableSipHasher128, region: Region<'db>) -> Option<()> {
         let RegionKind::ReBound(index, bound) = region.kind() else {
-            if self.signatures > 0 {
+            // An error in a signature is a lifetime nothing settled, which rustc may have bound.
+            if self.signatures > 0 && region.is_error() {
                 return None;
             }
             // `ReErased`.
@@ -499,7 +528,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         hasher.write_isize(0);
         hasher.write_isize(0);
         hasher.write_u128(value);
-        hasher.write_u8(8);
+        hasher.write_u8(super::Target::current().word() as u8);
         Some(())
     }
 
@@ -714,6 +743,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                     self.module(module)?.hash(hasher);
                 }
             }
+            // Its `mut` is not restricted: the syntax is unstable.
+            hasher.write_isize(0);
             hasher.write_isize(if field.is_unsafe { 0 } else { 1 });
             hasher.write_u8(0);
         }

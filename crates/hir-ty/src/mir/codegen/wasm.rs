@@ -1,2725 +1,2449 @@
-//! WebAssembly (`wasm32-unknown-unknown`) backend for `rustd`.
+//! Lowers one function of Cranelift IR to a WebAssembly function body.
 //!
-//! Translates Cranelift IR (`cranelift_codegen::ir::Function`) produced by `FunctionCx` into
-//! WebAssembly bytecode and stitches compiled functions and data into a relocatable Wasm `.o`
-//! object file (`linking` + `reloc.CODE` + `reloc.DATA`) that links with `wild -flavor wasm`
-//! or `wasm-ld`.
+//! Cranelift has no WebAssembly backend, so this takes the IR the rest of codegen builds and
+//! writes wasm from it directly. The target is `wasm32`, so an address is an `i32`.
+//!
+//! What comes out is not a module. A [`WasmFunction`] names the functions and data it uses
+//! through relocations, like machine code does, and a linker gives them places:
+//!
+//! - a call names the function ([`Calls::Direct`]) or goes through the function's slot in
+//!   the function table ([`Calls::Table`]), so that a function is replaced by writing its
+//!   slot;
+//! - the address of a function is its slot, the address of data is where the linker put it
+//!   in linear memory;
+//! - stack slots live on the stack in linear memory, whose pointer is the global
+//!   `__stack_pointer`.
+//!
+//! The signatures are the ones LLVM gives the same functions, since the code is linked with
+//! rustc's: a function that returns more than one value, or an `i128`, writes them through
+//! a pointer it takes ahead of its parameters.
+//!
+//! Unwinding is not lowered: the exceptional edges of `try_call` are dropped, which is what
+//! `panic=abort` means, and the wasm targets rustc has are built that way.
 
 use cranelift_codegen::{
-    binemit::{CodeOffset, Reloc},
+    entity::{EntityRef, SecondaryMap},
     ir::{
-        self, Block, ExternalName, GlobalValue, GlobalValueData, InstructionData,
-        JumpTableData, Opcode, StackSlot, Type, Value,
+        self, AtomicRmwOp, Block, BlockArg, BlockCall, ExternalName, Function, GlobalValueData,
+        InstructionData, LibCall, Opcode, Signature, Type, Value,
         condcodes::{FloatCC, IntCC},
-        immediates::Offset32,
         types,
     },
 };
-use cranelift_module::{
-    DataId, FuncId, Linkage, ModuleDeclarations, ModuleReloc, ModuleRelocTarget,
-};
-use rustc_hash::FxHashMap;
+use cranelift_module::{ModuleReloc, ModuleRelocTarget};
+use serde_derive::{Deserialize, Serialize};
+use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 
-use super::{Code, CodegenError, ConstBlob, Result};
+use super::target::Calls;
 
-const WASM_VAL_I32: u8 = 0x7f;
-const WASM_VAL_I64: u8 = 0x7e;
-const WASM_VAL_F32: u8 = 0x7d;
-const WASM_VAL_F64: u8 = 0x7c;
-const WASM_BLOCK_EMPTY: u8 = 0x40;
+/// How many bytes an operand a linker fills in takes: a LEB128 padded to full length.
+pub const INDEX_LEN: usize = 5;
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct WasmSig {
-    params: Vec<WasmType>,
-    returns: Vec<WasmType>,
+/// The relocation of a `call` operand: the index of the function. The other relocation
+/// here, `Abs4`, is of an `i32.const` operand: the address of data, or the slot of a function.
+pub(super) const CALL: cranelift_codegen::binemit::Reloc =
+    cranelift_codegen::binemit::Reloc::X86CallPCRel4;
+
+/// A value type, as its byte in the binary format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum WasmType {
+    I32 = 0x7f,
+    I64 = 0x7e,
+    F32 = 0x7d,
+    F64 = 0x7c,
 }
 
-impl WasmSig {
-    fn of(sig: &ir::Signature) -> std::result::Result<Self, String> {
+impl From<WasmType> for ValType {
+    fn from(ty: WasmType) -> ValType {
+        match ty {
+            WasmType::I32 => ValType::I32,
+            WasmType::I64 => ValType::I64,
+            WasmType::F32 => ValType::F32,
+            WasmType::F64 => ValType::F64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WasmSignature {
+    pub params: Vec<WasmType>,
+    pub results: Vec<WasmType>,
+}
+
+impl WasmSignature {
+    pub fn of(sig: &Signature) -> Result<WasmSignature, String> {
         let mut params = Vec::new();
-        for p in &sig.params {
-            if p.value_type == types::I128 {
-                params.push(WasmType::I64);
-                params.push(WasmType::I64);
-            } else {
-                params.push(WasmType::of(p.value_type)?);
+        let returned = Returned::of(sig)?;
+        if let Returned::Through(_) = returned {
+            params.push(WasmType::I32);
+        }
+        for param in &sig.params {
+            match Class::of(param.value_type)? {
+                Class::Pair => params.extend([WasmType::I64, WasmType::I64]),
+                class => params.push(class.wasm()),
             }
         }
-        let mut returns = Vec::new();
-        for p in &sig.returns {
-            if p.value_type == types::I128 {
-                returns.push(WasmType::I64);
-                returns.push(WasmType::I64);
-            } else {
-                returns.push(WasmType::of(p.value_type)?);
-            }
-        }
-        Ok(WasmSig { params, returns })
+        let results = match returned {
+            Returned::Value(class) => vec![class.wasm()],
+            Returned::Nothing | Returned::Through(_) => Vec::new(),
+        };
+        Ok(WasmSignature { params, results })
     }
 }
 
-static INTERNED_SIGS: std::sync::OnceLock<std::sync::Mutex<Vec<WasmSig>>> =
-    std::sync::OnceLock::new();
+/// How a function hands back what it returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Returned {
+    Nothing,
+    Value(Class),
+    /// Written through a pointer that is the first parameter, each value at its offset: what
+    /// LLVM does with a return of several values or of an `i128` where a wasm function has
+    /// one result of one of four types.
+    Through(Vec<(u64, Class)>),
+}
 
-fn intern_global_wsig(sig: &ir::Signature) -> std::result::Result<u32, String> {
-    let wsig = WasmSig::of(sig)?;
-    let mut list = INTERNED_SIGS.get_or_init(Default::default).lock().unwrap();
-    if let Some(pos) = list.iter().position(|s| s == &wsig) {
-        return Ok(pos as u32);
+impl Returned {
+    /// The bytes a caller sets aside for [`Returned::Through`], and their alignment.
+    const SPACE: u64 = 64;
+    const ALIGN: u64 = 16;
+
+    fn of(sig: &Signature) -> Result<Returned, String> {
+        let classes: Vec<Class> =
+            sig.returns.iter().map(|it| Class::of(it.value_type)).collect::<Result<_, _>>()?;
+        match classes[..] {
+            [] => return Ok(Returned::Nothing),
+            [class] if class != Class::Pair => return Ok(Returned::Value(class)),
+            _ => {}
+        }
+        // The fields of the struct the values are to LLVM, each aligned to its size.
+        let mut end = 0u64;
+        let mut places = Vec::new();
+        for class in classes {
+            let size = class.bytes();
+            let at = end.next_multiple_of(size);
+            places.push((at, class));
+            end = at + size;
+        }
+        if end > Returned::SPACE {
+            return Err("wasm: more returned values than there is room for".to_owned());
+        }
+        Ok(Returned::Through(places))
     }
-    let idx = list.len() as u32;
-    list.push(wsig);
-    Ok(idx)
 }
 
-fn get_global_wsig(idx: u32) -> WasmSig {
-    let list = INTERNED_SIGS.get_or_init(Default::default).lock().unwrap();
-    list[idx as usize].clone()
+/// A function body with what a linker has to fill in.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WasmFunction {
+    pub signature: WasmSignature,
+    /// The signatures of the indirect calls in the body.
+    pub types: Vec<WasmSignature>,
+    /// Where the body has a type index to fill in, and which of `types` it is. Each place is
+    /// [`INDEX_LEN`] bytes.
+    pub type_fixups: Vec<(u32, u32)>,
+    /// Where the body has the index of the stack pointer's global to fill in.
+    pub stack_pointer_fixups: Vec<u32>,
+    /// Local declarations and instructions, as the code section has them after the size.
+    pub body: Vec<u8>,
 }
-const R_WASM_FUNCTION_INDEX_LEB: u8 = 0;
-const R_WASM_TABLE_INDEX_SLEB: u8 = 1;
-const R_WASM_TABLE_INDEX_I32: u8 = 2;
-const R_WASM_MEMORY_ADDR_SLEB: u8 = 4;
-const R_WASM_MEMORY_ADDR_I32: u8 = 5;
-const R_WASM_TYPE_INDEX_LEB: u8 = 6;
-const R_WASM_GLOBAL_INDEX_LEB: u8 = 7;
 
-// Internal Reloc tags used inside `ModuleReloc` to carry Wasm relocation kinds.
-const RELOC_FN_LEB: Reloc = Reloc::X86CallPLTRel4;
-const RELOC_TABLE_SLEB: Reloc = Reloc::Abs4;
-const RELOC_MEM_SLEB: Reloc = Reloc::Abs8;
-const RELOC_TYPE_LEB: Reloc = Reloc::S390xTlsGdCall;
-const RELOC_SP_GLOBAL_LEB: Reloc = Reloc::ElfX86_64TlsGd;
+impl WasmFunction {
+    /// The bytes that stand for the function where machine code would, and where in them
+    /// `body` starts: relocations are counted from the start of these.
+    pub fn encode(&self) -> Result<(Vec<u8>, u32), String> {
+        let header = WasmFunction { body: Vec::new(), ..self.clone_header() };
+        let header = postcard::to_allocvec(&header).map_err(|e| e.to_string())?;
+        let mut bytes = (header.len() as u32).to_le_bytes().to_vec();
+        bytes.extend(header);
+        let start = bytes.len() as u32;
+        bytes.extend(&self.body);
+        Ok((bytes, start))
+    }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum WasmType {
-    I32,
-    I64,
+    /// Reads what [`Self::encode`] wrote. The second value is where the body starts in
+    /// `bytes`.
+    pub fn decode(bytes: &[u8]) -> Result<(WasmFunction, usize), String> {
+        let len = bytes.first_chunk::<4>().ok_or("truncated function")?;
+        let start = 4 + u32::from_le_bytes(*len) as usize;
+        let header = bytes.get(4..start).ok_or("truncated function header")?;
+        let mut function: WasmFunction = postcard::from_bytes(header).map_err(|e| e.to_string())?;
+        function.body = bytes[start..].to_vec();
+        Ok((function, start))
+    }
+
+    fn clone_header(&self) -> WasmFunction {
+        WasmFunction {
+            signature: self.signature.clone(),
+            types: self.types.clone(),
+            type_fixups: self.type_fixups.clone(),
+            stack_pointer_fixups: self.stack_pointer_fixups.clone(),
+            body: Vec::new(),
+        }
+    }
+}
+
+/// Lowers `func`. The relocations are relative to the start of the body.
+pub(super) fn lower(
+    func: &Function,
+    calls: Calls,
+) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
+    Lower::new(func, calls)?.run()
+}
+
+/// How a Cranelift type is held in wasm locals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// `i8`, `i16` and `i32` in an `i32`, the narrow ones zero-extended.
+    Word(u8),
+    Long,
+    /// `i128` in two `i64`, low half first.
+    Pair,
     F32,
     F64,
 }
 
-impl WasmType {
-    fn of(ty: Type) -> std::result::Result<Self, String> {
-        if ty == types::I8 || ty == types::I16 || ty == types::I32 {
-            Ok(WasmType::I32)
-        } else if ty == types::I64 {
-            Ok(WasmType::I64)
-        } else if ty == types::F32 {
-            Ok(WasmType::F32)
-        } else if ty == types::F64 {
-            Ok(WasmType::F64)
-        } else {
-            Err(format!("unsupported type {ty} in wasm backend"))
-        }
+impl Class {
+    fn of(ty: Type) -> Result<Class, String> {
+        Ok(match ty {
+            types::I8 => Class::Word(8),
+            types::I16 => Class::Word(16),
+            types::I32 => Class::Word(32),
+            types::I64 => Class::Long,
+            types::I128 => Class::Pair,
+            types::F32 => Class::F32,
+            types::F64 => Class::F64,
+            _ => return Err(format!("wasm: type {ty}")),
+        })
     }
 
-    fn byte(self) -> u8 {
+    fn wasm(self) -> WasmType {
         match self {
-            WasmType::I32 => WASM_VAL_I32,
-            WasmType::I64 => WASM_VAL_I64,
-            WasmType::F32 => WASM_VAL_F32,
-            WasmType::F64 => WASM_VAL_F64,
+            Class::Word(_) => WasmType::I32,
+            Class::Long | Class::Pair => WasmType::I64,
+            Class::F32 => WasmType::F32,
+            Class::F64 => WasmType::F64,
+        }
+    }
+
+    fn narrow(self) -> Option<u8> {
+        match self {
+            Class::Word(bits @ (8 | 16)) => Some(bits),
+            _ => None,
+        }
+    }
+
+    fn is_long(self) -> bool {
+        self == Class::Long
+    }
+
+    /// How many bytes the value is in memory.
+    fn bytes(self) -> u64 {
+        match self {
+            Class::Word(bits) => u64::from(bits / 8),
+            Class::F32 => 4,
+            Class::Long | Class::F64 => 8,
+            Class::Pair => 16,
         }
     }
 }
 
-fn write_uleb(buf: &mut Vec<u8>, mut val: u64) {
-    loop {
-        let mut byte = (val & 0x7f) as u8;
-        val >>= 7;
-        if val != 0 {
-            byte |= 0x80;
-        }
-        buf.push(byte);
-        if val == 0 {
-            break;
-        }
-    }
+/// An integer operation that `i32` and `i64` both have.
+#[derive(Clone, Copy)]
+enum Op {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Shl,
+    ShrU,
+    ShrS,
+    Rotl,
+    Rotr,
+    DivU,
+    DivS,
+    RemU,
+    RemS,
+    Eq,
+    Ne,
+    LtU,
+    LtS,
+    GtU,
+    GtS,
+    LeU,
+    LeS,
+    GeU,
+    GeS,
+    Popcnt,
 }
 
-fn write_sleb(buf: &mut Vec<u8>, mut val: i64) {
-    loop {
-        let byte = (val & 0x7f) as u8;
-        val >>= 7;
-        let done = (val == 0 && (byte & 0x40) == 0) || (val == -1 && (byte & 0x40) != 0);
-        if done {
-            buf.push(byte);
-            break;
-        }
-        buf.push(byte | 0x80);
-    }
-}
-
-fn write_uleb_5(buf: &mut [u8], val: u32) {
-    buf[0] = ((val & 0x7f) as u8) | 0x80;
-    buf[1] = (((val >> 7) & 0x7f) as u8) | 0x80;
-    buf[2] = (((val >> 14) & 0x7f) as u8) | 0x80;
-    buf[3] = (((val >> 21) & 0x7f) as u8) | 0x80;
-    buf[4] = ((val >> 28) & 0x0f) as u8;
-}
-
-fn write_sleb_5(buf: &mut [u8], val: i32) {
-    let v = val as u32;
-    buf[0] = ((v & 0x7f) as u8) | 0x80;
-    buf[1] = (((v >> 7) & 0x7f) as u8) | 0x80;
-    buf[2] = (((v >> 14) & 0x7f) as u8) | 0x80;
-    buf[3] = (((v >> 21) & 0x7f) as u8) | 0x80;
-    let last = ((v >> 28) & 0x0f) as u8;
-    let sign = if val < 0 { 0x70 } else { 0x00 };
-    buf[4] = last | sign;
-}
-
-fn write_str(buf: &mut Vec<u8>, s: &str) {
-    write_uleb(buf, s.len() as u64);
-    buf.extend_from_slice(s.as_bytes());
-}
-
-/// Compiles a single Cranelift IR `Function` into WebAssembly function body bytes + relocations.
-pub(super) fn emit_function(func: &ir::Function) -> std::result::Result<Code, String> {
-    if func.signature.returns.len() > 1 {
-        return Err("multi-value return unsupported in wasm backend".to_owned());
-    }
-    let blocks: Vec<Block> = func.layout.blocks().collect();
-    if blocks.is_empty() {
-        return Err("empty function".to_owned());
-    }
-    let entry_block = blocks[0];
-    let entry_params = func.dfg.block_params(entry_block);
-    if entry_params.len() != func.signature.params.len() {
-        return Err("entry block param count mismatch".to_owned());
-    }
-
-    let mut block_indices: FxHashMap<Block, u32> = FxHashMap::default();
-    for (idx, &b) in blocks.iter().enumerate() {
-        block_indices.insert(b, idx as u32);
-    }
-
-    // Stack frame layout for StackSlots.
-    let mut slot_offsets: FxHashMap<StackSlot, u32> = FxHashMap::default();
-    let mut frame_size = 0u32;
-    for (slot, data) in func.sized_stack_slots.iter() {
-        let align = (1u32 << data.align_shift).max(1);
-        frame_size = (frame_size + align - 1) & !(align - 1);
-        slot_offsets.insert(slot, frame_size);
-        frame_size = frame_size.saturating_add(data.size);
-    }
-    if !func.sized_stack_slots.is_empty() && frame_size == 0 {
-        frame_size = 16;
-    }
-    frame_size = (frame_size + 15) & !15;
-
-    // Assign Wasm local indices to all SSA values.
-    // An `I128` value occupies two consecutive `I64` locals `(lo, lo + 1)`.
-    let mut value_locals: FxHashMap<Value, u32> = FxHashMap::default();
-    let mut local_types: Vec<WasmType> = Vec::new();
-    let mut num_params = 0u32;
-
-    for &val in entry_params {
-        let ty = func.dfg.value_type(val);
-        value_locals.insert(val, num_params);
-        if ty == types::I128 {
-            num_params += 2;
-        } else {
-            let _ = WasmType::of(ty)?;
-            num_params += 1;
+impl Op {
+    fn compare(cond: IntCC) -> Op {
+        match cond {
+            IntCC::Equal => Op::Eq,
+            IntCC::NotEqual => Op::Ne,
+            IntCC::SignedLessThan => Op::LtS,
+            IntCC::SignedGreaterThanOrEqual => Op::GeS,
+            IntCC::SignedGreaterThan => Op::GtS,
+            IntCC::SignedLessThanOrEqual => Op::LeS,
+            IntCC::UnsignedLessThan => Op::LtU,
+            IntCC::UnsignedGreaterThanOrEqual => Op::GeU,
+            IntCC::UnsignedGreaterThan => Op::GtU,
+            IntCC::UnsignedLessThanOrEqual => Op::LeU,
         }
     }
 
-    let mut alloc_local = |wty: WasmType| -> u32 {
-        let idx = num_params + local_types.len() as u32;
-        local_types.push(wty);
-        idx
-    };
+    fn is_signed(self) -> bool {
+        matches!(self, Op::ShrS | Op::DivS | Op::RemS | Op::LtS | Op::GtS | Op::LeS | Op::GeS)
+    }
 
-    for &b in &blocks {
-        if b != entry_block {
-            for &val in func.dfg.block_params(b) {
-                let ty = func.dfg.value_type(val);
-                if ty == types::I128 {
-                    let lo = alloc_local(WasmType::I64);
-                    let _hi = alloc_local(WasmType::I64);
-                    value_locals.insert(val, lo);
-                } else {
-                    let wty = WasmType::of(ty)?;
-                    let l = alloc_local(wty);
-                    value_locals.insert(val, l);
-                }
+    /// The comparison without its `or equal`, and unsigned: what decides between two wide
+    /// integers whose high halves are equal.
+    fn strict_unsigned(self) -> Op {
+        match self {
+            Op::LtS | Op::LtU | Op::LeS | Op::LeU => Op::LtU,
+            _ => Op::GtU,
+        }
+    }
+
+    fn strict(self) -> Op {
+        match self {
+            Op::LeS => Op::LtS,
+            Op::LeU => Op::LtU,
+            Op::GeS => Op::GtS,
+            Op::GeU => Op::GtU,
+            other => other,
+        }
+    }
+
+    fn or_equal(self) -> bool {
+        matches!(self, Op::LeS | Op::LeU | Op::GeS | Op::GeU)
+    }
+
+    fn instruction(self, long: bool) -> I<'static> {
+        match (self, long) {
+            (Op::Add, false) => I::I32Add,
+            (Op::Add, true) => I::I64Add,
+            (Op::Sub, false) => I::I32Sub,
+            (Op::Sub, true) => I::I64Sub,
+            (Op::Mul, false) => I::I32Mul,
+            (Op::Mul, true) => I::I64Mul,
+            (Op::And, false) => I::I32And,
+            (Op::And, true) => I::I64And,
+            (Op::Or, false) => I::I32Or,
+            (Op::Or, true) => I::I64Or,
+            (Op::Xor, false) => I::I32Xor,
+            (Op::Xor, true) => I::I64Xor,
+            (Op::Shl, false) => I::I32Shl,
+            (Op::Shl, true) => I::I64Shl,
+            (Op::ShrU, false) => I::I32ShrU,
+            (Op::ShrU, true) => I::I64ShrU,
+            (Op::ShrS, false) => I::I32ShrS,
+            (Op::ShrS, true) => I::I64ShrS,
+            (Op::Rotl, false) => I::I32Rotl,
+            (Op::Rotl, true) => I::I64Rotl,
+            (Op::Rotr, false) => I::I32Rotr,
+            (Op::Rotr, true) => I::I64Rotr,
+            (Op::DivU, false) => I::I32DivU,
+            (Op::DivU, true) => I::I64DivU,
+            (Op::DivS, false) => I::I32DivS,
+            (Op::DivS, true) => I::I64DivS,
+            (Op::RemU, false) => I::I32RemU,
+            (Op::RemU, true) => I::I64RemU,
+            (Op::RemS, false) => I::I32RemS,
+            (Op::RemS, true) => I::I64RemS,
+            (Op::Eq, false) => I::I32Eq,
+            (Op::Eq, true) => I::I64Eq,
+            (Op::Ne, false) => I::I32Ne,
+            (Op::Ne, true) => I::I64Ne,
+            (Op::LtU, false) => I::I32LtU,
+            (Op::LtU, true) => I::I64LtU,
+            (Op::LtS, false) => I::I32LtS,
+            (Op::LtS, true) => I::I64LtS,
+            (Op::GtU, false) => I::I32GtU,
+            (Op::GtU, true) => I::I64GtU,
+            (Op::GtS, false) => I::I32GtS,
+            (Op::GtS, true) => I::I64GtS,
+            (Op::LeU, false) => I::I32LeU,
+            (Op::LeU, true) => I::I64LeU,
+            (Op::LeS, false) => I::I32LeS,
+            (Op::LeS, true) => I::I64LeS,
+            (Op::GeU, false) => I::I32GeU,
+            (Op::GeU, true) => I::I64GeU,
+            (Op::GeS, false) => I::I32GeS,
+            (Op::GeS, true) => I::I64GeS,
+            (Op::Popcnt, false) => I::I32Popcnt,
+            (Op::Popcnt, true) => I::I64Popcnt,
+        }
+    }
+}
+
+struct Lower<'a> {
+    func: &'a Function,
+    calls: Calls,
+    signature: WasmSignature,
+    returned: Returned,
+    /// Where in the frame the values are written that a called function returns through a
+    /// pointer.
+    returned_at: Option<u64>,
+    /// The blocks a jump reaches. The others are where a call unwinds to.
+    reachable: SecondaryMap<Block, bool>,
+    code: Vec<u8>,
+    /// The locals after the parameters.
+    locals: Vec<ValType>,
+    param_count: u32,
+    /// The first local of each value, plus one.
+    values: SecondaryMap<Value, u32>,
+    /// The place of each block in the layout, plus one.
+    order: SecondaryMap<Block, u32>,
+    block_count: u32,
+    /// The local that says which block runs next, when a block jumps backwards.
+    next_block: Option<u32>,
+    /// The local that holds the address of the stack slots, and their size together.
+    frame: Option<(u32, u64)>,
+    slot_offsets: Vec<u64>,
+    relocs: Vec<ModuleReloc>,
+    types: Vec<WasmSignature>,
+    type_fixups: Vec<(u32, u32)>,
+    stack_pointer_fixups: Vec<u32>,
+}
+
+const MEMORY: u32 = 0;
+
+fn mem(offset: u64) -> MemArg {
+    MemArg { offset, align: 0, memory_index: MEMORY }
+}
+
+impl<'a> Lower<'a> {
+    fn new(func: &'a Function, calls: Calls) -> Result<Self, String> {
+        let signature = WasmSignature::of(&func.signature)?;
+        let returned = Returned::of(&func.signature)?;
+        let mut order = SecondaryMap::new();
+        let mut block_count = 0;
+        for block in func.layout.blocks() {
+            block_count += 1;
+            order[block] = block_count;
+        }
+        let mut slot_offsets = Vec::new();
+        let mut size = 0u64;
+        for (_, slot) in func.sized_stack_slots.iter() {
+            let align = 1u64 << slot.align_shift;
+            size = size.next_multiple_of(align);
+            slot_offsets.push(size);
+            size += u64::from(slot.size);
+        }
+        if func.dynamic_stack_slots.iter().next().is_some() {
+            return Err("wasm: dynamic stack slot".to_owned());
+        }
+        let mut returned_at = None;
+        for (_, called) in func.dfg.signatures.iter() {
+            if let Returned::Through(_) = Returned::of(called)? {
+                size = size.next_multiple_of(Returned::ALIGN);
+                returned_at = Some(size);
+                size += Returned::SPACE;
+                break;
             }
         }
-        let mut inst_opt = func.layout.first_inst(b);
-        while let Some(inst) = inst_opt {
-            for &res in func.dfg.inst_results(inst) {
-                let ty = func.dfg.value_type(res);
-                if ty == types::I128 {
-                    let lo = alloc_local(WasmType::I64);
-                    let _hi = alloc_local(WasmType::I64);
-                    value_locals.insert(res, lo);
-                } else {
-                    let wty = WasmType::of(ty)?;
-                    let l = alloc_local(wty);
-                    value_locals.insert(res, l);
+        let mut this = Lower {
+            func,
+            calls,
+            returned,
+            returned_at,
+            reachable: Self::reachable(func),
+            param_count: signature.params.len() as u32,
+            signature,
+            code: Vec::new(),
+            locals: Vec::new(),
+            values: SecondaryMap::new(),
+            order,
+            block_count,
+            next_block: None,
+            frame: None,
+            slot_offsets,
+            relocs: Vec::new(),
+            types: Vec::new(),
+            type_fixups: Vec::new(),
+            stack_pointer_fixups: Vec::new(),
+        };
+        if size != 0 || !this.slot_offsets.is_empty() {
+            let frame = this.temp(ValType::I32);
+            this.frame = Some((frame, size.next_multiple_of(16)));
+        }
+        Ok(this)
+    }
+
+    fn run(mut self) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
+        let func = self.func;
+        let Some(entry) = func.layout.entry_block() else {
+            return Err("wasm: function without blocks".to_owned());
+        };
+        // The parameters of the entry block are the parameters of the function, after the
+        // pointer it returns through.
+        let mut local = if let Returned::Through(_) = self.returned { 1 } else { 0 };
+        for &param in func.dfg.block_params(entry) {
+            self.values[param] = local + 1;
+            let class = self.class(param)?;
+            if let Some(bits) = class.narrow() {
+                // Whoever calls from outside may leave anything in the upper bits.
+                self.i(I::LocalGet(local));
+                self.mask(bits);
+                self.i(I::LocalSet(local));
+            }
+            local += if class == Class::Pair { 2 } else { 1 };
+        }
+        if local != self.param_count {
+            return Err("wasm: entry block and signature disagree".to_owned());
+        }
+        if let Some((frame, size)) = self.frame {
+            self.stack_pointer(false);
+            self.i(I::I32Const(size as i32));
+            self.i(I::I32Sub);
+            self.i(I::LocalTee(frame));
+            self.stack_pointer(true);
+        }
+
+        // Blocks are laid out one after the other, each inside a wasm block that ends where
+        // it starts, so a jump forwards is a `br` out of the blocks in between. A jump
+        // backwards sets which block is next and goes around a loop that holds all of them,
+        // where a `br_table` finds the block. That is right for any control flow graph,
+        // reducible or not, and costs only on the edges that go backwards.
+        let backwards = func.layout.blocks().any(|block| {
+            let from = self.order[block];
+            func.layout.last_inst(block).is_some_and(|last| {
+                func.dfg.insts[last]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .any(|call| self.order[call.block(&func.dfg.value_lists)] <= from)
+            })
+        });
+        if backwards {
+            self.next_block = Some(self.temp(ValType::I32));
+            self.i(I::Loop(BlockType::Empty));
+        }
+        for _ in 0..self.block_count {
+            self.i(I::Block(BlockType::Empty));
+        }
+        if let Some(next) = self.next_block {
+            self.i(I::LocalGet(next));
+            let targets: Vec<u32> = (0..self.block_count).collect();
+            self.i(I::BrTable(targets.into(), 0));
+        }
+        for block in func.layout.blocks() {
+            self.i(I::End);
+            if !self.reachable[block] {
+                self.i(I::Unreachable);
+                continue;
+            }
+            for inst in func.layout.block_insts(block) {
+                self.inst(block, inst)?;
+            }
+        }
+        if backwards {
+            self.i(I::End);
+        }
+        self.i(I::Unreachable);
+        self.i(I::End);
+
+        let mut body = Vec::new();
+        // Runs of the same type, as the format wants them.
+        let mut runs: Vec<(u32, ValType)> = Vec::new();
+        for &ty in &self.locals {
+            match runs.last_mut() {
+                Some((count, last)) if *last == ty => *count += 1,
+                _ => runs.push((1, ty)),
+            }
+        }
+        (runs.len() as u32).encode(&mut body);
+        for (count, ty) in runs {
+            count.encode(&mut body);
+            ty.encode(&mut body);
+        }
+        let start = body.len() as u32;
+        body.extend(self.code);
+        for reloc in &mut self.relocs {
+            reloc.offset += start;
+        }
+        for (offset, _) in &mut self.type_fixups {
+            *offset += start;
+        }
+        for offset in &mut self.stack_pointer_fixups {
+            *offset += start;
+        }
+        let function = WasmFunction {
+            signature: self.signature,
+            types: self.types,
+            type_fixups: self.type_fixups,
+            stack_pointer_fixups: self.stack_pointer_fixups,
+            body,
+        };
+        Ok((function, self.relocs))
+    }
+
+    /// The blocks reached from the entry without unwinding.
+    fn reachable(func: &Function) -> SecondaryMap<Block, bool> {
+        let mut reachable = SecondaryMap::new();
+        let mut pending: Vec<Block> = func.layout.entry_block().into_iter().collect();
+        while let Some(block) = pending.pop() {
+            if std::mem::replace(&mut reachable[block], true) {
+                continue;
+            }
+            let Some(last) = func.layout.last_inst(block) else { continue };
+            match func.dfg.insts[last] {
+                InstructionData::TryCall { exception, .. }
+                | InstructionData::TryCallIndirect { exception, .. } => {
+                    let returns = func.dfg.exception_tables[exception].normal_return();
+                    pending.push(returns.block(&func.dfg.value_lists));
+                }
+                data => pending.extend(
+                    data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                        .iter()
+                        .map(|call| call.block(&func.dfg.value_lists)),
+                ),
+            }
+        }
+        reachable
+    }
+
+    fn i(&mut self, instruction: I<'_>) {
+        instruction.encode(&mut self.code);
+    }
+
+    /// Reads the stack pointer, or writes it. Which global that is, a linker says.
+    fn stack_pointer(&mut self, write: bool) {
+        self.code.push(if write { 0x24 } else { 0x23 });
+        self.stack_pointer_fixups.push(self.code.len() as u32);
+        self.index_to_fill();
+    }
+
+    /// Leaves room for an index: a LEB128 of full length, so that any index fits.
+    fn index_to_fill(&mut self) {
+        self.code.extend([0x80; INDEX_LEN - 1]);
+        self.code.push(0);
+    }
+
+    fn temp(&mut self, ty: ValType) -> u32 {
+        self.locals.push(ty);
+        self.param_count + self.locals.len() as u32 - 1
+    }
+
+    fn ty(&self, value: Value) -> Type {
+        self.func.dfg.value_type(value)
+    }
+
+    fn class(&self, value: Value) -> Result<Class, String> {
+        Class::of(self.ty(value))
+    }
+
+    /// The first local of a value.
+    fn local(&mut self, value: Value) -> Result<u32, String> {
+        let value = self.func.dfg.resolve_aliases(value);
+        if self.values[value] != 0 {
+            return Ok(self.values[value] - 1);
+        }
+        let class = self.class(value)?;
+        let local = self.temp(class.wasm().into());
+        if class == Class::Pair {
+            self.temp(ValType::I64);
+        }
+        self.values[value] = local + 1;
+        Ok(local)
+    }
+
+    /// Pushes a value: both halves of a wide integer, the low one first.
+    fn get(&mut self, value: Value) -> Result<(), String> {
+        let local = self.local(value)?;
+        self.i(I::LocalGet(local));
+        if self.class(value)? == Class::Pair {
+            self.i(I::LocalGet(local + 1));
+        }
+        Ok(())
+    }
+
+    /// Pops a value pushed the way [`Self::get`] pushes.
+    fn set(&mut self, value: Value) -> Result<(), String> {
+        let local = self.local(value)?;
+        if self.class(value)? == Class::Pair {
+            self.i(I::LocalSet(local + 1));
+        }
+        self.i(I::LocalSet(local));
+        Ok(())
+    }
+
+    fn get_low(&mut self, value: Value) -> Result<(), String> {
+        let local = self.local(value)?;
+        self.i(I::LocalGet(local));
+        Ok(())
+    }
+
+    fn get_high(&mut self, value: Value) -> Result<(), String> {
+        let local = self.local(value)? + 1;
+        self.i(I::LocalGet(local));
+        Ok(())
+    }
+
+    /// Pushes a narrow value sign-extended to the `i32` it is held in.
+    fn get_signed(&mut self, value: Value) -> Result<(), String> {
+        self.get(value)?;
+        match self.class(value)?.narrow() {
+            Some(8) => self.i(I::I32Extend8S),
+            Some(_) => self.i(I::I32Extend16S),
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn get_for(&mut self, value: Value, signed: bool) -> Result<(), String> {
+        if signed { self.get_signed(value) } else { self.get(value) }
+    }
+
+    /// Clears the bits of the `i32` on the stack that a narrow integer has no use for.
+    fn mask(&mut self, bits: u8) {
+        self.i(I::I32Const(((1u32 << bits) - 1) as i32));
+        self.i(I::I32And);
+    }
+
+    fn mask_for(&mut self, class: Class) {
+        if let Some(bits) = class.narrow() {
+            self.mask(bits);
+        }
+    }
+
+    fn op(&mut self, op: Op, long: bool) {
+        self.i(op.instruction(long));
+    }
+
+    fn constant(&mut self, value: i64, long: bool) {
+        if long {
+            self.i(I::I64Const(value));
+        } else {
+            self.i(I::I32Const(value as i32));
+        }
+    }
+
+    /// Pushes whether a value is anything but zero.
+    fn truthy(&mut self, value: Value) -> Result<(), String> {
+        match self.class(value)? {
+            Class::Word(_) => self.get(value)?,
+            Class::Long => {
+                self.get(value)?;
+                self.i(I::I64Const(0));
+                self.i(I::I64Ne);
+            }
+            Class::Pair => {
+                self.get(value)?;
+                self.i(I::I64Or);
+                self.i(I::I64Const(0));
+                self.i(I::I64Ne);
+            }
+            Class::F32 | Class::F64 => return Err("wasm: float as a condition".to_owned()),
+        }
+        Ok(())
+    }
+
+    /// Pushes an integer as a shift amount for an operand that is an `i64` or is not.
+    fn amount(&mut self, value: Value, long: bool) -> Result<(), String> {
+        match (self.class(value)?, long) {
+            (Class::Word(_), false) | (Class::Long, true) => self.get(value)?,
+            (Class::Word(_), true) => {
+                self.get(value)?;
+                self.i(I::I64ExtendI32U);
+            }
+            (Class::Long, false) => {
+                self.get(value)?;
+                self.i(I::I32WrapI64);
+            }
+            (Class::Pair, _) => {
+                self.get_low(value)?;
+                if !long {
+                    self.i(I::I32WrapI64);
                 }
             }
-            inst_opt = func.layout.next_inst(inst);
+            _ => return Err("wasm: float as a shift amount".to_owned()),
         }
+        Ok(())
     }
 
-    let needs_cfg = blocks.len() > 1
-        || func
-            .layout
-            .last_inst(blocks[0])
-            .is_some_and(|i| func.dfg.insts[i].opcode().is_branch());
-    let fp_local = if frame_size > 0 { Some(alloc_local(WasmType::I32)) } else { None };
-    let bb_local = if needs_cfg { Some(alloc_local(WasmType::I32)) } else { None };
+    /// Pushes an address that a linker fills in.
+    fn address(&mut self, name: &ExternalName, addend: i64) -> Result<(), String> {
+        let ExternalName::User(name) = name else {
+            return Err(format!("wasm: address of {name:?}"));
+        };
+        let name = &self.func.params.user_named_funcs()[*name];
+        // `i32.const`, then the operand.
+        self.code.push(0x41);
+        self.relocs.push(ModuleReloc {
+            offset: self.code.len() as u32,
+            kind: cranelift_codegen::binemit::Reloc::Abs4,
+            name: ModuleRelocTarget::user(name.namespace, name.index),
+            addend,
+        });
+        self.index_to_fill();
+        Ok(())
+    }
 
-    // Encode locals header (run-length encoded).
-    let mut body = Vec::new();
-    let mut runs: Vec<(u32, WasmType)> = Vec::new();
-    for &wty in &local_types {
-        if let Some(last) = runs.last_mut()
-            && last.1 == wty
-        {
-            last.0 += 1;
-        } else {
-            runs.push((1, wty));
+    /// Calls the function `name` with the arguments on the stack.
+    fn call_named(&mut self, name: &ExternalName, signature: &Signature) -> Result<(), String> {
+        if self.calls == Calls::Table {
+            self.address(name, 0)?;
+            return self.call_slot(signature);
         }
-    }
-    write_uleb(&mut body, runs.len() as u64);
-    for (count, wty) in runs {
-        write_uleb(&mut body, u64::from(count));
-        body.push(wty.byte());
-    }
-
-    let mut relocs: Vec<ModuleReloc> = Vec::new();
-
-    // Prologue: allocate shadow stack frame if needed.
-    if let Some(fp) = fp_local {
-        // global.get __stack_pointer
-        body.push(0x23);
-        relocs.push(ModuleReloc {
-            kind: RELOC_SP_GLOBAL_LEB,
-            offset: body.len() as CodeOffset,
-            name: ModuleRelocTarget::user(2, 0),
+        let ExternalName::User(name) = name else {
+            return Err(format!("wasm: call of {name:?}"));
+        };
+        let name = &self.func.params.user_named_funcs()[*name];
+        // `call`, then the index of the function.
+        self.code.push(0x10);
+        self.relocs.push(ModuleReloc {
+            offset: self.code.len() as u32,
+            kind: CALL,
+            name: ModuleRelocTarget::user(name.namespace, name.index),
             addend: 0,
         });
-        body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-        // i32.const frame_size
-        body.push(0x41);
-        write_sleb(&mut body, i64::from(frame_size));
-        // i32.sub
-        body.push(0x6b);
-        // local.tee $fp
-        body.push(0x22);
-        write_uleb(&mut body, u64::from(fp));
-        // global.set __stack_pointer
-        body.push(0x24);
-        relocs.push(ModuleReloc {
-            kind: RELOC_SP_GLOBAL_LEB,
-            offset: body.len() as CodeOffset,
-            name: ModuleRelocTarget::user(2, 0),
-            addend: 0,
+        self.index_to_fill();
+        Ok(())
+    }
+
+    /// Calls through the table the function whose slot is on the stack.
+    fn call_slot(&mut self, signature: &Signature) -> Result<(), String> {
+        let signature = WasmSignature::of(signature)?;
+        let index = match self.types.iter().position(|it| *it == signature) {
+            Some(index) => index,
+            None => {
+                self.types.push(signature);
+                self.types.len() - 1
+            }
+        };
+        // `call_indirect`, the type, the table.
+        self.code.push(0x11);
+        self.type_fixups.push((self.code.len() as u32, index as u32));
+        self.index_to_fill();
+        self.code.push(0);
+        Ok(())
+    }
+
+    fn slot_address(&mut self, slot: ir::StackSlot, offset: i64) -> Result<(), String> {
+        let Some((frame, _)) = self.frame else {
+            return Err("wasm: stack slot without a frame".to_owned());
+        };
+        let offset = self.slot_offsets[slot.index()] as i64 + offset;
+        self.i(I::LocalGet(frame));
+        if offset != 0 {
+            self.i(I::I32Const(offset as i32));
+            self.i(I::I32Add);
+        }
+        Ok(())
+    }
+
+    /// Pushes the address `base + offset` and gives what is left of the offset to put in the
+    /// instruction.
+    fn pointer(&mut self, base: Value, offset: i64) -> Result<u64, String> {
+        self.get(base)?;
+        if offset >= 0 {
+            return Ok(offset as u64);
+        }
+        self.i(I::I32Const(offset as i32));
+        self.i(I::I32Add);
+        Ok(0)
+    }
+
+    /// Loads `bits` of an integer held as `class` from the address on the stack.
+    fn load_int(&mut self, class: Class, bits: u8, signed: bool, offset: u64) {
+        let at = mem(offset);
+        self.i(match (class.is_long() || class == Class::Pair, bits, signed) {
+            (false, 8, false) => I::I32Load8U(at),
+            (false, 8, true) => I::I32Load8S(at),
+            (false, 16, false) => I::I32Load16U(at),
+            (false, 16, true) => I::I32Load16S(at),
+            (false, ..) => I::I32Load(at),
+            (true, 8, false) => I::I64Load8U(at),
+            (true, 8, true) => I::I64Load8S(at),
+            (true, 16, false) => I::I64Load16U(at),
+            (true, 16, true) => I::I64Load16S(at),
+            (true, 32, false) => I::I64Load32U(at),
+            (true, 32, true) => I::I64Load32S(at),
+            (true, ..) => I::I64Load(at),
         });
-        body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
     }
 
-    let mut emitter = WasmFuncEmitter {
-        func,
-        body: &mut body,
-        relocs: &mut relocs,
-        value_locals: &value_locals,
-        slot_offsets: &slot_offsets,
-        block_indices: &block_indices,
-        fp_local,
-        frame_size,
-        bb_local,
-        num_blocks: blocks.len() as u32,
-    };
-
-    if !needs_cfg {
-        emitter.emit_block(blocks[0], 0)?;
-    } else {
-        let n = blocks.len();
-        // loop $dispatch (blocktype empty)
-        emitter.body.push(0x03);
-        emitter.body.push(WASM_BLOCK_EMPTY);
-        for _ in 0..n {
-            emitter.body.push(0x02);
-            emitter.body.push(WASM_BLOCK_EMPTY);
-        }
-        // local.get $bb
-        emitter.body.push(0x20);
-        write_uleb(emitter.body, u64::from(bb_local.unwrap()));
-        // br_table 0 1 2 ... (n-1) (n-1)
-        emitter.body.push(0x0e);
-        write_uleb(emitter.body, n as u64);
-        for i in 0..n {
-            write_uleb(emitter.body, i as u64);
-        }
-        write_uleb(emitter.body, (n - 1) as u64);
-
-        for (k, &block) in blocks.iter().enumerate() {
-            // end of $b_k
-            emitter.body.push(0x0b);
-            emitter.emit_block(block, k as u32)?;
-        }
-        // end of loop $dispatch
-        emitter.body.push(0x0b);
-        // unreachable
-        emitter.body.push(0x00);
+    /// Stores the low `bits` of the integer on the stack, held as `class`, to the address
+    /// under it.
+    fn store_int(&mut self, class: Class, bits: u8, offset: u64) {
+        let at = mem(offset);
+        self.i(match (class.is_long() || class == Class::Pair, bits) {
+            (false, 8) => I::I32Store8(at),
+            (false, 16) => I::I32Store16(at),
+            (false, _) => I::I32Store(at),
+            (true, 8) => I::I64Store8(at),
+            (true, 16) => I::I64Store16(at),
+            (true, 32) => I::I64Store32(at),
+            (true, _) => I::I64Store(at),
+        });
     }
 
-    // End of function body.
-    body.push(0x0b);
-
-    Ok(Code {
-        signature: func.signature.clone(),
-        bytes: body,
-        align: 1,
-        relocs,
-        unwind: None,
-    })
-}
-
-struct WasmFuncEmitter<'a> {
-    func: &'a ir::Function,
-    body: &'a mut Vec<u8>,
-    relocs: &'a mut Vec<ModuleReloc>,
-    value_locals: &'a FxHashMap<Value, u32>,
-    slot_offsets: &'a FxHashMap<StackSlot, u32>,
-    block_indices: &'a FxHashMap<Block, u32>,
-    fp_local: Option<u32>,
-    frame_size: u32,
-    bb_local: Option<u32>,
-    num_blocks: u32,
-}
-
-impl<'a> WasmFuncEmitter<'a> {
-    fn resolve_val(&self, v: Value) -> Value {
-        self.func.dfg.resolve_aliases(v)
-    }
-
-    fn val_local(&self, v: Value) -> std::result::Result<u32, String> {
-        let v = self.resolve_val(v);
-        self.value_locals
-            .get(&v)
-            .copied()
-            .ok_or_else(|| format!("missing wasm local for value {v}"))
-    }
-
-    fn get_val(&mut self, v: Value) -> std::result::Result<(), String> {
-        let l = self.val_local(v)?;
-        self.body.push(0x20); // local.get
-        write_uleb(self.body, u64::from(l));
-        Ok(())
-    }
-
-    fn get_val_hi(&mut self, v: Value) -> std::result::Result<(), String> {
-        let l = self.val_local(v)? + 1;
-        self.body.push(0x20); // local.get
-        write_uleb(self.body, u64::from(l));
-        Ok(())
-    }
-
-    fn get_val_unsigned(&mut self, v: Value) -> std::result::Result<(), String> {
-        let v = self.resolve_val(v);
-        let ty = self.func.dfg.value_type(v);
-        self.get_val(v)?;
-        if ty == types::I8 {
-            self.body.push(0x41);
-            write_sleb(self.body, 0xff);
-            self.body.push(0x71); // i32.and
-        } else if ty == types::I16 {
-            self.body.push(0x41);
-            write_sleb(self.body, 0xffff);
-            self.body.push(0x71); // i32.and
-        }
-        Ok(())
-    }
-
-    fn get_val_signed(&mut self, v: Value) -> std::result::Result<(), String> {
-        let v = self.resolve_val(v);
-        let ty = self.func.dfg.value_type(v);
-        self.get_val(v)?;
-        if ty == types::I8 {
-            self.body.push(0xc0); // i32.extend8_s
-        } else if ty == types::I16 {
-            self.body.push(0xc1); // i32.extend16_s
-        }
-        Ok(())
-    }
-
-    fn set_val(&mut self, v: Value) -> std::result::Result<(), String> {
-        let l = self.val_local(v)?;
-        self.body.push(0x21); // local.set
-        write_uleb(self.body, u64::from(l));
-        Ok(())
-    }
-
-    fn set_val_hi(&mut self, v: Value) -> std::result::Result<(), String> {
-        let l = self.val_local(v)? + 1;
-        self.body.push(0x21); // local.set
-        write_uleb(self.body, u64::from(l));
-        Ok(())
-    }
-
-    fn resolve_gv(&self, gv: GlobalValue) -> std::result::Result<(ModuleRelocTarget, i64), String> {
-        match self.func.global_values[gv] {
-            GlobalValueData::Symbol { ref name, offset, .. } => {
-                let target = self.reloc_target_from_ext_name(name)?;
-                Ok((target, offset.into()))
+    fn load(&mut self, result: Value, base: Value, offset: i64) -> Result<(), String> {
+        let class = self.class(result)?;
+        let offset = self.pointer(base, offset)?;
+        match class {
+            Class::Word(bits) => self.load_int(class, bits, false, offset),
+            Class::Long => self.load_int(class, 64, false, offset),
+            Class::Pair => {
+                self.i(I::I64Load(mem(offset)));
+                self.get(base)?;
+                self.i(I::I64Load(mem(offset + 8)));
             }
-            GlobalValueData::IAddImm { base, offset, .. } => {
-                let (target, base_off) = self.resolve_gv(base)?;
-                let off: i64 = offset.into();
-                Ok((target, base_off + off))
-            }
-            ref other => Err(format!("unsupported GlobalValue {other:?} in wasm backend")),
+            Class::F32 => self.i(I::F32Load(mem(offset))),
+            Class::F64 => self.i(I::F64Load(mem(offset))),
         }
+        self.set(result)
     }
 
-    fn reloc_target_from_ext_name(
-        &self,
-        name: &ExternalName,
-    ) -> std::result::Result<ModuleRelocTarget, String> {
-        match *name {
-            ExternalName::User(user_ref) => {
-                let u = &self.func.params.user_named_funcs()[user_ref];
-                Ok(ModuleRelocTarget::user(u.namespace, u.index))
+    fn store(&mut self, value: Value, base: Value, offset: i64) -> Result<(), String> {
+        let class = self.class(value)?;
+        let offset = self.pointer(base, offset)?;
+        match class {
+            Class::Word(bits) => {
+                self.get(value)?;
+                self.store_int(class, bits, offset);
             }
-            ExternalName::LibCall(lc) => Ok(ModuleRelocTarget::LibCall(lc)),
-            ref other => Err(format!("unsupported ExternalName {other:?} in wasm backend")),
+            Class::Long => {
+                self.get(value)?;
+                self.i(I::I64Store(mem(offset)));
+            }
+            Class::Pair => {
+                self.get_low(value)?;
+                self.i(I::I64Store(mem(offset)));
+                self.get(base)?;
+                self.get_high(value)?;
+                self.i(I::I64Store(mem(offset + 8)));
+            }
+            Class::F32 => {
+                self.get(value)?;
+                self.i(I::F32Store(mem(offset)));
+            }
+            Class::F64 => {
+                self.get(value)?;
+                self.i(I::F64Store(mem(offset)));
+            }
         }
+        Ok(())
     }
 
-    fn emit_jump_to(
+    /// Leaves the block for another: `depth` is how many wasm blocks opened inside the
+    /// block's own code the jump is in.
+    fn jump(
         &mut self,
-        target_block: Block,
-        args: &[Value],
-        current_block_idx: u32,
-        extra_depth: u32,
-    ) -> std::result::Result<(), String> {
-        for &arg in args {
-            let ty = self.func.dfg.value_type(self.resolve_val(arg));
-            self.get_val(arg)?;
-            if ty == types::I128 {
-                self.get_val_hi(arg)?;
-            }
-        }
-        let target_params = self.func.dfg.block_params(target_block);
-        if args.len() != target_params.len() {
-            return Err("branch arg count mismatch".to_owned());
-        }
-        for &param in target_params.iter().rev() {
-            let ty = self.func.dfg.value_type(self.resolve_val(param));
-            if ty == types::I128 {
-                self.set_val_hi(param)?;
-            }
-            self.set_val(param)?;
-        }
-        let target_idx = self.block_indices[&target_block];
-        self.body.push(0x41); // i32.const
-        write_sleb(self.body, i64::from(target_idx));
-        self.body.push(0x21); // local.set $bb
-        write_uleb(self.body, u64::from(self.bb_local.unwrap()));
-        // Branch to loop $dispatch.
-        let depth = (self.num_blocks - 1 - current_block_idx) + extra_depth;
-        self.body.push(0x0c); // br
-        write_uleb(self.body, u64::from(depth));
-        Ok(())
-    }
-
-    fn emit_block(&mut self, block: Block, block_idx: u32) -> std::result::Result<(), String> {
-        let mut inst_opt = self.func.layout.first_inst(block);
-        while let Some(inst) = inst_opt {
-            self.emit_inst(inst, block_idx)?;
-            inst_opt = self.func.layout.next_inst(inst);
-        }
-        Ok(())
-    }
-
-    fn emit_load(
-        &mut self,
-        addr: Value,
-        offset: Offset32,
-        res: Value,
-        opcode: Opcode,
-    ) -> std::result::Result<(), String> {
-        let off: i64 = offset.into();
-        let (base_off, extra_add) = if off >= 0 && off <= i64::from(u32::MAX - 8) {
-            (off as u32, None)
-        } else {
-            (0u32, Some(off as i32))
-        };
-        let res_ty = self.func.dfg.value_type(res);
-        if res_ty == types::I128 {
-            self.get_val(addr)?;
-            if let Some(delta) = extra_add {
-                self.body.push(0x41);
-                write_sleb(self.body, i64::from(delta));
-                self.body.push(0x6a); // i32.add
-            }
-            self.body.push(0x29); // i64.load
-            write_uleb(self.body, 0);
-            write_uleb(self.body, u64::from(base_off));
-            self.set_val(res)?;
-
-            self.get_val(addr)?;
-            if let Some(delta) = extra_add {
-                self.body.push(0x41);
-                write_sleb(self.body, i64::from(delta));
-                self.body.push(0x6a); // i32.add
-            }
-            self.body.push(0x29); // i64.load
-            write_uleb(self.body, 0);
-            write_uleb(self.body, u64::from(base_off + 8));
-            return self.set_val_hi(res);
-        }
-        self.get_val(addr)?;
-        if let Some(delta) = extra_add {
-            self.body.push(0x41);
-            write_sleb(self.body, i64::from(delta));
-            self.body.push(0x6a); // i32.add
-        }
-        let op = match opcode {
-            Opcode::Load | Opcode::AtomicLoad => match res_ty {
-                types::I8 => 0x2d,  // i32.load8_u
-                types::I16 => 0x2f, // i32.load16_u
-                types::I32 => 0x28, // i32.load
-                types::I64 => 0x29, // i64.load
-                types::F32 => 0x2a, // f32.load
-                types::F64 => 0x2b, // f64.load
-                _ => return Err(format!("unsupported load type {res_ty}")),
-            },
-            Opcode::Uload8 => {
-                if res_ty == types::I64 {
-                    0x31
-                } else {
-                    0x2d
+        from: Block,
+        call: BlockCall,
+        depth: u32,
+        returned: &[u32],
+    ) -> Result<(), String> {
+        let func = self.func;
+        let target = call.block(&func.dfg.value_lists);
+        let params = func.dfg.block_params(target);
+        let mut passed = 0;
+        for (arg, &param) in call.args(&func.dfg.value_lists).zip(params) {
+            match arg {
+                BlockArg::Value(value) => self.get(value)?,
+                BlockArg::TryCallRet(index) => {
+                    let local = *returned.get(index as usize).ok_or("wasm: no such result")?;
+                    self.i(I::LocalGet(local));
+                    if self.class(param)? == Class::Pair {
+                        self.i(I::LocalGet(local + 1));
+                    }
                 }
+                BlockArg::TryCallExn(_) => return Err("wasm: exception payload".to_owned()),
             }
-            Opcode::Sload8 => {
-                if res_ty == types::I64 {
-                    0x30
-                } else {
-                    0x2c
-                }
-            }
-            Opcode::Uload16 => {
-                if res_ty == types::I64 {
-                    0x33
-                } else {
-                    0x2f
-                }
-            }
-            Opcode::Sload16 => {
-                if res_ty == types::I64 {
-                    0x32
-                } else {
-                    0x2e
-                }
-            }
-            Opcode::Uload32 => 0x35, // i64.load32_u
-            Opcode::Sload32 => 0x34, // i64.load32_s
-            _ => return Err(format!("unexpected load opcode {opcode:?}")),
-        };
-        self.body.push(op);
-        write_uleb(self.body, 0); // align = 0 (byte-aligned safe)
-        write_uleb(self.body, u64::from(base_off));
-        self.set_val(res)
-    }
-
-    fn emit_store(
-        &mut self,
-        addr: Value,
-        val: Value,
-        offset: Offset32,
-        opcode: Opcode,
-    ) -> std::result::Result<(), String> {
-        let off: i64 = offset.into();
-        let (base_off, extra_add) = if off >= 0 && off <= i64::from(u32::MAX - 8) {
-            (off as u32, None)
-        } else {
-            (0u32, Some(off as i32))
-        };
-        let val_ty = self.func.dfg.value_type(self.resolve_val(val));
-        if val_ty == types::I128 {
-            self.get_val(addr)?;
-            if let Some(delta) = extra_add {
-                self.body.push(0x41);
-                write_sleb(self.body, i64::from(delta));
-                self.body.push(0x6a); // i32.add
-            }
-            self.get_val(val)?;
-            self.body.push(0x37); // i64.store
-            write_uleb(self.body, 0);
-            write_uleb(self.body, u64::from(base_off));
-
-            self.get_val(addr)?;
-            if let Some(delta) = extra_add {
-                self.body.push(0x41);
-                write_sleb(self.body, i64::from(delta));
-                self.body.push(0x6a); // i32.add
-            }
-            self.get_val_hi(val)?;
-            self.body.push(0x37); // i64.store
-            write_uleb(self.body, 0);
-            write_uleb(self.body, u64::from(base_off + 8));
+            passed += 1;
+        }
+        // All of them are on the stack before any is written: a block may pass its own
+        // parameters on in another order.
+        for &param in params[..passed].iter().rev() {
+            self.set(param)?;
+        }
+        let (from, target) = (self.order[from] - 1, self.order[target] - 1);
+        if target > from {
+            self.i(I::Br(target - from - 1 + depth));
             return Ok(());
         }
-        self.get_val(addr)?;
-        if let Some(delta) = extra_add {
-            self.body.push(0x41);
-            write_sleb(self.body, i64::from(delta));
-            self.body.push(0x6a); // i32.add
-        }
-        self.get_val(val)?;
-        let op = match opcode {
-            Opcode::Store | Opcode::AtomicStore => match val_ty {
-                types::I8 => 0x3a,  // i32.store8
-                types::I16 => 0x3b, // i32.store16
-                types::I32 => 0x36, // i32.store
-                types::I64 => 0x37, // i64.store
-                types::F32 => 0x38, // f32.store
-                types::F64 => 0x39, // f64.store
-                _ => return Err(format!("unsupported store type {val_ty}")),
-            },
-            Opcode::Istore8 => {
-                if val_ty == types::I64 {
-                    0x3c
-                } else {
-                    0x3a
-                }
-            }
-            Opcode::Istore16 => {
-                if val_ty == types::I64 {
-                    0x3d
-                } else {
-                    0x3b
-                }
-            }
-            Opcode::Istore32 => 0x3e, // i64.store32
-            _ => return Err(format!("unexpected store opcode {opcode:?}")),
+        let Some(next) = self.next_block else {
+            return Err("wasm: jump backwards without a loop".to_owned());
         };
-        self.body.push(op);
-        write_uleb(self.body, 0); // align = 0
-        write_uleb(self.body, u64::from(base_off));
+        self.i(I::I32Const(target as i32));
+        self.i(I::LocalSet(next));
+        self.i(I::Br(self.block_count - 1 - from + depth));
         Ok(())
     }
 
-    fn emit_inst(&mut self, inst: ir::Inst, block_idx: u32) -> std::result::Result<(), String> {
-        let data = &self.func.dfg.insts[inst];
-        let opcode = data.opcode();
-        let results = self.func.dfg.inst_results(inst);
-        let res = results.first().copied();
-        let res_ty = res.map(|r| self.func.dfg.value_type(r));
-
-        match *data {
-            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
-                let r = res.unwrap();
-                let ty = res_ty.unwrap();
-                let raw: i64 = imm.into();
-                if ty == types::I64 {
-                    self.body.push(0x42);
-                    write_sleb(self.body, raw);
-                } else {
-                    self.body.push(0x41);
-                    write_sleb(self.body, i64::from(raw as i32));
-                }
-                self.set_val(r)?;
-            }
-            InstructionData::UnaryIeee32 { opcode: Opcode::F32const, imm } => {
-                let r = res.unwrap();
-                self.body.push(0x43);
-                self.body.extend_from_slice(&imm.bits().to_le_bytes());
-                self.set_val(r)?;
-            }
-            InstructionData::UnaryIeee64 { opcode: Opcode::F64const, imm } => {
-                let r = res.unwrap();
-                self.body.push(0x44);
-                self.body.extend_from_slice(&imm.bits().to_le_bytes());
-                self.set_val(r)?;
-            }
-            InstructionData::StackAddr { opcode: Opcode::StackAddr, stack_slot, offset } => {
-                let r = res.unwrap();
-                let base = self.slot_offsets[&stack_slot];
-                let off: i64 = offset.into();
-                self.body.push(0x20); // local.get $fp
-                write_uleb(self.body, u64::from(self.fp_local.unwrap()));
-                let total = (i64::from(base) + off) as i32;
-                if total != 0 {
-                    self.body.push(0x41);
-                    write_sleb(self.body, i64::from(total));
-                    self.body.push(0x6a); // i32.add
-                }
-                self.set_val(r)?;
-            }
-            InstructionData::UnaryGlobalValue {
-                opcode: Opcode::SymbolValue,
-                global_value,
-            } => {
-                let r = res.unwrap();
-                let (target, addend) = self.resolve_gv(global_value)?;
-                self.body.push(0x41); // i32.const
-                self.relocs.push(ModuleReloc {
-                    kind: RELOC_MEM_SLEB,
-                    offset: self.body.len() as CodeOffset,
-                    name: target,
-                    addend,
-                });
-                self.body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-                self.set_val(r)?;
-            }
-            InstructionData::FuncAddr { opcode: Opcode::FuncAddr, func_ref } => {
-                let r = res.unwrap();
-                let target = self.reloc_target_from_ext_name(&self.func.dfg.ext_funcs[func_ref].name)?;
-                self.body.push(0x41); // i32.const
-                self.relocs.push(ModuleReloc {
-                    kind: RELOC_TABLE_SLEB,
-                    offset: self.body.len() as CodeOffset,
-                    name: target,
-                    addend: 0,
-                });
-                self.body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-                self.set_val(r)?;
-            }
-            InstructionData::LoadNoOffset { opcode, arg, .. } => {
-                self.emit_load(arg, Offset32::new(0), res.unwrap(), opcode)?;
-            }
-            InstructionData::Load { opcode, arg, offset, .. } => {
-                self.emit_load(arg, offset, res.unwrap(), opcode)?;
-            }
-            InstructionData::StoreNoOffset { opcode, args: [val, addr], .. } => {
-                self.emit_store(addr, val, Offset32::new(0), opcode)?;
-            }
-            InstructionData::Store { opcode, args: [val, addr], offset, .. } => {
-                self.emit_store(addr, val, offset, opcode)?;
-            }
-            InstructionData::Binary { opcode: Opcode::Iconcat, args: [lo, hi] } => {
-                let r = res.unwrap();
-                self.get_val(lo)?;
-                self.set_val(r)?;
-                self.get_val(hi)?;
-                self.set_val_hi(r)?;
-            }
-            InstructionData::Unary { opcode: Opcode::Isplit, arg } => {
-                let r_lo = results[0];
-                let r_hi = results[1];
-                self.get_val(arg)?;
-                self.set_val(r_lo)?;
-                self.get_val_hi(arg)?;
-                self.set_val(r_hi)?;
-            }
-            InstructionData::Binary { opcode, args: [a, b] }
-                if self.func.dfg.value_type(self.resolve_val(a)) == types::I128 =>
-            {
-                let r = res.unwrap();
-                match opcode {
-                    Opcode::Band | Opcode::Bor | Opcode::Bxor => {
-                        let op = match opcode {
-                            Opcode::Band => 0x83,
-                            Opcode::Bor => 0x84,
-                            _ => 0x85,
-                        };
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(op);
-                        self.set_val(r)?;
-                        self.get_val_hi(a)?;
-                        self.get_val_hi(b)?;
-                        self.body.push(op);
-                        self.set_val_hi(r)?;
-                    }
-                    Opcode::Iadd | Opcode::UaddOverflow | Opcode::SaddOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(0x7c); // i64.add
-                        self.set_val(r)?;
-                        self.get_val_hi(a)?;
-                        self.get_val_hi(b)?;
-                        self.body.push(0x7c); // i64.add
-                        // + carry (r.lo <_u a.lo)
-                        self.get_val(r)?;
-                        self.get_val(a)?;
-                        self.body.push(0x54); // i64.lt_u
-                        self.body.push(0xad); // i64.extend_i32_u
-                        self.body.push(0x7c); // i64.add
-                        self.set_val_hi(r)?;
-                        if opcode == Opcode::UaddOverflow {
-                            let r_ovf = results[1];
-                            // overflow iff (a.hi + b.hi + carry) overflowed
-                            self.get_val_hi(r)?;
-                            self.get_val_hi(a)?;
-                            self.body.push(0x54); // r.hi <_u a.hi
-                            self.get_val_hi(r)?;
-                            self.get_val_hi(a)?;
-                            self.body.push(0x51); // r.hi == a.hi
-                            self.get_val(r)?;
-                            self.get_val(a)?;
-                            self.body.push(0x54); // r.lo <_u a.lo
-                            self.body.push(0x71); // i32.and
-                            self.body.push(0x72); // i32.or
-                            self.set_val(r_ovf)?;
-                        } else if opcode == Opcode::SaddOverflow {
-                            let r_ovf = results[1];
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(r)?;
-                            self.body.push(0x85); // xor
-                            self.get_val_hi(b)?;
-                            self.get_val_hi(r)?;
-                            self.body.push(0x85); // xor
-                            self.body.push(0x83); // and
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x53); // i64.lt_s
-                            self.set_val(r_ovf)?;
-                        }
-                    }
-                    Opcode::Isub | Opcode::UsubOverflow | Opcode::SsubOverflow => {
-                        self.get_val_hi(a)?;
-                        self.get_val_hi(b)?;
-                        self.body.push(0x7d); // i64.sub
-                        // - borrow (a.lo <_u b.lo)
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(0x54); // i64.lt_u
-                        self.body.push(0xad); // i64.extend_i32_u
-                        self.body.push(0x7d); // i64.sub
-                        self.set_val_hi(r)?;
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(0x7d); // i64.sub
-                        self.set_val(r)?;
-                        if opcode == Opcode::UsubOverflow {
-                            let r_ovf = results[1];
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(0x54); // a.hi <_u b.hi
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(0x51); // a.hi == b.hi
-                            self.get_val(a)?;
-                            self.get_val(b)?;
-                            self.body.push(0x54); // a.lo <_u b.lo
-                            self.body.push(0x71); // i32.and
-                            self.body.push(0x72); // i32.or
-                            self.set_val(r_ovf)?;
-                        } else if opcode == Opcode::SsubOverflow {
-                            let r_ovf = results[1];
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(0x85); // xor
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(r)?;
-                            self.body.push(0x85); // xor
-                            self.body.push(0x83); // and
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x53); // i64.lt_s
-                            self.set_val(r_ovf)?;
-                        }
-                    }
-                    Opcode::Imul => {
-                        // 128-bit wrapping multiply:
-                        // r.lo = a.lo * b.lo
-                        // r.hi = mulhu64(a.lo, b.lo) + a.lo * b.hi + a.hi * b.lo
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(0x7e); // i64.mul
-                        self.set_val(r)?;
-
-                        // Compute mulhu64(a.lo, b.lo):
-                        // a0 = a.lo & 0xffffffff, a1 = a.lo >>_u 32
-                        // b0 = b.lo & 0xffffffff, b1 = b.lo >>_u 32
-                        // p11 = a1 * b1
-                        self.get_val(a)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88);
-                        self.get_val(b)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88);
-                        self.body.push(0x7e); // p11
-
-                        // + (a.lo * b.hi) + (a.hi * b.lo)
-                        self.get_val(a)?;
-                        self.get_val_hi(b)?;
-                        self.body.push(0x7e);
-                        self.body.push(0x7c);
-                        self.get_val_hi(a)?;
-                        self.get_val(b)?;
-                        self.body.push(0x7e);
-                        self.body.push(0x7c);
-
-                        // + (((((a0*b0)>>32) + (a0*b1 & 0xffffffff) + (a1*b0 & 0xffffffff)) >> 32) + (a0*b1 >> 32) + (a1*b0 >> 32))
-                        // First: (a0 * b1) >> 32
-                        self.get_val(a)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.get_val(b)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88);
-                        self.body.push(0x7e); // p01
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88); // p01 >> 32
-                        self.body.push(0x7c);
-
-                        // + (a1 * b0) >> 32
-                        self.get_val(a)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88);
-                        self.get_val(b)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.body.push(0x7e); // p10
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88); // p10 >> 32
-                        self.body.push(0x7c);
-
-                        // + (((p00 >> 32) + (p01 & 0xffffffff) + (p10 & 0xffffffff)) >> 32)
-                        self.get_val(a)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.get_val(b)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.body.push(0x7e); // p00
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88); // p00 >> 32
-
-                        self.get_val(a)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.get_val(b)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88);
-                        self.body.push(0x7e); // p01
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.body.push(0x7c);
-
-                        self.get_val(a)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88);
-                        self.get_val(b)?;
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.body.push(0x7e); // p10
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0xffff_ffff);
-                        self.body.push(0x83);
-                        self.body.push(0x7c);
-
-                        self.body.push(0x42);
-                        write_sleb(self.body, 32);
-                        self.body.push(0x88); // mid >> 32
-                        self.body.push(0x7c);
-                        self.set_val_hi(r)?;
-                    }
-                    Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
-                        // Convert shift amount `b` to i64 masked by 127.
-                        let push_shift_64 = |this: &mut Self| -> std::result::Result<(), String> {
-                            let b_ty = this.func.dfg.value_type(this.resolve_val(b));
-                            this.get_val(b)?;
-                            if b_ty != types::I64 {
-                                if b_ty == types::I128 {
-                                    // `get_val(b)` already pushed `b.lo` (i64)
-                                } else {
-                                    this.body.push(0xad); // i64.extend_i32_u
-                                }
-                            }
-                            this.body.push(0x42);
-                            write_sleb(this.body, 127);
-                            this.body.push(0x83); // i64.and
-                            Ok(())
-                        };
-                        let push_shift_32 = |this: &mut Self| -> std::result::Result<(), String> {
-                            let b_ty = this.func.dfg.value_type(this.resolve_val(b));
-                            this.get_val(b)?;
-                            if b_ty == types::I64 || b_ty == types::I128 {
-                                this.body.push(0xa7); // i32.wrap_i64
-                            }
-                            this.body.push(0x41);
-                            write_sleb(this.body, 127);
-                            this.body.push(0x71); // i32.and
-                            Ok(())
-                        };
-                        match opcode {
-                            Opcode::Ishl => {
-                                // if s == 0: (a.lo, a.hi)
-                                // else if s < 64: (a.lo << s, (a.hi << s) | (a.lo >>_u (64 - s)))
-                                // else: (0, a.lo << (s - 64))
-                                push_shift_32(self)?;
-                                self.body.push(0x45); // i32.eqz
-                                self.body.push(0x04); // if
-                                self.body.push(WASM_BLOCK_EMPTY);
-                                self.get_val(a)?;
-                                self.set_val(r)?;
-                                self.get_val_hi(a)?;
-                                self.set_val_hi(r)?;
-                                self.body.push(0x05); // else
-                                push_shift_32(self)?;
-                                self.body.push(0x41);
-                                write_sleb(self.body, 64);
-                                self.body.push(0x49); // i32.lt_u
-                                self.body.push(0x04); // if (s < 64)
-                                self.body.push(WASM_BLOCK_EMPTY);
-                                self.get_val_hi(a)?;
-                                push_shift_64(self)?;
-                                self.body.push(0x86); // a.hi << s
-                                self.get_val(a)?;
-                                self.body.push(0x42);
-                                write_sleb(self.body, 64);
-                                push_shift_64(self)?;
-                                self.body.push(0x7d); // 64 - s
-                                self.body.push(0x88); // a.lo >>_u (64 - s)
-                                self.body.push(0x84); // i64.or
-                                self.set_val_hi(r)?;
-                                self.get_val(a)?;
-                                push_shift_64(self)?;
-                                self.body.push(0x86); // a.lo << s
-                                self.set_val(r)?;
-                                self.body.push(0x05); // else (s >= 64)
-                                self.get_val(a)?;
-                                push_shift_64(self)?;
-                                self.body.push(0x42);
-                                write_sleb(self.body, 64);
-                                self.body.push(0x7d); // s - 64
-                                self.body.push(0x86); // a.lo << (s - 64)
-                                self.set_val_hi(r)?;
-                                self.body.push(0x42);
-                                write_sleb(self.body, 0);
-                                self.set_val(r)?;
-                                self.body.push(0x0b); // end
-                                self.body.push(0x0b); // end
-                            }
-                            Opcode::Ushr | Opcode::Sshr => {
-                                let shr_hi_op = if opcode == Opcode::Sshr { 0x87 } else { 0x88 };
-                                push_shift_32(self)?;
-                                self.body.push(0x45); // i32.eqz
-                                self.body.push(0x04); // if
-                                self.body.push(WASM_BLOCK_EMPTY);
-                                self.get_val(a)?;
-                                self.set_val(r)?;
-                                self.get_val_hi(a)?;
-                                self.set_val_hi(r)?;
-                                self.body.push(0x05); // else
-                                push_shift_32(self)?;
-                                self.body.push(0x41);
-                                write_sleb(self.body, 64);
-                                self.body.push(0x49); // i32.lt_u
-                                self.body.push(0x04); // if (s < 64)
-                                self.body.push(WASM_BLOCK_EMPTY);
-                                self.get_val(a)?;
-                                push_shift_64(self)?;
-                                self.body.push(0x88); // a.lo >>_u s
-                                self.get_val_hi(a)?;
-                                self.body.push(0x42);
-                                write_sleb(self.body, 64);
-                                push_shift_64(self)?;
-                                self.body.push(0x7d); // 64 - s
-                                self.body.push(0x86); // a.hi << (64 - s)
-                                self.body.push(0x84); // i64.or
-                                self.set_val(r)?;
-                                self.get_val_hi(a)?;
-                                push_shift_64(self)?;
-                                self.body.push(shr_hi_op);
-                                self.set_val_hi(r)?;
-                                self.body.push(0x05); // else (s >= 64)
-                                self.get_val_hi(a)?;
-                                push_shift_64(self)?;
-                                self.body.push(0x42);
-                                write_sleb(self.body, 64);
-                                self.body.push(0x7d); // s - 64
-                                self.body.push(shr_hi_op);
-                                self.set_val(r)?;
-                                if opcode == Opcode::Sshr {
-                                    self.get_val_hi(a)?;
-                                    self.body.push(0x42);
-                                    write_sleb(self.body, 63);
-                                    self.body.push(0x87); // a.hi >>_s 63
-                                } else {
-                                    self.body.push(0x42);
-                                    write_sleb(self.body, 0);
-                                }
-                                self.set_val_hi(r)?;
-                                self.body.push(0x0b); // end
-                                self.body.push(0x0b); // end
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    _ => return Err(format!("unsupported 128-bit binary op {opcode:?}")),
-                }
-            }
-            InstructionData::Binary { opcode, args: [a, b] }
-                if matches!(
-                    opcode,
-                    Opcode::UaddOverflow
-                        | Opcode::UsubOverflow
-                        | Opcode::SaddOverflow
-                        | Opcode::SsubOverflow
-                        | Opcode::UmulOverflow
-                        | Opcode::SmulOverflow
-                ) =>
-            {
-                let r_val = results[0];
-                let r_ovf = results[1];
-                let ty = self.func.dfg.value_type(self.resolve_val(a));
-                let is_64 = ty == types::I64;
-                match opcode {
-                    Opcode::UaddOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(if is_64 { 0x7c } else { 0x6a }); // add
-                        self.set_val(r_val)?;
-                        self.get_val_unsigned(r_val)?;
-                        self.get_val_unsigned(a)?;
-                        self.body.push(if is_64 { 0x54 } else { 0x49 }); // lt_u
-                        self.set_val(r_ovf)?;
-                    }
-                    Opcode::UsubOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(if is_64 { 0x7d } else { 0x6b }); // sub
-                        self.set_val(r_val)?;
-                        self.get_val_unsigned(a)?;
-                        self.get_val_unsigned(b)?;
-                        self.body.push(if is_64 { 0x54 } else { 0x49 }); // lt_u
-                        self.set_val(r_ovf)?;
-                    }
-                    Opcode::SaddOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(if is_64 { 0x7c } else { 0x6a }); // add
-                        self.set_val(r_val)?;
-                        // ((a_s ^ sum_s) & (b_s ^ sum_s)) < 0
-                        self.get_val_signed(a)?;
-                        self.get_val_signed(r_val)?;
-                        self.body.push(if is_64 { 0x85 } else { 0x73 }); // xor
-                        self.get_val_signed(b)?;
-                        self.get_val_signed(r_val)?;
-                        self.body.push(if is_64 { 0x85 } else { 0x73 }); // xor
-                        self.body.push(if is_64 { 0x83 } else { 0x71 }); // and
-                        if is_64 {
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x53); // i64.lt_s
-                        } else {
-                            self.body.push(0x41);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x48); // i32.lt_s
-                        }
-                        self.set_val(r_ovf)?;
-                    }
-                    Opcode::SsubOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(if is_64 { 0x7d } else { 0x6b }); // sub
-                        self.set_val(r_val)?;
-                        // ((a_s ^ b_s) & (a_s ^ diff_s)) < 0
-                        self.get_val_signed(a)?;
-                        self.get_val_signed(b)?;
-                        self.body.push(if is_64 { 0x85 } else { 0x73 }); // xor
-                        self.get_val_signed(a)?;
-                        self.get_val_signed(r_val)?;
-                        self.body.push(if is_64 { 0x85 } else { 0x73 }); // xor
-                        self.body.push(if is_64 { 0x83 } else { 0x71 }); // and
-                        if is_64 {
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x53); // i64.lt_s
-                        } else {
-                            self.body.push(0x41);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x48); // i32.lt_s
-                        }
-                        self.set_val(r_ovf)?;
-                    }
-                    Opcode::UmulOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(if is_64 { 0x7e } else { 0x6c }); // mul
-                        self.set_val(r_val)?;
-                        if !is_64 {
-                            self.get_val_unsigned(a)?;
-                            self.body.push(0xad); // i64.extend_i32_u
-                            self.get_val_unsigned(b)?;
-                            self.body.push(0xad); // i64.extend_i32_u
-                            self.body.push(0x7e); // i64.mul
-                            self.get_val_unsigned(r_val)?;
-                            self.body.push(0xad); // i64.extend_i32_u
-                            self.body.push(0x52); // i64.ne
-                            self.set_val(r_ovf)?;
-                        } else {
-                            // b != 0 && (r_val /_u b) != a
-                            self.get_val(b)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x52); // i64.ne
-                            self.body.push(0x04); // if (result i32)
-                            self.body.push(WASM_VAL_I32);
-                            self.get_val(r_val)?;
-                            self.get_val(b)?;
-                            self.body.push(0x80); // i64.div_u
-                            self.get_val(a)?;
-                            self.body.push(0x52); // i64.ne
-                            self.body.push(0x05); // else
-                            self.body.push(0x41);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x0b); // end
-                            self.set_val(r_ovf)?;
-                        }
-                    }
-                    Opcode::SmulOverflow => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                        self.body.push(if is_64 { 0x7e } else { 0x6c }); // mul
-                        self.set_val(r_val)?;
-                        if !is_64 {
-                            self.get_val_signed(a)?;
-                            self.body.push(0xac); // i64.extend_i32_s
-                            self.get_val_signed(b)?;
-                            self.body.push(0xac); // i64.extend_i32_s
-                            self.body.push(0x7e); // i64.mul
-                            self.get_val_signed(r_val)?;
-                            self.body.push(0xac); // i64.extend_i32_s
-                            self.body.push(0x52); // i64.ne
-                            self.set_val(r_ovf)?;
-                        } else {
-                            // if b == 0 -> 0; else if a == i64::MIN && b == -1 -> 1; else (r_val /_s b) != a
-                            self.get_val(b)?;
-                            self.body.push(0x50); // i64.eqz
-                            self.body.push(0x04); // if (result i32)
-                            self.body.push(WASM_VAL_I32);
-                            self.body.push(0x41);
-                            write_sleb(self.body, 0);
-                            self.body.push(0x05); // else
-                            self.get_val(a)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, i64::MIN);
-                            self.body.push(0x51); // i64.eq
-                            self.get_val(b)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x51); // i64.eq
-                            self.body.push(0x71); // i32.and
-                            self.body.push(0x04); // if (result i32)
-                            self.body.push(WASM_VAL_I32);
-                            self.body.push(0x41);
-                            write_sleb(self.body, 1);
-                            self.body.push(0x05); // else
-                            self.get_val(r_val)?;
-                            self.get_val(b)?;
-                            self.body.push(0x7f); // i64.div_s
-                            self.get_val(a)?;
-                            self.body.push(0x52); // i64.ne
-                            self.body.push(0x0b); // end
-                            self.body.push(0x0b); // end
-                            self.set_val(r_ovf)?;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            InstructionData::Binary { opcode, args: [a, b] }
-                if matches!(opcode, Opcode::Umax | Opcode::Umin | Opcode::Smax | Opcode::Smin) =>
-            {
-                let r = res.unwrap();
-                let ty = self.func.dfg.value_type(self.resolve_val(a));
-                let is_64 = ty == types::I64;
-                self.get_val(a)?;
-                self.get_val(b)?;
-                match opcode {
-                    Opcode::Umax => {
-                        self.get_val_unsigned(a)?;
-                        self.get_val_unsigned(b)?;
-                        self.body.push(if is_64 { 0x56 } else { 0x4b }); // gt_u
-                    }
-                    Opcode::Umin => {
-                        self.get_val_unsigned(a)?;
-                        self.get_val_unsigned(b)?;
-                        self.body.push(if is_64 { 0x54 } else { 0x49 }); // lt_u
-                    }
-                    Opcode::Smax => {
-                        self.get_val_signed(a)?;
-                        self.get_val_signed(b)?;
-                        self.body.push(if is_64 { 0x55 } else { 0x4a }); // gt_s
-                    }
-                    Opcode::Smin => {
-                        self.get_val_signed(a)?;
-                        self.get_val_signed(b)?;
-                        self.body.push(if is_64 { 0x53 } else { 0x48 }); // lt_s
-                    }
-                    _ => unreachable!(),
-                }
-                self.body.push(0x1b); // select
-                self.set_val(r)?;
-            }
-            InstructionData::Binary { opcode, args: [a, b] } => {
-                let r = res.unwrap();
-                let ty = self.func.dfg.value_type(self.resolve_val(a));
-                let is_64 = ty == types::I64;
-                match opcode {
-                    Opcode::Udiv | Opcode::Urem | Opcode::Ushr => {
-                        self.get_val_unsigned(a)?;
-                        if opcode == Opcode::Ushr && is_64 && self.func.dfg.value_type(self.resolve_val(b)) != types::I64 {
-                            self.get_val_unsigned(b)?;
-                            self.body.push(0xad); // i64.extend_i32_u
-                        } else if opcode == Opcode::Ushr && !is_64 && self.func.dfg.value_type(self.resolve_val(b)) == types::I64 {
-                            self.get_val(b)?;
-                            self.body.push(0xa7); // i32.wrap_i64
-                        } else {
-                            self.get_val_unsigned(b)?;
-                        }
-                    }
-                    Opcode::Sdiv | Opcode::Srem | Opcode::Sshr => {
-                        self.get_val_signed(a)?;
-                        if opcode == Opcode::Sshr && is_64 && self.func.dfg.value_type(self.resolve_val(b)) != types::I64 {
-                            self.get_val_unsigned(b)?;
-                            self.body.push(0xad); // i64.extend_i32_u
-                        } else if opcode == Opcode::Sshr && !is_64 && self.func.dfg.value_type(self.resolve_val(b)) == types::I64 {
-                            self.get_val(b)?;
-                            self.body.push(0xa7); // i32.wrap_i64
-                        } else {
-                            self.get_val_signed(b)?;
-                        }
-                    }
-                    Opcode::Ishl | Opcode::Rotl | Opcode::Rotr => {
-                        self.get_val(a)?;
-                        let b_ty = self.func.dfg.value_type(self.resolve_val(b));
-                        if is_64 && b_ty != types::I64 {
-                            self.get_val_unsigned(b)?;
-                            self.body.push(0xad); // i64.extend_i32_u
-                        } else if !is_64 && b_ty == types::I64 {
-                            self.get_val(b)?;
-                            self.body.push(0xa7); // i32.wrap_i64
-                        } else {
-                            self.get_val(b)?;
-                        }
-                    }
-                    _ => {
-                        self.get_val(a)?;
-                        self.get_val(b)?;
-                    }
-                }
-                let op = match (opcode, ty) {
-                    (Opcode::Iadd, types::I64) => 0x7c,
-                    (Opcode::Iadd, _) => 0x6a,
-                    (Opcode::Isub, types::I64) => 0x7d,
-                    (Opcode::Isub, _) => 0x6b,
-                    (Opcode::Imul, types::I64) => 0x7e,
-                    (Opcode::Imul, _) => 0x6c,
-                    (Opcode::Sdiv, types::I64) => 0x7f,
-                    (Opcode::Sdiv, _) => 0x6d,
-                    (Opcode::Udiv, types::I64) => 0x80,
-                    (Opcode::Udiv, _) => 0x6e,
-                    (Opcode::Srem, types::I64) => 0x81,
-                    (Opcode::Srem, _) => 0x6f,
-                    (Opcode::Urem, types::I64) => 0x82,
-                    (Opcode::Urem, _) => 0x70,
-                    (Opcode::Band, types::I64) => 0x83,
-                    (Opcode::Band, _) => 0x71,
-                    (Opcode::Bor, types::I64) => 0x84,
-                    (Opcode::Bor, _) => 0x72,
-                    (Opcode::Bxor, types::I64) => 0x85,
-                    (Opcode::Bxor, _) => 0x73,
-                    (Opcode::Ishl, types::I64) => 0x86,
-                    (Opcode::Ishl, _) => 0x74,
-                    (Opcode::Sshr, types::I64) => 0x87,
-                    (Opcode::Sshr, _) => 0x75,
-                    (Opcode::Ushr, types::I64) => 0x88,
-                    (Opcode::Ushr, _) => 0x76,
-                    (Opcode::Rotl, types::I64) => 0x89,
-                    (Opcode::Rotl, _) => 0x77,
-                    (Opcode::Rotr, types::I64) => 0x8a,
-                    (Opcode::Rotr, _) => 0x78,
-                    (Opcode::Fadd, types::F32) => 0x92,
-                    (Opcode::Fadd, types::F64) => 0xa0,
-                    (Opcode::Fsub, types::F32) => 0x93,
-                    (Opcode::Fsub, types::F64) => 0xa1,
-                    (Opcode::Fmul, types::F32) => 0x94,
-                    (Opcode::Fmul, types::F64) => 0xa2,
-                    (Opcode::Fdiv, types::F32) => 0x95,
-                    (Opcode::Fdiv, types::F64) => 0xa3,
-                    (Opcode::Fmin, types::F32) => 0x96,
-                    (Opcode::Fmin, types::F64) => 0xa4,
-                    (Opcode::Fmax, types::F32) => 0x97,
-                    (Opcode::Fmax, types::F64) => 0xa5,
-                    (Opcode::Fcopysign, types::F32) => 0x98,
-                    (Opcode::Fcopysign, types::F64) => 0xa6,
-                    _ => return Err(format!("unsupported binary op {opcode:?} on {ty}")),
+    fn return_(&mut self, values: &[Value]) -> Result<(), String> {
+        match self.returned.clone() {
+            Returned::Nothing => {}
+            Returned::Value(_) => {
+                let [value] = values else {
+                    return Err("wasm: return and signature disagree".to_owned());
                 };
-                self.body.push(op);
-                self.set_val(r)?;
+                let signed =
+                    self.func.signature.returns[0].extension == ir::ArgumentExtension::Sext;
+                self.get_for(*value, signed)?;
             }
-            InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args: [a, b] } => {
-                let r = res.unwrap();
-                let ty = self.func.dfg.value_type(self.resolve_val(a));
-                if ty == types::I128 {
-                    match cond {
-                        IntCC::Equal => {
-                            self.get_val(a)?;
-                            self.get_val(b)?;
-                            self.body.push(0x51); // i64.eq
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(0x51); // i64.eq
-                            self.body.push(0x71); // i32.and
-                        }
-                        IntCC::NotEqual => {
-                            self.get_val(a)?;
-                            self.get_val(b)?;
-                            self.body.push(0x52); // i64.ne
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(0x52); // i64.ne
-                            self.body.push(0x72); // i32.or
-                        }
-                        _ => {
-                            let hi_strict = match cond {
-                                IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual => 0x53,
-                                IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => 0x54,
-                                IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual => 0x55,
-                                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => 0x56,
-                                _ => unreachable!(),
-                            };
-                            let lo_cmp = match cond {
-                                IntCC::SignedLessThan | IntCC::UnsignedLessThan => 0x54,
-                                IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => 0x58,
-                                IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => 0x56,
-                                IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => 0x5a,
-                                _ => unreachable!(),
-                            };
-                            // (a.hi < b.hi) | ((a.hi == b.hi) & (a.lo <_u b.lo))
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(hi_strict);
-                            self.get_val_hi(a)?;
-                            self.get_val_hi(b)?;
-                            self.body.push(0x51); // i64.eq
-                            self.get_val(a)?;
-                            self.get_val(b)?;
-                            self.body.push(lo_cmp);
-                            self.body.push(0x71); // i32.and
-                            self.body.push(0x72); // i32.or
-                        }
-                    }
-                    self.set_val(r)?;
-                    return Ok(());
-                }
-                let signed = matches!(
-                    cond,
-                    IntCC::SignedLessThan
-                        | IntCC::SignedGreaterThanOrEqual
-                        | IntCC::SignedGreaterThan
-                        | IntCC::SignedLessThanOrEqual
-                );
-                if signed {
-                    self.get_val_signed(a)?;
-                    self.get_val_signed(b)?;
-                } else {
-                    self.get_val_unsigned(a)?;
-                    self.get_val_unsigned(b)?;
-                }
-                let op = Self::int_cmp_opcode(cond, ty == types::I64);
-                self.body.push(op);
-                self.set_val(r)?;
-            }
-            InstructionData::FloatCompare { opcode: Opcode::Fcmp, cond, args: [a, b] } => {
-                let r = res.unwrap();
-                let ty = self.func.dfg.value_type(self.resolve_val(a));
-                let is_64 = ty == types::F64;
-                self.get_val(a)?;
-                self.get_val(b)?;
-                let op = match (cond, is_64) {
-                    (FloatCC::Equal, false) => 0x5b,
-                    (FloatCC::Equal, true) => 0x61,
-                    (FloatCC::NotEqual, false) => 0x5c,
-                    (FloatCC::NotEqual, true) => 0x62,
-                    (FloatCC::LessThan, false) => 0x5d,
-                    (FloatCC::LessThan, true) => 0x63,
-                    (FloatCC::GreaterThan, false) => 0x5e,
-                    (FloatCC::GreaterThan, true) => 0x64,
-                    (FloatCC::LessThanOrEqual, false) => 0x5f,
-                    (FloatCC::LessThanOrEqual, true) => 0x65,
-                    (FloatCC::GreaterThanOrEqual, false) => 0x60,
-                    (FloatCC::GreaterThanOrEqual, true) => 0x66,
-                    _ => return Err(format!("unsupported FloatCC {cond:?}")),
-                };
-                self.body.push(op);
-                self.set_val(r)?;
-            }
-            InstructionData::Ternary { opcode: Opcode::Select, args: [cond, t_val, f_val] } => {
-                let r = res.unwrap();
-                let dst_ty = res_ty.unwrap();
-                let cond_ty = self.func.dfg.value_type(self.resolve_val(cond));
-                self.get_val(t_val)?;
-                self.get_val(f_val)?;
-                self.get_val(cond)?;
-                if cond_ty == types::I64 {
-                    self.body.push(0x42);
-                    write_sleb(self.body, 0);
-                    self.body.push(0x52); // i64.ne
-                }
-                self.body.push(0x1b); // select
-                self.set_val(r)?;
-                if dst_ty == types::I128 {
-                    self.get_val_hi(t_val)?;
-                    self.get_val_hi(f_val)?;
-                    self.get_val(cond)?;
-                    if cond_ty == types::I64 {
-                        self.body.push(0x42);
-                        write_sleb(self.body, 0);
-                        self.body.push(0x52); // i64.ne
-                    }
-                    self.body.push(0x1b); // select
-                    self.set_val_hi(r)?;
+            Returned::Through(places) => {
+                for (&value, (at, class)) in values.iter().zip(places) {
+                    self.i(I::LocalGet(0));
+                    self.get(value)?;
+                    self.store_class(class, at);
                 }
             }
-            InstructionData::Unary { opcode, arg } => {
-                let r = res.unwrap();
-                let dst_ty = res_ty.unwrap();
-                let src_ty = self.func.dfg.value_type(self.resolve_val(arg));
-                if dst_ty == types::I128 {
-                    match opcode {
-                        Opcode::Uextend => {
-                            self.get_val_unsigned(arg)?;
-                            if src_ty != types::I64 {
-                                self.body.push(0xad); // i64.extend_i32_u
-                            }
-                            self.set_val(r)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.set_val_hi(r)?;
-                        }
-                        Opcode::Sextend => {
-                            self.get_val_signed(arg)?;
-                            if src_ty != types::I64 {
-                                self.body.push(0xac); // i64.extend_i32_s
-                            }
-                            self.set_val(r)?;
-                            self.get_val(r)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 63);
-                            self.body.push(0x87); // i64.shr_s
-                            self.set_val_hi(r)?;
-                        }
-                        Opcode::Bnot => {
-                            self.get_val(arg)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x85);
-                            self.set_val(r)?;
-                            self.get_val_hi(arg)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x85);
-                            self.set_val_hi(r)?;
-                        }
-                        Opcode::Ineg => {
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.get_val_hi(arg)?;
-                            self.body.push(0x7d); // 0 - a.hi
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.get_val(arg)?;
-                            self.body.push(0x54); // 0 <_u a.lo
-                            self.body.push(0xad);
-                            self.body.push(0x7d); // - borrow
-                            self.set_val_hi(r)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.get_val(arg)?;
-                            self.body.push(0x7d); // 0 - a.lo
-                            self.set_val(r)?;
-                        }
-                        Opcode::Bswap => {
-                            // Swap hi -> lo and lo -> hi, each 64-bit bswapped.
-                            for (in_hi, out_hi) in [(true, false), (false, true)] {
-                                for b in 0..8usize {
-                                    if in_hi {
-                                        self.get_val_hi(arg)?;
-                                    } else {
-                                        self.get_val(arg)?;
-                                    }
-                                    if b > 0 {
-                                        self.body.push(0x42);
-                                        write_sleb(self.body, (b * 8) as i64);
-                                        self.body.push(0x88);
-                                    }
-                                    self.body.push(0x42);
-                                    write_sleb(self.body, 0xff);
-                                    self.body.push(0x83);
-                                    let shl = (7 - b) * 8;
-                                    if shl > 0 {
-                                        self.body.push(0x42);
-                                        write_sleb(self.body, shl as i64);
-                                        self.body.push(0x86);
-                                    }
-                                    if b > 0 {
-                                        self.body.push(0x84);
-                                    }
-                                }
-                                if out_hi {
-                                    self.set_val_hi(r)?;
-                                } else {
-                                    self.set_val(r)?;
-                                }
-                            }
-                        }
-                        Opcode::Clz => {
-                            // if a.hi == 0 -> 64 + clz(a.lo) else clz(a.hi)
-                            self.get_val_hi(arg)?;
-                            self.body.push(0x50); // i64.eqz
-                            self.body.push(0x04);
-                            self.body.push(WASM_VAL_I64);
-                            self.get_val(arg)?;
-                            self.body.push(0x79); // i64.clz
-                            self.body.push(0x42);
-                            write_sleb(self.body, 64);
-                            self.body.push(0x7c);
-                            self.body.push(0x05);
-                            self.get_val_hi(arg)?;
-                            self.body.push(0x79);
-                            self.body.push(0x0b);
-                            self.set_val(r)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.set_val_hi(r)?;
-                        }
-                        Opcode::Ctz => {
-                            // if a.lo == 0 -> 64 + ctz(a.hi) else ctz(a.lo)
-                            self.get_val(arg)?;
-                            self.body.push(0x50); // i64.eqz
-                            self.body.push(0x04);
-                            self.body.push(WASM_VAL_I64);
-                            self.get_val_hi(arg)?;
-                            self.body.push(0x7a); // i64.ctz
-                            self.body.push(0x42);
-                            write_sleb(self.body, 64);
-                            self.body.push(0x7c);
-                            self.body.push(0x05);
-                            self.get_val(arg)?;
-                            self.body.push(0x7a);
-                            self.body.push(0x0b);
-                            self.set_val(r)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.set_val_hi(r)?;
-                        }
-                        Opcode::Popcnt => {
-                            self.get_val(arg)?;
-                            self.body.push(0x7b);
-                            self.get_val_hi(arg)?;
-                            self.body.push(0x7b);
-                            self.body.push(0x7c);
-                            self.set_val(r)?;
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.set_val_hi(r)?;
-                        }
-                        _ => return Err(format!("unsupported 128-bit unary op {opcode:?}")),
-                    }
-                    return Ok(());
-                }
-                match opcode {
-                    Opcode::Uextend => {
-                        self.get_val_unsigned(arg)?;
-                        if dst_ty == types::I64 && src_ty != types::I64 {
-                            self.body.push(0xad); // i64.extend_i32_u
-                        }
-                    }
-                    Opcode::Sextend => {
-                        self.get_val_signed(arg)?;
-                        if dst_ty == types::I64 && src_ty != types::I64 {
-                            self.body.push(0xac); // i64.extend_i32_s
-                        }
-                    }
-                    Opcode::Ireduce => {
-                        self.get_val(arg)?;
-                        if (src_ty == types::I64 || src_ty == types::I128) && dst_ty != types::I64 {
-                            self.body.push(0xa7); // i32.wrap_i64
-                        }
-                    }
-                    Opcode::Bnot => {
-                        self.get_val(arg)?;
-                        if dst_ty == types::I64 {
-                            self.body.push(0x42);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x85); // i64.xor
-                        } else {
-                            self.body.push(0x41);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x73); // i32.xor
-                        }
-                    }
-                    Opcode::Ineg => {
-                        if dst_ty == types::I64 {
-                            self.body.push(0x42);
-                            write_sleb(self.body, 0);
-                            self.get_val(arg)?;
-                            self.body.push(0x7d); // i64.sub
-                        } else {
-                            self.body.push(0x41);
-                            write_sleb(self.body, 0);
-                            self.get_val(arg)?;
-                            self.body.push(0x6b); // i32.sub
-                        }
-                    }
-                    Opcode::Clz => {
-                        self.get_val_unsigned(arg)?;
-                        if dst_ty == types::I64 {
-                            self.body.push(0x79); // i64.clz
-                        } else {
-                            self.body.push(0x67); // i32.clz
-                            if src_ty == types::I8 {
-                                self.body.push(0x41);
-                                write_sleb(self.body, 24);
-                                self.body.push(0x6b);
-                            } else if src_ty == types::I16 {
-                                self.body.push(0x41);
-                                write_sleb(self.body, 16);
-                                self.body.push(0x6b);
-                            }
-                        }
-                    }
-                    Opcode::Ctz => {
-                        self.get_val(arg)?;
-                        if dst_ty == types::I64 {
-                            self.body.push(0x7a); // i64.ctz
-                        } else {
-                            if src_ty == types::I8 {
-                                self.body.push(0x41);
-                                write_sleb(self.body, 0x100);
-                                self.body.push(0x72); // i32.or
-                            } else if src_ty == types::I16 {
-                                self.body.push(0x41);
-                                write_sleb(self.body, 0x10000);
-                                self.body.push(0x72); // i32.or
-                            }
-                            self.body.push(0x68); // i32.ctz
-                        }
-                    }
-                    Opcode::Popcnt => {
-                        self.get_val_unsigned(arg)?;
-                        if dst_ty == types::I64 {
-                            self.body.push(0x7b); // i64.popcnt
-                        } else {
-                            self.body.push(0x69); // i32.popcnt
-                        }
-                    }
-                    Opcode::Bswap => {
-                        let bytes = dst_ty.bytes() as usize;
-                        for b in 0..bytes {
-                            self.get_val_unsigned(arg)?;
-                            if dst_ty == types::I64 {
-                                if b > 0 {
-                                    self.body.push(0x42);
-                                    write_sleb(self.body, (b * 8) as i64);
-                                    self.body.push(0x88); // i64.shr_u
-                                }
-                                self.body.push(0x42);
-                                write_sleb(self.body, 0xff);
-                                self.body.push(0x83); // i64.and
-                                let shl = (bytes - 1 - b) * 8;
-                                if shl > 0 {
-                                    self.body.push(0x42);
-                                    write_sleb(self.body, shl as i64);
-                                    self.body.push(0x86); // i64.shl
-                                }
-                                if b > 0 {
-                                    self.body.push(0x84); // i64.or
-                                }
-                            } else {
-                                if b > 0 {
-                                    self.body.push(0x41);
-                                    write_sleb(self.body, (b * 8) as i64);
-                                    self.body.push(0x76); // i32.shr_u
-                                }
-                                self.body.push(0x41);
-                                write_sleb(self.body, 0xff);
-                                self.body.push(0x71); // i32.and
-                                let shl = (bytes - 1 - b) * 8;
-                                if shl > 0 {
-                                    self.body.push(0x41);
-                                    write_sleb(self.body, shl as i64);
-                                    self.body.push(0x74); // i32.shl
-                                }
-                                if b > 0 {
-                                    self.body.push(0x72); // i32.or
-                                }
-                            }
-                        }
-                    }
-                    Opcode::Bitcast => {
-                        self.get_val(arg)?;
-                        match (src_ty, dst_ty) {
-                            (types::F32, types::I32) => self.body.push(0xbc),
-                            (types::F64, types::I64) => self.body.push(0xbd),
-                            (types::I32, types::F32) => self.body.push(0xbe),
-                            (types::I64, types::F64) => self.body.push(0xbf),
-                            (a, b) if a == b => {}
-                            _ => return Err(format!("unsupported bitcast {src_ty} -> {dst_ty}")),
-                        }
-                    }
-                    Opcode::Fpromote => {
-                        self.get_val(arg)?;
-                        self.body.push(0xbb); // f64.promote_f32
-                    }
-                    Opcode::Fdemote => {
-                        self.get_val(arg)?;
-                        self.body.push(0xb6); // f32.demote_f64
-                    }
-                    Opcode::Fneg => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x9a } else { 0x8c });
-                    }
-                    Opcode::Fabs => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x99 } else { 0x8b });
-                    }
-                    Opcode::Sqrt => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x9f } else { 0x91 });
-                    }
-                    Opcode::Ceil => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x9b } else { 0x8d });
-                    }
-                    Opcode::Floor => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x9c } else { 0x8e });
-                    }
-                    Opcode::Trunc => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x9d } else { 0x8f });
-                    }
-                    Opcode::Nearest => {
-                        self.get_val(arg)?;
-                        self.body.push(if dst_ty == types::F64 { 0x9e } else { 0x90 });
-                    }
-                    Opcode::FcvtFromSint => {
-                        self.get_val_signed(arg)?;
-                        let op = match (src_ty == types::I64, dst_ty == types::F64) {
-                            (false, false) => 0xb2,
-                            (true, false) => 0xb4,
-                            (false, true) => 0xb7,
-                            (true, true) => 0xb9,
-                        };
-                        self.body.push(op);
-                    }
-                    Opcode::FcvtFromUint => {
-                        self.get_val_unsigned(arg)?;
-                        let op = match (src_ty == types::I64, dst_ty == types::F64) {
-                            (false, false) => 0xb3,
-                            (true, false) => 0xb5,
-                            (false, true) => 0xb8,
-                            (true, true) => 0xba,
-                        };
-                        self.body.push(op);
-                    }
-                    Opcode::FcvtToSint | Opcode::FcvtToSintSat => {
-                        self.get_val(arg)?;
-                        let sat = match (src_ty == types::F64, dst_ty == types::I64) {
-                            (false, false) => 0u8,
-                            (true, false) => 2u8,
-                            (false, true) => 4u8,
-                            (true, true) => 6u8,
-                        };
-                        self.body.push(0xfc);
-                        write_uleb(self.body, u64::from(sat));
-                    }
-                    Opcode::FcvtToUint | Opcode::FcvtToUintSat => {
-                        self.get_val(arg)?;
-                        let sat = match (src_ty == types::F64, dst_ty == types::I64) {
-                            (false, false) => 1u8,
-                            (true, false) => 3u8,
-                            (false, true) => 5u8,
-                            (true, true) => 7u8,
-                        };
-                        self.body.push(0xfc);
-                        write_uleb(self.body, u64::from(sat));
-                    }
-                    _ => return Err(format!("unsupported unary op {opcode:?}")),
-                }
-                self.set_val(r)?;
+        }
+        if let Some((frame, size)) = self.frame {
+            self.i(I::LocalGet(frame));
+            self.i(I::I32Const(size as i32));
+            self.i(I::I32Add);
+            self.stack_pointer(true);
+        }
+        self.i(I::Return);
+        Ok(())
+    }
+
+    /// Stores the value on the stack, held as `class`, at `offset` from the address below it.
+    fn store_class(&mut self, class: Class, offset: u64) {
+        match class {
+            Class::Word(bits) => self.store_int(class, bits, offset),
+            Class::Long => self.i(I::I64Store(mem(offset))),
+            Class::F32 => self.i(I::F32Store(mem(offset))),
+            Class::F64 => self.i(I::F64Store(mem(offset))),
+            Class::Pair => {
+                let high = self.temp(ValType::I64);
+                let low = self.temp(ValType::I64);
+                let address = self.temp(ValType::I32);
+                self.i(I::LocalSet(high));
+                self.i(I::LocalSet(low));
+                self.i(I::LocalTee(address));
+                self.i(I::LocalGet(low));
+                self.i(I::I64Store(mem(offset)));
+                self.i(I::LocalGet(address));
+                self.i(I::LocalGet(high));
+                self.i(I::I64Store(mem(offset + 8)));
             }
-            InstructionData::Call { opcode: Opcode::Call, func_ref, ref args } => {
-                let args_slice = args.as_slice(&self.func.dfg.value_lists);
-                let ext = &self.func.dfg.ext_funcs[func_ref];
-                if let ExternalName::LibCall(lc) = ext.name {
-                    match lc {
-                        ir::LibCall::Memcpy | ir::LibCall::Memmove => {
-                            self.get_val(args_slice[0])?;
-                            self.get_val(args_slice[1])?;
-                            self.get_val(args_slice[2])?;
-                            self.body.extend_from_slice(&[0xfc, 0x0a, 0x00, 0x00]); // memory.copy
-                            return Ok(());
-                        }
-                        ir::LibCall::Memset => {
-                            self.get_val(args_slice[0])?;
-                            self.get_val(args_slice[1])?;
-                            self.get_val(args_slice[2])?;
-                            self.body.extend_from_slice(&[0xfc, 0x0b, 0x00]); // memory.fill
-                            return Ok(());
-                        }
-                        _ => return Err(format!("unsupported LibCall {lc:?} in wasm backend")),
-                    }
-                }
-                let target = self.reloc_target_from_ext_name(&ext.name)?;
-                for &arg in args_slice {
-                    self.get_val(arg)?;
-                    if self.func.dfg.value_type(self.resolve_val(arg)) == types::I128 {
-                        self.get_val_hi(arg)?;
-                    }
-                }
-                self.body.push(0x10); // call
-                self.relocs.push(ModuleReloc {
-                    kind: RELOC_FN_LEB,
-                    offset: self.body.len() as CodeOffset,
-                    name: target,
-                    addend: 0,
-                });
-                self.body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-                if let Some(r) = res {
-                    self.set_val(r)?;
-                }
+        }
+    }
+
+    /// Pushes the value held as `class` at `offset` from the address on the stack.
+    fn load_class(&mut self, class: Class, offset: u64) {
+        match class {
+            Class::Word(bits) => self.load_int(class, bits, false, offset),
+            Class::Long => self.i(I::I64Load(mem(offset))),
+            Class::F32 => self.i(I::F32Load(mem(offset))),
+            Class::F64 => self.i(I::F64Load(mem(offset))),
+            Class::Pair => {
+                let address = self.temp(ValType::I32);
+                self.i(I::LocalTee(address));
+                self.i(I::I64Load(mem(offset)));
+                self.i(I::LocalGet(address));
+                self.i(I::I64Load(mem(offset + 8)));
             }
-            InstructionData::CallIndirect { opcode: Opcode::CallIndirect, sig_ref, ref args } => {
-                let args_slice = args.as_slice(&self.func.dfg.value_lists);
-                let (&callee, call_args) =
-                    args_slice.split_first().ok_or_else(|| "empty CallIndirect".to_owned())?;
-                let wsig_id = intern_global_wsig(&self.func.dfg.signatures[sig_ref])?;
-                for &arg in call_args {
-                    self.get_val(arg)?;
-                    if self.func.dfg.value_type(self.resolve_val(arg)) == types::I128 {
-                        self.get_val_hi(arg)?;
-                    }
-                }
-                self.get_val(callee)?;
-                self.body.push(0x11); // call_indirect
-                self.relocs.push(ModuleReloc {
-                    kind: RELOC_TYPE_LEB,
-                    offset: self.body.len() as CodeOffset,
-                    name: ModuleRelocTarget::user(3, wsig_id),
-                    addend: 0,
-                });
-                self.body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-                self.body.push(0x00); // table 0
-                if let Some(r) = res {
-                    self.set_val(r)?;
-                }
-            }
-            InstructionData::Jump { opcode: Opcode::Jump, destination } => {
-                let target = destination.block(&self.func.dfg.value_lists);
-                let args: Vec<Value> = destination
-                    .args(&self.func.dfg.value_lists)
-                    .filter_map(|a| a.as_value())
-                    .collect();
-                self.emit_jump_to(target, &args, block_idx, 0)?;
-            }
-            InstructionData::Brif {
-                opcode: Opcode::Brif,
-                arg,
-                blocks: [then_call, else_call],
-            } => {
-                let arg_ty = self.func.dfg.value_type(self.resolve_val(arg));
-                self.get_val(arg)?;
-                if arg_ty == types::I128 {
-                    self.get_val_hi(arg)?;
-                    self.body.push(0x84); // i64.or
-                    self.body.push(0x42);
-                    write_sleb(self.body, 0);
-                    self.body.push(0x52); // i64.ne
-                } else if arg_ty == types::I64 {
-                    self.body.push(0x42);
-                    write_sleb(self.body, 0);
-                    self.body.push(0x52); // i64.ne
-                }
-                // if (empty)
-                self.body.push(0x04);
-                self.body.push(WASM_BLOCK_EMPTY);
-                let then_b = then_call.block(&self.func.dfg.value_lists);
-                let then_args: Vec<Value> = then_call
-                    .args(&self.func.dfg.value_lists)
-                    .filter_map(|a| a.as_value())
-                    .collect();
-                self.emit_jump_to(then_b, &then_args, block_idx, 1)?;
-                // else
-                self.body.push(0x05);
-                let else_b = else_call.block(&self.func.dfg.value_lists);
-                let else_args: Vec<Value> = else_call
-                    .args(&self.func.dfg.value_lists)
-                    .filter_map(|a| a.as_value())
-                    .collect();
-                self.emit_jump_to(else_b, &else_args, block_idx, 1)?;
-                // end
-                self.body.push(0x0b);
-            }
-            InstructionData::BranchTable { opcode: Opcode::BrTable, arg, table } => {
-                let jt_data: &JumpTableData = &self.func.stencil.dfg.jump_tables[table];
-                let all = jt_data.all_branches();
-                let (&default_call, rest) =
-                    all.split_first().ok_or_else(|| "empty jump table".to_owned())?;
-                for (i, branch_call) in rest.iter().enumerate() {
-                    self.get_val(arg)?;
-                    self.body.push(0x41);
-                    write_sleb(self.body, i as i64);
-                    self.body.push(0x46); // i32.eq
-                    self.body.push(0x04); // if
-                    self.body.push(WASM_BLOCK_EMPTY);
-                    let b = branch_call.block(&self.func.dfg.value_lists);
-                    let args: Vec<Value> = branch_call
-                        .args(&self.func.dfg.value_lists)
-                        .filter_map(|a| a.as_value())
-                        .collect();
-                    self.emit_jump_to(b, &args, block_idx, 1)?;
-                    self.body.push(0x0b); // end if
-                }
-                let def_b = default_call.block(&self.func.dfg.value_lists);
-                let def_args: Vec<Value> = default_call
-                    .args(&self.func.dfg.value_lists)
-                    .filter_map(|a| a.as_value())
-                    .collect();
-                self.emit_jump_to(def_b, &def_args, block_idx, 0)?;
-            }
-            InstructionData::MultiAry { opcode: Opcode::Return, ref args } => {
-                let args_slice = args.as_slice(&self.func.dfg.value_lists);
-                if let Some(&ret_val) = args_slice.first() {
-                    self.get_val(ret_val)?;
-                }
-                if let Some(fp) = self.fp_local {
-                    self.body.push(0x20); // local.get $fp
-                    write_uleb(self.body, u64::from(fp));
-                    self.body.push(0x41); // i32.const frame_size
-                    write_sleb(self.body, i64::from(self.frame_size));
-                    self.body.push(0x6a); // i32.add
-                    self.body.push(0x24); // global.set __stack_pointer
-                    self.relocs.push(ModuleReloc {
-                        kind: RELOC_SP_GLOBAL_LEB,
-                        offset: self.body.len() as CodeOffset,
-                        name: ModuleRelocTarget::user(2, 0),
-                        addend: 0,
-                    });
-                    self.body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-                }
-                self.body.push(0x0f); // return
-            }
-            InstructionData::Trap { opcode: Opcode::Trap, .. } => {
-                self.body.push(0x00); // unreachable
-            }
-            InstructionData::CondTrap { opcode: Opcode::Trapz | Opcode::Trapnz, arg, .. } => {
-                self.get_val(arg)?;
-                let ty = self.func.dfg.value_type(self.resolve_val(arg));
-                if opcode == Opcode::Trapz {
-                    self.body.push(if ty == types::I64 { 0x50 } else { 0x45 }); // eqz
-                } else if ty == types::I64 {
-                    self.body.push(0x42);
-                    write_sleb(self.body, 0);
-                    self.body.push(0x52); // i64.ne
-                }
-                self.body.push(0x04); // if
-                self.body.push(WASM_BLOCK_EMPTY);
-                self.body.push(0x00); // unreachable
-                self.body.push(0x0b); // end
-            }
-            InstructionData::NullAry { opcode: Opcode::Fence } => {}
-            InstructionData::AtomicRmw { opcode: Opcode::AtomicRmw, op, args: [addr, val], .. } => {
-                let r = res.unwrap();
-                let ty = res_ty.unwrap();
-                let is_64 = ty == types::I64;
-                // Load old value into `r`.
-                self.emit_load(addr, Offset32::new(0), r, Opcode::Load)?;
-                // Push address for store, then compute new value on stack.
-                self.get_val(addr)?;
-                match op {
-                    ir::AtomicRmwOp::Xchg => {
-                        self.get_val(val)?;
-                    }
-                    ir::AtomicRmwOp::Add => {
-                        self.get_val(r)?;
-                        self.get_val(val)?;
-                        self.body.push(if is_64 { 0x7c } else { 0x6a });
-                    }
-                    ir::AtomicRmwOp::Sub => {
-                        self.get_val(r)?;
-                        self.get_val(val)?;
-                        self.body.push(if is_64 { 0x7d } else { 0x6b });
-                    }
-                    ir::AtomicRmwOp::And => {
-                        self.get_val(r)?;
-                        self.get_val(val)?;
-                        self.body.push(if is_64 { 0x83 } else { 0x71 });
-                    }
-                    ir::AtomicRmwOp::Or => {
-                        self.get_val(r)?;
-                        self.get_val(val)?;
-                        self.body.push(if is_64 { 0x84 } else { 0x72 });
-                    }
-                    ir::AtomicRmwOp::Xor => {
-                        self.get_val(r)?;
-                        self.get_val(val)?;
-                        self.body.push(if is_64 { 0x85 } else { 0x73 });
-                    }
-                    ir::AtomicRmwOp::Nand => {
-                        self.get_val(r)?;
-                        self.get_val(val)?;
-                        self.body.push(if is_64 { 0x83 } else { 0x71 });
-                        if is_64 {
-                            self.body.push(0x42);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x85);
-                        } else {
-                            self.body.push(0x41);
-                            write_sleb(self.body, -1);
-                            self.body.push(0x73);
-                        }
-                    }
-                    _ => return Err(format!("unsupported AtomicRmwOp {op:?}")),
-                }
-                let store_op = match ty {
-                    types::I8 => 0x3a,
-                    types::I16 => 0x3b,
-                    types::I32 => 0x36,
-                    types::I64 => 0x37,
-                    _ => return Err(format!("unsupported atomic rmw type {ty}")),
-                };
-                self.body.push(store_op);
-                write_uleb(self.body, 0);
-                write_uleb(self.body, 0);
-            }
-            InstructionData::AtomicCas {
-                opcode: Opcode::AtomicCas,
-                args: [addr, expected, replacement],
-                ..
-            } => {
-                let r = res.unwrap();
-                let ty = res_ty.unwrap();
-                self.emit_load(addr, Offset32::new(0), r, Opcode::Load)?;
-                self.get_val_unsigned(r)?;
-                self.get_val_unsigned(expected)?;
-                self.body.push(if ty == types::I64 { 0x51 } else { 0x46 }); // eq
-                self.body.push(0x04); // if
-                self.body.push(WASM_BLOCK_EMPTY);
-                self.emit_store(addr, replacement, Offset32::new(0), Opcode::Store)?;
-                self.body.push(0x0b); // end
-            }
-            _ => return Err(format!("unsupported Cranelift instruction {opcode:?} in wasm backend")),
+        }
+    }
+
+    /// Pushes the arguments of a call: the pointer the function returns through when it does
+    /// that, then each one extended the way the signature asks.
+    fn arguments(&mut self, signature: &Signature, args: &[Value]) -> Result<(), String> {
+        if let Returned::Through(_) = Returned::of(signature)? {
+            let Some(at) = self.returned_at else {
+                return Err("wasm: no room for what a call returns".to_owned());
+            };
+            let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
+            self.i(I::LocalGet(frame));
+            self.i(I::I32Const(at as i32));
+            self.i(I::I32Add);
+        }
+        for (&arg, param) in args.iter().zip(&signature.params) {
+            self.get_for(arg, param.extension == ir::ArgumentExtension::Sext)?;
         }
         Ok(())
     }
 
-    fn int_cmp_opcode(cond: IntCC, is_64: bool) -> u8 {
-        match (cond, is_64) {
-            (IntCC::Equal, false) => 0x46,
-            (IntCC::Equal, true) => 0x51,
-            (IntCC::NotEqual, false) => 0x47,
-            (IntCC::NotEqual, true) => 0x52,
-            (IntCC::SignedLessThan, false) => 0x48,
-            (IntCC::SignedLessThan, true) => 0x53,
-            (IntCC::UnsignedLessThan, false) => 0x49,
-            (IntCC::UnsignedLessThan, true) => 0x54,
-            (IntCC::SignedGreaterThan, false) => 0x4a,
-            (IntCC::SignedGreaterThan, true) => 0x55,
-            (IntCC::UnsignedGreaterThan, false) => 0x4b,
-            (IntCC::UnsignedGreaterThan, true) => 0x56,
-            (IntCC::SignedLessThanOrEqual, false) => 0x4c,
-            (IntCC::SignedLessThanOrEqual, true) => 0x57,
-            (IntCC::UnsignedLessThanOrEqual, false) => 0x4d,
-            (IntCC::UnsignedLessThanOrEqual, true) => 0x58,
-            (IntCC::SignedGreaterThanOrEqual, false) => 0x4e,
-            (IntCC::SignedGreaterThanOrEqual, true) => 0x59,
-            (IntCC::UnsignedGreaterThanOrEqual, false) => 0x4f,
-            (IntCC::UnsignedGreaterThanOrEqual, true) => 0x5a,
-        }
-    }
-}
-
-/// Accumulates defined functions and data objects and serializes a relocatable Wasm `.o` file.
-#[derive(Default)]
-pub(super) struct WasmObjectBuilder {
-    functions: FxHashMap<FuncId, (Vec<u8>, Vec<ModuleReloc>)>,
-    datas: FxHashMap<DataId, ConstBlob>,
-}
-
-impl WasmObjectBuilder {
-    pub(super) fn define_function(
+    /// Makes the call the arguments are on the stack for and puts what it returns in fresh
+    /// locals, the first of each value given.
+    fn finish_call(
         &mut self,
-        id: FuncId,
-        bytes: &[u8],
-        relocs: &[ModuleReloc],
-    ) {
-        self.functions.insert(id, (bytes.to_vec(), relocs.to_vec()));
+        callee: Option<&ExternalName>,
+        signature: &Signature,
+    ) -> Result<Vec<u32>, String> {
+        match callee {
+            Some(name) => self.call_named(name, signature)?,
+            None => self.call_slot(signature)?,
+        }
+        let mut local_of = |this: &mut Self, class: Class| {
+            let local = this.temp(class.wasm().into());
+            if class == Class::Pair {
+                this.temp(ValType::I64);
+            }
+            local
+        };
+        match Returned::of(signature)? {
+            Returned::Nothing => Ok(Vec::new()),
+            Returned::Value(class) => {
+                let local = local_of(self, class);
+                self.mask_for(class);
+                self.i(I::LocalSet(local));
+                Ok(vec![local])
+            }
+            Returned::Through(places) => {
+                let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
+                let base = self.returned_at.ok_or("wasm: no room for what a call returns")?;
+                let mut locals = Vec::new();
+                for (at, class) in places {
+                    let local = local_of(self, class);
+                    self.i(I::LocalGet(frame));
+                    self.load_class(class, base + at);
+                    if class == Class::Pair {
+                        self.i(I::LocalSet(local + 1));
+                    }
+                    self.mask_for(class);
+                    self.i(I::LocalSet(local));
+                    locals.push(local);
+                }
+                Ok(locals)
+            }
+        }
     }
 
-    pub(super) fn define_data(&mut self, id: DataId, blob: ConstBlob) {
-        self.datas.insert(id, blob);
+    /// Calls a function. `callee` is `None` when the slot to call is the first of `args`.
+    fn call(
+        &mut self,
+        callee: Option<&ExternalName>,
+        signature: &Signature,
+        args: &[Value],
+        results: &[Value],
+    ) -> Result<(), String> {
+        if let Some(ExternalName::LibCall(libcall)) = callee {
+            return self.libcall(*libcall, args, results);
+        }
+        let returned = self.call_returning(callee, signature, args)?;
+        for (&result, local) in results.iter().zip(returned) {
+            self.i(I::LocalGet(local));
+            if self.class(result)? == Class::Pair {
+                self.i(I::LocalGet(local + 1));
+            }
+            self.set(result)?;
+        }
+        Ok(())
     }
 
-    pub(super) fn finish(
-        self,
-        decls: &ModuleDeclarations,
-        is_base: bool,
-        patching: bool,
-    ) -> Result<Vec<u8>> {
-        let map_err = |e: String| CodegenError::Backend(e);
-        let emit_trampolines =
-            is_base && patching && std::env::var_os("RUSTD_WASM_TRAMPOLINES").is_some();
-        let emit_patch_exports = !is_base;
-
-        let mut types: Vec<WasmSig> = Vec::new();
-        let mut type_map: FxHashMap<WasmSig, u32> = FxHashMap::default();
-        let intern_wsig = |wsig: WasmSig, types: &mut Vec<WasmSig>, type_map: &mut FxHashMap<WasmSig, u32>| -> u32 {
-            if let Some(&idx) = type_map.get(&wsig) {
-                return idx;
-            }
-            let idx = types.len() as u32;
-            types.push(wsig.clone());
-            type_map.insert(wsig, idx);
-            idx
-        };
-
-        let mut imported_funcs: Vec<(FuncId, String, u32)> = Vec::new();
-        let mut defined_funcs: Vec<(FuncId, String, Linkage, u32)> = Vec::new();
-        for (func_id, decl) in decls.get_functions() {
-            let name = decl.linkage_name(func_id).into_owned();
-            if self.functions.contains_key(&func_id) {
-                let wsig = WasmSig::of(&decl.signature).map_err(map_err)?;
-                let tidx = intern_wsig(wsig, &mut types, &mut type_map);
-                defined_funcs.push((func_id, name, decl.linkage, tidx));
-            } else {
-                let wsig = WasmSig::of(&decl.signature).map_err(map_err)?;
-                let tidx = intern_wsig(wsig, &mut types, &mut type_map);
-                imported_funcs.push((func_id, name, tidx));
+    fn call_returning(
+        &mut self,
+        callee: Option<&ExternalName>,
+        signature: &Signature,
+        args: &[Value],
+    ) -> Result<Vec<u32>, String> {
+        match callee {
+            Some(_) => self.arguments(signature, args)?,
+            None => {
+                let [slot, args @ ..] = args else {
+                    return Err("wasm: indirect call of nothing".to_owned());
+                };
+                self.arguments(signature, args)?;
+                self.get(*slot)?;
             }
         }
+        self.finish_call(callee, signature)
+    }
 
-        let mut imported_datas: Vec<(DataId, String)> = Vec::new();
-        let mut defined_datas: Vec<(DataId, String, Linkage, u32, ConstBlob)> = Vec::new();
-        let mut mem_cursor = if emit_patch_exports { 60 * 1024 * 1024 } else { 0u32 };
-        for (data_id, decl) in decls.get_data_objects() {
-            let name = decl.linkage_name(data_id).into_owned();
-            if let Some(blob) = self.datas.get(&data_id) {
-                let align = (blob.align as u32).max(1);
-                mem_cursor = (mem_cursor + align - 1) & !(align - 1);
-                let mem_offset = mem_cursor;
-                mem_cursor = mem_cursor.saturating_add(blob.bytes.len() as u32);
-                defined_datas.push((data_id, name, decl.linkage, mem_offset, blob.clone()));
-            } else {
-                imported_datas.push((data_id, name));
+    /// The memory routines Cranelift's frontend calls by name are instructions here.
+    fn libcall(
+        &mut self,
+        libcall: LibCall,
+        args: &[Value],
+        results: &[Value],
+    ) -> Result<(), String> {
+        match (libcall, args) {
+            (LibCall::Memcpy | LibCall::Memmove, &[to, from, len]) => {
+                self.get(to)?;
+                self.get(from)?;
+                self.get(len)?;
+                self.i(I::MemoryCopy { src_mem: MEMORY, dst_mem: MEMORY });
             }
-        }
-
-        // Symbol table layout:
-        //   0: __stack_pointer (Global, undefined, element_index = 0)
-        //   1..=imported_funcs.len(): imported functions (element_index = 0..imported_funcs.len())
-        //   next..: defined functions (element_index = imported_funcs.len()..)
-        //   (if emit_trampolines: next..: __rustd_impl_<name> functions)
-        //   next..: imported datas
-        //   next..: defined datas
-        let mut func_sym_index: FxHashMap<FuncId, (u32, u32)> = FxHashMap::default(); // FuncId -> (sym_idx, wasm_func_idx)
-        let mut data_sym_index: FxHashMap<DataId, (u32, u32)> = FxHashMap::default(); // DataId -> (sym_idx, mem_offset)
-        let mut impl_sym_indices: Vec<u32> = Vec::new();
-
-        let mut next_sym = 1u32; // 0 is __stack_pointer
-        for (i, &(fid, _, _)) in imported_funcs.iter().enumerate() {
-            func_sym_index.insert(fid, (next_sym, i as u32));
-            next_sym += 1;
-        }
-        let num_func_imports = imported_funcs.len() as u32;
-        for (i, &(fid, _, _, _)) in defined_funcs.iter().enumerate() {
-            func_sym_index.insert(fid, (next_sym, num_func_imports + i as u32));
-            next_sym += 1;
-        }
-        if emit_trampolines {
-            for _ in 0..defined_funcs.len() {
-                impl_sym_indices.push(next_sym);
-                next_sym += 1;
+            (LibCall::Memset, &[to, byte, len]) => {
+                self.get(to)?;
+                self.get(byte)?;
+                self.get(len)?;
+                self.i(I::MemoryFill(MEMORY));
             }
+            _ => return Err(format!("wasm: libcall {libcall}")),
         }
-        for &(did, _) in &imported_datas {
-            data_sym_index.insert(did, (next_sym, 0));
-            next_sym += 1;
-        }
-        for &(did, _, _, mem_off, _) in &defined_datas {
-            data_sym_index.insert(did, (next_sym, mem_off));
-            next_sym += 1;
-        }
-
-        // 1. Type section (id = 1) — built after Code section so CallIndirect types are included.
-
-        // 2. Import section (id = 2)
-        // Imports:
-        //   - env.__linear_memory (memory)
-        //   - env.__indirect_function_table (table)
-        //   - env.__stack_pointer (global 0)
-        //   - imported functions
-        let mut import_sec = Vec::new();
-        write_uleb(&mut import_sec, (3 + imported_funcs.len()) as u64);
-        // env.__linear_memory
-        write_str(&mut import_sec, "env");
-        write_str(&mut import_sec, "__linear_memory");
-        import_sec.push(0x02); // Memory
-        import_sec.push(0x00); // limits: flags=0
-        write_uleb(&mut import_sec, 1); // initial=1
-        // env.__indirect_function_table
-        write_str(&mut import_sec, "env");
-        write_str(&mut import_sec, "__indirect_function_table");
-        import_sec.push(0x01); // Table
-        import_sec.push(0x70); // funcref
-        import_sec.push(0x00); // flags=0
-        write_uleb(&mut import_sec, 0); // initial=0
-        // env.__stack_pointer
-        write_str(&mut import_sec, "env");
-        write_str(&mut import_sec, "__stack_pointer");
-        import_sec.push(0x03); // Global
-        import_sec.push(WASM_VAL_I32);
-        import_sec.push(0x01); // mutable
-        for (_, name, tidx) in &imported_funcs {
-            write_str(&mut import_sec, "env");
-            write_str(&mut import_sec, name);
-            import_sec.push(0x00); // Function
-            write_uleb(&mut import_sec, u64::from(*tidx));
-        }
-
-        // 3. Function section (id = 3)
-        let mut func_sec = Vec::new();
-        let total_defined_funcs = if emit_trampolines {
-            defined_funcs.len() * 2
-        } else {
-            defined_funcs.len()
-        };
-        write_uleb(&mut func_sec, total_defined_funcs as u64);
-        for &(_, _, _, tidx) in &defined_funcs {
-            write_uleb(&mut func_sec, u64::from(tidx));
-        }
-        if emit_trampolines {
-            for &(_, _, _, tidx) in &defined_funcs {
-                write_uleb(&mut func_sec, u64::from(tidx));
+        if let (&[to, ..], &[result]) = (args, results) {
+            self.get(to)?;
+            // Cranelift's frontend types what the routine returns as an address of the
+            // machine it has a backend for.
+            if self.func.dfg.value_type(result) == types::I64 {
+                self.i(I::I64ExtendI32U);
             }
+            self.set(result)?;
         }
+        Ok(())
+    }
 
-        // 7. Export section (id = 7) for patch objects so `new WebAssembly.Instance` exposes patched fns.
-        let mut export_sec = Vec::new();
-        if emit_patch_exports {
-            write_uleb(&mut export_sec, defined_funcs.len() as u64);
-            for (i, (_, name, _, _)) in defined_funcs.iter().enumerate() {
-                write_str(&mut export_sec, name);
-                export_sec.push(0x00); // Func
-                write_uleb(&mut export_sec, u64::from(num_func_imports + i as u32));
+    /// Calls as [`Self::call`] does and goes on to where the call returns to. Nothing here
+    /// unwinds, so the handlers are never reached.
+    fn try_call(
+        &mut self,
+        block: Block,
+        callee: Option<&ExternalName>,
+        table: ir::ExceptionTable,
+        args: &[Value],
+    ) -> Result<(), String> {
+        let func = self.func;
+        let table = &func.dfg.exception_tables[table];
+        let signature = &func.dfg.signatures[table.signature()];
+        let returned = self.call_returning(callee, signature, args)?;
+        self.jump(block, *table.normal_return(), 0, &returned)
+    }
+
+    fn inst(&mut self, block: Block, inst: ir::Inst) -> Result<(), String> {
+        let func = self.func;
+        let dfg = &func.dfg;
+        let results = dfg.inst_results(inst);
+        let data = dfg.insts[inst];
+        let opcode = data.opcode();
+        match data {
+            InstructionData::Jump { destination, .. } => self.jump(block, destination, 0, &[]),
+            InstructionData::Brif { arg, blocks: [then, otherwise], .. } => {
+                self.truthy(arg)?;
+                self.i(I::If(BlockType::Empty));
+                self.jump(block, then, 1, &[])?;
+                self.i(I::End);
+                self.jump(block, otherwise, 0, &[])
             }
-        }
-
-        let code_section_index = if emit_patch_exports { 4u32 } else { 3u32 };
-        let data_section_index = code_section_index + 1;
-
-        // 10. Code section (id = 10) + reloc.CODE entries
-        // Each reloc entry: (reloc_type: u8, offset_in_code_sec: u32, index: u32, addend: Option<i64>)
-        let mut code_sec = Vec::new();
-        let mut code_relocs: Vec<(u8, u32, u32, Option<i64>)> = Vec::new();
-        write_uleb(&mut code_sec, total_defined_funcs as u64);
-        if emit_trampolines {
-            for (i, &(_, _, _, tidx)) in defined_funcs.iter().enumerate() {
-                let num_params = types[tidx as usize].params.len();
-                let mut tramp = Vec::new();
-                tramp.push(0x00); // 0 locals
-                for p in 0..num_params {
-                    tramp.push(0x20); // local.get
-                    write_uleb(&mut tramp, p as u64);
+            InstructionData::BranchTable { arg, table, .. } => {
+                let table = &dfg.jump_tables[table];
+                let cases = table.as_slice();
+                // One wasm block per case to land in, where the jump proper is: a case
+                // passes arguments of its own.
+                for _ in 0..=cases.len() {
+                    self.i(I::Block(BlockType::Empty));
                 }
-                tramp.push(0x41); // i32.const <table_slot>
-                let slot_reloc_off = tramp.len() as u32;
-                tramp.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
-                tramp.push(0x11); // call_indirect
-                let type_reloc_off = tramp.len() as u32;
-                let mut tidx_buf = [0u8; 5];
-                write_uleb_5(&mut tidx_buf, tidx);
-                tramp.extend_from_slice(&tidx_buf);
-                tramp.push(0x00); // table 0
-                tramp.push(0x0b); // end
-
-                let mut len_buf = Vec::new();
-                write_uleb(&mut len_buf, tramp.len() as u64);
-                let body_start = (code_sec.len() + len_buf.len()) as u32;
-                code_relocs.push((
-                    R_WASM_TABLE_INDEX_SLEB,
-                    body_start + slot_reloc_off,
-                    impl_sym_indices[i],
-                    None,
-                ));
-                code_relocs.push((
-                    R_WASM_TYPE_INDEX_LEB,
-                    body_start + type_reloc_off,
-                    tidx,
-                    None,
-                ));
-                code_sec.extend_from_slice(&len_buf);
-                code_sec.extend_from_slice(&tramp);
+                match self.class(arg)? {
+                    Class::Word(_) => self.get(arg)?,
+                    Class::Long => {
+                        // An index that does not fit goes to the default like any other
+                        // that is out of range.
+                        let count = cases.len() as i32;
+                        self.i(I::I32Const(count));
+                        self.get(arg)?;
+                        self.i(I::I32WrapI64);
+                        self.get(arg)?;
+                        self.i(I::I64Const(i64::from(count)));
+                        self.i(I::I64GeU);
+                        self.i(I::Select);
+                    }
+                    _ => return Err("wasm: br_table on a wide value".to_owned()),
+                }
+                let targets: Vec<u32> = (0..cases.len() as u32).collect();
+                self.i(I::BrTable(targets.into(), cases.len() as u32));
+                let count = cases.len() as u32;
+                for (at, &case) in cases.iter().enumerate() {
+                    self.i(I::End);
+                    self.jump(block, case, count - at as u32, &[])?;
+                }
+                self.i(I::End);
+                self.jump(block, table.default_block(), 0, &[])
             }
+            InstructionData::MultiAry { opcode: Opcode::Return, args } => {
+                let args = args.as_slice(&dfg.value_lists);
+                self.return_(args)
+            }
+            InstructionData::Trap { .. } => {
+                self.i(I::Unreachable);
+                Ok(())
+            }
+            InstructionData::CondTrap { arg, .. } => {
+                self.truthy(arg)?;
+                if opcode == Opcode::Trapz {
+                    self.i(I::I32Eqz);
+                }
+                self.i(I::If(BlockType::Empty));
+                self.i(I::Unreachable);
+                self.i(I::End);
+                Ok(())
+            }
+            InstructionData::Call { args, func_ref, .. } => {
+                let callee = &dfg.ext_funcs[func_ref];
+                let signature = &dfg.signatures[callee.signature];
+                let args = args.as_slice(&dfg.value_lists);
+                self.call(Some(&callee.name), signature, args, results)
+            }
+            InstructionData::CallIndirect { args, sig_ref, .. } => {
+                let args = args.as_slice(&dfg.value_lists);
+                self.call(None, &dfg.signatures[sig_ref], args, results)
+            }
+            InstructionData::TryCall { args, func_ref, exception, .. } => {
+                let callee = &dfg.ext_funcs[func_ref];
+                let args = args.as_slice(&dfg.value_lists);
+                self.try_call(block, Some(&callee.name), exception, args)
+            }
+            InstructionData::TryCallIndirect { args, exception, .. } => {
+                let args = args.as_slice(&dfg.value_lists);
+                self.try_call(block, None, exception, args)
+            }
+            InstructionData::FuncAddr { func_ref, .. } => {
+                self.address(&dfg.ext_funcs[func_ref].name, 0)?;
+                self.set(results[0])
+            }
+            InstructionData::UnaryGlobalValue { global_value, .. } => {
+                let GlobalValueData::Symbol { name, offset, .. } =
+                    &func.global_values[global_value]
+                else {
+                    return Err("wasm: global value that is not a symbol".to_owned());
+                };
+                self.address(name, offset.bits())?;
+                self.set(results[0])
+            }
+            InstructionData::StackAddr { stack_slot, offset, .. } => {
+                self.slot_address(stack_slot, offset.into())?;
+                self.set(results[0])
+            }
+            InstructionData::UnaryImm { imm, .. } => {
+                let class = self.class(results[0])?;
+                match class {
+                    Class::Word(bits) => {
+                        let mask = if bits == 32 { u32::MAX } else { (1 << bits) - 1 };
+                        self.i(I::I32Const((imm.bits() as u32 & mask) as i32));
+                    }
+                    Class::Long => self.i(I::I64Const(imm.bits())),
+                    _ => return Err("wasm: iconst of a wide type".to_owned()),
+                }
+                self.set(results[0])
+            }
+            InstructionData::UnaryIeee32 { imm, .. } => {
+                self.i(I::F32Const(f32::from_bits(imm.bits()).into()));
+                self.set(results[0])
+            }
+            InstructionData::UnaryIeee64 { imm, .. } => {
+                self.i(I::F64Const(f64::from_bits(imm.bits()).into()));
+                self.set(results[0])
+            }
+            InstructionData::Load { arg, offset, .. } => match opcode {
+                Opcode::Load => self.load(results[0], arg, offset.into()),
+                _ => {
+                    let (bits, signed) = match opcode {
+                        Opcode::Uload8 => (8, false),
+                        Opcode::Sload8 => (8, true),
+                        Opcode::Uload16 => (16, false),
+                        Opcode::Sload16 => (16, true),
+                        Opcode::Uload32 => (32, false),
+                        Opcode::Sload32 => (32, true),
+                        _ => return Err(format!("wasm: {opcode}")),
+                    };
+                    let class = self.class(results[0])?;
+                    let offset = self.pointer(arg, offset.into())?;
+                    self.load_int(class, bits, signed, offset);
+                    self.mask_for(class);
+                    self.set(results[0])
+                }
+            },
+            InstructionData::Store { args: [value, base], offset, .. } => match opcode {
+                Opcode::Store => self.store(value, base, offset.into()),
+                _ => {
+                    let bits = match opcode {
+                        Opcode::Istore8 => 8,
+                        Opcode::Istore16 => 16,
+                        Opcode::Istore32 => 32,
+                        _ => return Err(format!("wasm: {opcode}")),
+                    };
+                    let class = self.class(value)?;
+                    let offset = self.pointer(base, offset.into())?;
+                    self.get_low(value)?;
+                    self.store_int(class, bits, offset);
+                    Ok(())
+                }
+            },
+            InstructionData::LoadNoOffset { arg, .. } => match opcode {
+                Opcode::Bitcast => self.bitcast(results[0], arg),
+                // One thread runs the code: an atomic load is a load.
+                Opcode::AtomicLoad => self.load(results[0], arg, 0),
+                _ => Err(format!("wasm: {opcode}")),
+            },
+            InstructionData::StoreNoOffset { args: [value, base], .. } => match opcode {
+                Opcode::AtomicStore => self.store(value, base, 0),
+                _ => Err(format!("wasm: {opcode}")),
+            },
+            InstructionData::AtomicRmw { args: [base, value], op, .. } => {
+                self.atomic_rmw(results[0], base, value, op)
+            }
+            InstructionData::AtomicCas { args: [base, expected, replacement], .. } => {
+                let old = results[0];
+                self.load(old, base, 0)?;
+                match self.class(old)? {
+                    Class::Word(_) => {
+                        self.get(old)?;
+                        self.get(expected)?;
+                        self.i(I::I32Eq);
+                    }
+                    Class::Long => {
+                        self.get(old)?;
+                        self.get(expected)?;
+                        self.i(I::I64Eq);
+                    }
+                    _ => return Err("wasm: atomic_cas of a wide type".to_owned()),
+                }
+                self.i(I::If(BlockType::Empty));
+                self.store(replacement, base, 0)?;
+                self.i(I::End);
+                Ok(())
+            }
+            InstructionData::IntCompare { args: [a, b], cond, .. } => {
+                self.compare(Op::compare(cond), a, b)?;
+                self.set(results[0])
+            }
+            InstructionData::FloatCompare { args: [a, b], cond, .. } => {
+                self.float_compare(cond, a, b)?;
+                self.set(results[0])
+            }
+            InstructionData::Ternary { args: [a, b, c], .. } => match opcode {
+                Opcode::Select | Opcode::SelectSpectreGuard => self.select(results[0], a, b, c),
+                Opcode::Bitselect => {
+                    let long = match self.class(b)? {
+                        Class::Word(_) => false,
+                        Class::Long => true,
+                        _ => return Err("wasm: bitselect of this type".to_owned()),
+                    };
+                    self.get(b)?;
+                    self.get(a)?;
+                    self.op(Op::And, long);
+                    self.get(c)?;
+                    self.get(a)?;
+                    self.constant(-1, long);
+                    self.op(Op::Xor, long);
+                    self.op(Op::And, long);
+                    self.op(Op::Or, long);
+                    self.mask_for(self.class(b)?);
+                    self.set(results[0])
+                }
+                _ => Err(format!("wasm: {opcode}")),
+            },
+            InstructionData::Unary { arg, .. } => self.unary(opcode, results, arg),
+            InstructionData::Binary { args: [a, b], .. } => self.binary(opcode, results, a, b),
+            InstructionData::NullAry { .. } => match opcode {
+                Opcode::Nop | Opcode::Fence => Ok(()),
+                _ => Err(format!("wasm: {opcode}")),
+            },
+            _ => Err(format!("wasm: {opcode}")),
         }
-        for &(fid, _, _, _) in &defined_funcs {
-            let (raw_body, f_relocs) = &self.functions[&fid];
-            let mut patched_body = raw_body.clone();
-            let mut body_len_buf = Vec::new();
-            write_uleb(&mut body_len_buf, patched_body.len() as u64);
-            let body_start_in_sec = (code_sec.len() + body_len_buf.len()) as u32;
+    }
 
-            for reloc in f_relocs {
-                let slot_off = reloc.offset as usize;
-                let sec_off = body_start_in_sec + reloc.offset;
-                match (reloc.kind, &reloc.name) {
-                    (RELOC_SP_GLOBAL_LEB, _) => {
-                        write_uleb_5(&mut patched_body[slot_off..slot_off + 5], 0);
-                        code_relocs.push((R_WASM_GLOBAL_INDEX_LEB, sec_off, 0, None));
-                    }
-                    (RELOC_FN_LEB, &ModuleRelocTarget::User { namespace: 0, index }) => {
-                        let target_fid = FuncId::from_u32(index);
-                        let (sym_idx, wasm_fidx) = func_sym_index[&target_fid];
-                        write_uleb_5(&mut patched_body[slot_off..slot_off + 5], wasm_fidx);
-                        code_relocs.push((R_WASM_FUNCTION_INDEX_LEB, sec_off, sym_idx, None));
-                    }
-                    (RELOC_TABLE_SLEB, &ModuleRelocTarget::User { namespace: 0, index }) => {
-                        let target_fid = FuncId::from_u32(index);
-                        let (sym_idx, _) = func_sym_index[&target_fid];
-                        write_sleb_5(&mut patched_body[slot_off..slot_off + 5], 0);
-                        code_relocs.push((R_WASM_TABLE_INDEX_SLEB, sec_off, sym_idx, None));
-                    }
-                    (RELOC_MEM_SLEB, &ModuleRelocTarget::User { namespace: 1, index }) => {
-                        let target_did = DataId::from_u32(index);
-                        let (sym_idx, mem_off) = data_sym_index[&target_did];
-                        let val = (i64::from(mem_off) + reloc.addend) as i32;
-                        write_sleb_5(&mut patched_body[slot_off..slot_off + 5], val);
-                        code_relocs.push((
-                            R_WASM_MEMORY_ADDR_SLEB,
-                            sec_off,
-                            sym_idx,
-                            Some(reloc.addend),
-                        ));
-                    }
-                    (RELOC_TYPE_LEB, &ModuleRelocTarget::User { namespace: 3, index }) => {
-                        let wsig = get_global_wsig(index);
-                        let tidx = intern_wsig(wsig, &mut types, &mut type_map);
-                        write_uleb_5(&mut patched_body[slot_off..slot_off + 5], tidx);
-                        code_relocs.push((R_WASM_TYPE_INDEX_LEB, sec_off, tidx, None));
-                    }
-                    other => {
-                        return Err(CodegenError::Backend(format!(
-                            "unsupported wasm code reloc {other:?}"
-                        )));
+    fn select(
+        &mut self,
+        result: Value,
+        cond: Value,
+        then: Value,
+        otherwise: Value,
+    ) -> Result<(), String> {
+        if self.class(then)? == Class::Pair {
+            let local = self.local(result)?;
+            self.get_low(then)?;
+            self.get_low(otherwise)?;
+            self.truthy(cond)?;
+            self.i(I::Select);
+            self.get_high(then)?;
+            self.get_high(otherwise)?;
+            self.truthy(cond)?;
+            self.i(I::Select);
+            self.i(I::LocalSet(local + 1));
+            self.i(I::LocalSet(local));
+            return Ok(());
+        }
+        self.get(then)?;
+        self.get(otherwise)?;
+        self.truthy(cond)?;
+        self.i(I::Select);
+        self.set(result)
+    }
+
+    /// Pushes the `i32` that is one when the comparison holds.
+    fn compare(&mut self, op: Op, a: Value, b: Value) -> Result<(), String> {
+        match self.class(a)? {
+            class @ (Class::Word(_) | Class::Long) => {
+                self.get_for(a, op.is_signed())?;
+                self.get_for(b, op.is_signed())?;
+                self.op(op, class.is_long());
+            }
+            Class::Pair => match op {
+                Op::Eq | Op::Ne => {
+                    self.get_low(a)?;
+                    self.get_low(b)?;
+                    self.i(I::I64Xor);
+                    self.get_high(a)?;
+                    self.get_high(b)?;
+                    self.i(I::I64Xor);
+                    self.i(I::I64Or);
+                    self.i(I::I64Eqz);
+                    if matches!(op, Op::Ne) {
+                        self.i(I::I32Eqz);
                     }
                 }
-            }
-            code_sec.extend_from_slice(&body_len_buf);
-            code_sec.extend_from_slice(&patched_body);
+                _ => {
+                    // The high halves decide unless they are equal, and then the low ones
+                    // do, unsigned.
+                    self.get_low(a)?;
+                    self.get_low(b)?;
+                    self.op(
+                        if op.or_equal() {
+                            op.strict_unsigned_or_equal()
+                        } else {
+                            op.strict_unsigned()
+                        },
+                        true,
+                    );
+                    self.get_high(a)?;
+                    self.get_high(b)?;
+                    self.op(op.strict(), true);
+                    self.get_high(a)?;
+                    self.get_high(b)?;
+                    self.i(I::I64Eq);
+                    self.i(I::Select);
+                }
+            },
+            _ => return Err("wasm: icmp of floats".to_owned()),
         }
+        Ok(())
+    }
 
-        // 11. Data section (id = 11) + reloc.DATA entries
-        let mut data_sec = Vec::new();
-        let mut data_relocs: Vec<(u8, u32, u32, Option<i64>)> = Vec::new();
-        if !defined_datas.is_empty() {
-            write_uleb(&mut data_sec, defined_datas.len() as u64);
-            for (_, _, _, mem_off, blob) in &defined_datas {
-                data_sec.push(0x00); // active segment, memory 0
-                data_sec.push(0x41); // i32.const
-                write_sleb(&mut data_sec, i64::from(*mem_off as i32));
-                data_sec.push(0x0b); // end
-                let mut patched_bytes = blob.bytes.clone();
-                let mut len_buf = Vec::new();
-                write_uleb(&mut len_buf, patched_bytes.len() as u64);
-                let payload_start = (data_sec.len() + len_buf.len()) as u32;
+    fn float_compare(&mut self, cond: FloatCC, a: Value, b: Value) -> Result<(), String> {
+        let single = self.class(a)? == Class::F32;
+        let pick = |single: bool, f32: I<'static>, f64: I<'static>| if single { f32 } else { f64 };
+        let eq = pick(single, I::F32Eq, I::F64Eq);
+        let ne = pick(single, I::F32Ne, I::F64Ne);
+        let lt = pick(single, I::F32Lt, I::F64Lt);
+        let le = pick(single, I::F32Le, I::F64Le);
+        let gt = pick(single, I::F32Gt, I::F64Gt);
+        let ge = pick(single, I::F32Ge, I::F64Ge);
+        // Each is one comparison, or the opposite of one: an unordered pair fails every
+        // comparison but `ne`.
+        let (first, negate) = match cond {
+            FloatCC::Equal => (eq, false),
+            FloatCC::NotEqual => (ne, false),
+            FloatCC::LessThan => (lt, false),
+            FloatCC::LessThanOrEqual => (le, false),
+            FloatCC::GreaterThan => (gt, false),
+            FloatCC::GreaterThanOrEqual => (ge, false),
+            FloatCC::UnorderedOrLessThan => (ge, true),
+            FloatCC::UnorderedOrLessThanOrEqual => (gt, true),
+            FloatCC::UnorderedOrGreaterThan => (le, true),
+            FloatCC::UnorderedOrGreaterThanOrEqual => (lt, true),
+            FloatCC::Ordered | FloatCC::Unordered => {
+                self.get(a)?;
+                self.get(a)?;
+                self.i(eq.clone());
+                self.get(b)?;
+                self.get(b)?;
+                self.i(eq);
+                self.i(I::I32And);
+                if cond == FloatCC::Unordered {
+                    self.i(I::I32Eqz);
+                }
+                return Ok(());
+            }
+            FloatCC::OrderedNotEqual | FloatCC::UnorderedOrEqual => {
+                self.get(a)?;
+                self.get(b)?;
+                self.i(lt);
+                self.get(a)?;
+                self.get(b)?;
+                self.i(gt);
+                self.i(I::I32Or);
+                if cond == FloatCC::UnorderedOrEqual {
+                    self.i(I::I32Eqz);
+                }
+                return Ok(());
+            }
+        };
+        self.get(a)?;
+        self.get(b)?;
+        self.i(first);
+        if negate {
+            self.i(I::I32Eqz);
+        }
+        Ok(())
+    }
 
-                for &(off, target_did, addend) in &blob.relocs {
-                    let (sym_idx, target_mem_off) = data_sym_index[&target_did];
-                    let slot = off as usize;
-                    if slot + 4 <= patched_bytes.len() {
-                        let val = (i64::from(target_mem_off) + addend) as u32;
-                        patched_bytes[slot..slot + 4].copy_from_slice(&val.to_le_bytes());
-                        if slot + 8 <= patched_bytes.len() {
-                            patched_bytes[slot + 4..slot + 8].fill(0);
+    fn bitcast(&mut self, result: Value, arg: Value) -> Result<(), String> {
+        self.get(arg)?;
+        match (self.class(arg)?, self.class(result)?) {
+            (Class::Word(32), Class::F32) => self.i(I::F32ReinterpretI32),
+            (Class::F32, Class::Word(32)) => self.i(I::I32ReinterpretF32),
+            (Class::Long, Class::F64) => self.i(I::F64ReinterpretI64),
+            (Class::F64, Class::Long) => self.i(I::I64ReinterpretF64),
+            (from, to) if from == to => {}
+            (from, to) => return Err(format!("wasm: bitcast from {from:?} to {to:?}")),
+        }
+        self.set(result)
+    }
+
+    fn atomic_rmw(
+        &mut self,
+        old: Value,
+        base: Value,
+        value: Value,
+        op: AtomicRmwOp,
+    ) -> Result<(), String> {
+        let class = self.class(old)?;
+        let long = match class {
+            Class::Word(_) => false,
+            Class::Long => true,
+            _ => return Err("wasm: atomic_rmw of a wide type".to_owned()),
+        };
+        self.load(old, base, 0)?;
+        self.get(base)?;
+        match op {
+            AtomicRmwOp::Xchg => self.get(value)?,
+            AtomicRmwOp::Add
+            | AtomicRmwOp::Sub
+            | AtomicRmwOp::And
+            | AtomicRmwOp::Or
+            | AtomicRmwOp::Xor => {
+                self.get(old)?;
+                self.get(value)?;
+                self.op(
+                    match op {
+                        AtomicRmwOp::Add => Op::Add,
+                        AtomicRmwOp::Sub => Op::Sub,
+                        AtomicRmwOp::And => Op::And,
+                        AtomicRmwOp::Or => Op::Or,
+                        _ => Op::Xor,
+                    },
+                    long,
+                );
+            }
+            AtomicRmwOp::Nand => {
+                self.get(old)?;
+                self.get(value)?;
+                self.op(Op::And, long);
+                self.constant(-1, long);
+                self.op(Op::Xor, long);
+            }
+            AtomicRmwOp::Umin | AtomicRmwOp::Umax | AtomicRmwOp::Smin | AtomicRmwOp::Smax => {
+                let pick = match op {
+                    AtomicRmwOp::Umin => Op::LtU,
+                    AtomicRmwOp::Umax => Op::GtU,
+                    AtomicRmwOp::Smin => Op::LtS,
+                    _ => Op::GtS,
+                };
+                self.get(old)?;
+                self.get(value)?;
+                self.compare(pick, old, value)?;
+                self.i(I::Select);
+            }
+        }
+        // The store keeps the low bits alone, so nothing has to be cleared.
+        match class {
+            Class::Word(bits) => self.store_int(class, bits, 0),
+            _ => self.i(I::I64Store(mem(0))),
+        }
+        Ok(())
+    }
+
+    fn unary(&mut self, opcode: Opcode, results: &[Value], arg: Value) -> Result<(), String> {
+        let from = self.class(arg)?;
+        if opcode == Opcode::Isplit {
+            self.get_low(arg)?;
+            self.set(results[0])?;
+            self.get_high(arg)?;
+            return self.set(results[1]);
+        }
+        let result = results[0];
+        let to = self.class(result)?;
+        let single = from == Class::F32;
+        let float = |single: bool, f32: I<'static>, f64: I<'static>| if single { f32 } else { f64 };
+        match opcode {
+            Opcode::Uextend | Opcode::Sextend => {
+                let signed = opcode == Opcode::Sextend;
+                match (from, to) {
+                    (Class::Word(_), Class::Word(_)) => {
+                        self.get_for(arg, signed)?;
+                        self.mask_for(to);
+                    }
+                    (Class::Word(_), Class::Long | Class::Pair) => {
+                        self.get_for(arg, signed)?;
+                        self.i(if signed { I::I64ExtendI32S } else { I::I64ExtendI32U });
+                    }
+                    (Class::Long, Class::Pair) => self.get(arg)?,
+                    _ => return Err(format!("wasm: extend from {from:?} to {to:?}")),
+                }
+                if to == Class::Pair {
+                    // The low half is on the stack; the high one is its sign, or nothing.
+                    let local = self.local(result)?;
+                    self.i(I::LocalTee(local));
+                    self.i(I::I64Const(if signed { 63 } else { 64 }));
+                    self.i(if signed { I::I64ShrS } else { I::I64ShrU });
+                    if !signed {
+                        self.i(I::Drop);
+                        self.i(I::I64Const(0));
+                    }
+                    self.i(I::LocalSet(local + 1));
+                    return Ok(());
+                }
+            }
+            Opcode::Ireduce => {
+                self.get_low(arg)?;
+                if matches!(from, Class::Long | Class::Pair) && matches!(to, Class::Word(_)) {
+                    self.i(I::I32WrapI64);
+                }
+                self.mask_for(to);
+            }
+            Opcode::Ineg => match to {
+                Class::Word(_) | Class::Long => {
+                    self.constant(0, to.is_long());
+                    self.get(arg)?;
+                    self.op(Op::Sub, to.is_long());
+                    self.mask_for(to);
+                }
+                _ => return Err("wasm: ineg of a wide type".to_owned()),
+            },
+            Opcode::Bnot => match to {
+                Class::Word(_) | Class::Long => {
+                    self.get(arg)?;
+                    self.constant(-1, to.is_long());
+                    self.op(Op::Xor, to.is_long());
+                    self.mask_for(to);
+                }
+                Class::Pair => {
+                    self.get_low(arg)?;
+                    self.i(I::I64Const(-1));
+                    self.i(I::I64Xor);
+                    self.get_high(arg)?;
+                    self.i(I::I64Const(-1));
+                    self.i(I::I64Xor);
+                }
+                _ => return Err("wasm: bnot of a float".to_owned()),
+            },
+            Opcode::Popcnt => match to {
+                Class::Word(_) | Class::Long => {
+                    self.get(arg)?;
+                    self.op(Op::Popcnt, to.is_long());
+                }
+                Class::Pair => {
+                    self.get_low(arg)?;
+                    self.i(I::I64Popcnt);
+                    self.get_high(arg)?;
+                    self.i(I::I64Popcnt);
+                    self.i(I::I64Add);
+                    self.i(I::I64Const(0));
+                }
+                _ => return Err("wasm: popcnt of a float".to_owned()),
+            },
+            Opcode::Clz => match to {
+                Class::Word(bits) => {
+                    self.get(arg)?;
+                    self.i(I::I32Clz);
+                    if bits < 32 {
+                        self.i(I::I32Const(32 - i32::from(bits)));
+                        self.i(I::I32Sub);
+                    }
+                }
+                Class::Long => {
+                    self.get(arg)?;
+                    self.i(I::I64Clz);
+                }
+                Class::Pair => {
+                    self.get_high(arg)?;
+                    self.i(I::I64Clz);
+                    self.get_low(arg)?;
+                    self.i(I::I64Clz);
+                    self.i(I::I64Const(64));
+                    self.i(I::I64Add);
+                    self.get_high(arg)?;
+                    self.i(I::I64Const(0));
+                    self.i(I::I64Ne);
+                    self.i(I::Select);
+                    self.i(I::I64Const(0));
+                }
+                _ => return Err("wasm: clz of a float".to_owned()),
+            },
+            Opcode::Ctz => match to {
+                Class::Word(bits) => {
+                    self.get(arg)?;
+                    if bits < 32 {
+                        // A bit past the end stops the count there.
+                        self.i(I::I32Const(1 << bits));
+                        self.i(I::I32Or);
+                    }
+                    self.i(I::I32Ctz);
+                }
+                Class::Long => {
+                    self.get(arg)?;
+                    self.i(I::I64Ctz);
+                }
+                Class::Pair => {
+                    self.get_low(arg)?;
+                    self.i(I::I64Ctz);
+                    self.get_high(arg)?;
+                    self.i(I::I64Ctz);
+                    self.i(I::I64Const(64));
+                    self.i(I::I64Add);
+                    self.get_low(arg)?;
+                    self.i(I::I64Const(0));
+                    self.i(I::I64Ne);
+                    self.i(I::Select);
+                    self.i(I::I64Const(0));
+                }
+                _ => return Err("wasm: ctz of a float".to_owned()),
+            },
+            Opcode::Bswap => match to {
+                Class::Word(16) => {
+                    self.get(arg)?;
+                    self.swap_bytes(false, 16);
+                }
+                Class::Word(32) => {
+                    self.get(arg)?;
+                    self.swap_bytes(false, 32);
+                }
+                Class::Long => {
+                    self.get(arg)?;
+                    self.swap_bytes(true, 64);
+                }
+                Class::Pair => {
+                    self.get_high(arg)?;
+                    self.swap_bytes(true, 64);
+                    self.get_low(arg)?;
+                    self.swap_bytes(true, 64);
+                }
+                _ => return Err("wasm: bswap of this type".to_owned()),
+            },
+            Opcode::Bitrev => match to {
+                Class::Word(bits) => {
+                    self.get(arg)?;
+                    self.reverse_bits(false, bits);
+                }
+                Class::Long => {
+                    self.get(arg)?;
+                    self.reverse_bits(true, 64);
+                }
+                Class::Pair => {
+                    self.get_high(arg)?;
+                    self.reverse_bits(true, 64);
+                    self.get_low(arg)?;
+                    self.reverse_bits(true, 64);
+                }
+                _ => return Err("wasm: bitrev of a float".to_owned()),
+            },
+            Opcode::Fneg => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Neg, I::F64Neg));
+            }
+            Opcode::Fabs => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Abs, I::F64Abs));
+            }
+            Opcode::Sqrt => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Sqrt, I::F64Sqrt));
+            }
+            Opcode::Ceil => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Ceil, I::F64Ceil));
+            }
+            Opcode::Floor => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Floor, I::F64Floor));
+            }
+            Opcode::Trunc => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Trunc, I::F64Trunc));
+            }
+            Opcode::Nearest => {
+                self.get(arg)?;
+                self.i(float(single, I::F32Nearest, I::F64Nearest));
+            }
+            Opcode::Fpromote => {
+                self.get(arg)?;
+                self.i(I::F64PromoteF32);
+            }
+            Opcode::Fdemote => {
+                self.get(arg)?;
+                self.i(I::F32DemoteF64);
+            }
+            Opcode::FcvtFromUint | Opcode::FcvtFromSint => {
+                let signed = opcode == Opcode::FcvtFromSint;
+                self.get_for(arg, signed)?;
+                self.i(match (from, to, signed) {
+                    (Class::Word(_), Class::F32, false) => I::F32ConvertI32U,
+                    (Class::Word(_), Class::F32, true) => I::F32ConvertI32S,
+                    (Class::Word(_), Class::F64, false) => I::F64ConvertI32U,
+                    (Class::Word(_), Class::F64, true) => I::F64ConvertI32S,
+                    (Class::Long, Class::F32, false) => I::F32ConvertI64U,
+                    (Class::Long, Class::F32, true) => I::F32ConvertI64S,
+                    (Class::Long, Class::F64, false) => I::F64ConvertI64U,
+                    (Class::Long, Class::F64, true) => I::F64ConvertI64S,
+                    _ => return Err(format!("wasm: {opcode} from {from:?}")),
+                });
+            }
+            Opcode::FcvtToUintSat | Opcode::FcvtToSintSat => {
+                let signed = opcode == Opcode::FcvtToSintSat;
+                self.get(arg)?;
+                self.i(match (single, to, signed) {
+                    (true, Class::Word(_), false) => I::I32TruncSatF32U,
+                    (true, Class::Word(_), true) => I::I32TruncSatF32S,
+                    (false, Class::Word(_), false) => I::I32TruncSatF64U,
+                    (false, Class::Word(_), true) => I::I32TruncSatF64S,
+                    (true, Class::Long, false) => I::I64TruncSatF32U,
+                    (true, Class::Long, true) => I::I64TruncSatF32S,
+                    (false, Class::Long, false) => I::I64TruncSatF64U,
+                    (false, Class::Long, true) => I::I64TruncSatF64S,
+                    _ => return Err(format!("wasm: {opcode} to {to:?}")),
+                });
+                if let Some(bits) = to.narrow() {
+                    // Saturated to 32 bits so far: the narrow type has bounds of its own.
+                    let (low, high) = match signed {
+                        true => (-(1i32 << (bits - 1)), (1i32 << (bits - 1)) - 1),
+                        false => (0, (1i32 << bits) - 1),
+                    };
+                    let value = self.temp(ValType::I32);
+                    for (bound, keep) in [(high, Op::LtS), (low, Op::GtS)] {
+                        let keep = if signed { keep } else { keep.strict_unsigned() };
+                        self.i(I::LocalTee(value));
+                        self.i(I::I32Const(bound));
+                        self.i(I::LocalGet(value));
+                        self.i(I::I32Const(bound));
+                        self.op(keep, false);
+                        self.i(I::Select);
+                    }
+                    self.mask(bits);
+                }
+            }
+            _ => return Err(format!("wasm: {opcode}")),
+        }
+        self.set(result)
+    }
+
+    /// Reverses the bytes of the integer on the stack.
+    fn swap_bytes(&mut self, long: bool, bits: u8) {
+        let value = self.temp(if long { ValType::I64 } else { ValType::I32 });
+        // Neighbouring bytes change places, then neighbouring pairs of them, and so on.
+        let steps: &[(i64, u64)] = match bits {
+            16 => &[(8, 0x00ff)],
+            32 => &[(8, 0x00ff_00ff), (16, 0x0000_ffff)],
+            _ => &[(8, 0x00ff_00ff_00ff_00ff), (16, 0x0000_ffff_0000_ffff), (32, 0xffff_ffff)],
+        };
+        self.swap_groups(value, long, steps);
+    }
+
+    /// Reverses the bits of the integer on the stack, which is `bits` wide.
+    fn reverse_bits(&mut self, long: bool, bits: u8) {
+        let value = self.temp(if long { ValType::I64 } else { ValType::I32 });
+        let ones = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let steps = [
+            (1, 0x5555_5555_5555_5555 & ones),
+            (2, 0x3333_3333_3333_3333 & ones),
+            (4, 0x0f0f_0f0f_0f0f_0f0f & ones),
+        ];
+        self.swap_groups(value, long, &steps);
+        if bits > 8 {
+            self.swap_bytes(long, bits);
+        }
+    }
+
+    /// For each step, swaps every group of `shift` bits with the one beside it: `mask` has
+    /// the lower group of each pair set.
+    fn swap_groups(&mut self, value: u32, long: bool, steps: &[(i64, u64)]) {
+        for &(shift, mask) in steps {
+            self.i(I::LocalTee(value));
+            self.constant(mask as i64, long);
+            self.op(Op::And, long);
+            self.constant(shift, long);
+            self.op(Op::Shl, long);
+            self.i(I::LocalGet(value));
+            self.constant(shift, long);
+            self.op(Op::ShrU, long);
+            self.constant(mask as i64, long);
+            self.op(Op::And, long);
+            self.op(Op::Or, long);
+        }
+    }
+
+    fn binary(
+        &mut self,
+        opcode: Opcode,
+        results: &[Value],
+        a: Value,
+        b: Value,
+    ) -> Result<(), String> {
+        let result = results[0];
+        let class = self.class(a)?;
+        if opcode == Opcode::Iconcat {
+            self.get(a)?;
+            self.get(b)?;
+            return self.set(result);
+        }
+        match class {
+            Class::Word(_) | Class::Long => self.binary_int(opcode, results, a, b, class),
+            Class::Pair => self.binary_wide(opcode, results, a, b),
+            Class::F32 | Class::F64 => {
+                let single = class == Class::F32;
+                let float = |f32: I<'static>, f64: I<'static>| if single { f32 } else { f64 };
+                let instruction = match opcode {
+                    Opcode::Fadd => float(I::F32Add, I::F64Add),
+                    Opcode::Fsub => float(I::F32Sub, I::F64Sub),
+                    Opcode::Fmul => float(I::F32Mul, I::F64Mul),
+                    Opcode::Fdiv => float(I::F32Div, I::F64Div),
+                    Opcode::Fmin => float(I::F32Min, I::F64Min),
+                    Opcode::Fmax => float(I::F32Max, I::F64Max),
+                    Opcode::Fcopysign => float(I::F32Copysign, I::F64Copysign),
+                    _ => return Err(format!("wasm: {opcode}")),
+                };
+                self.get(a)?;
+                self.get(b)?;
+                self.i(instruction);
+                self.set(result)
+            }
+        }
+    }
+
+    fn binary_int(
+        &mut self,
+        opcode: Opcode,
+        results: &[Value],
+        a: Value,
+        b: Value,
+        class: Class,
+    ) -> Result<(), String> {
+        let result = results[0];
+        let long = class.is_long();
+        let bits = match class {
+            Class::Word(bits) => bits,
+            _ => 64,
+        };
+        let simple = match opcode {
+            Opcode::Iadd => Some(Op::Add),
+            Opcode::Isub => Some(Op::Sub),
+            Opcode::Imul => Some(Op::Mul),
+            Opcode::Band => Some(Op::And),
+            Opcode::Bor => Some(Op::Or),
+            Opcode::Bxor => Some(Op::Xor),
+            Opcode::Udiv => Some(Op::DivU),
+            Opcode::Urem => Some(Op::RemU),
+            Opcode::Sdiv => Some(Op::DivS),
+            Opcode::Srem => Some(Op::RemS),
+            _ => None,
+        };
+        if let Some(op) = simple {
+            self.get_for(a, op.is_signed())?;
+            self.get_for(b, op.is_signed())?;
+            self.op(op, long);
+            self.mask_for(class);
+            return self.set(result);
+        }
+        match opcode {
+            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
+                let op = match opcode {
+                    Opcode::Ishl => Op::Shl,
+                    Opcode::Ushr => Op::ShrU,
+                    _ => Op::ShrS,
+                };
+                self.get_for(a, op.is_signed())?;
+                self.amount(b, long)?;
+                if bits < 32 {
+                    // Wasm takes the amount modulo 32, the narrow type modulo its width.
+                    self.i(I::I32Const(i32::from(bits) - 1));
+                    self.i(I::I32And);
+                }
+                self.op(op, long);
+                self.mask_for(class);
+            }
+            Opcode::Rotl | Opcode::Rotr => {
+                let left = opcode == Opcode::Rotl;
+                if bits >= 32 {
+                    self.get(a)?;
+                    self.amount(b, long)?;
+                    self.op(if left { Op::Rotl } else { Op::Rotr }, long);
+                } else {
+                    // Two shifts that meet: the second amount is what is left of the width.
+                    let amount = self.temp(ValType::I32);
+                    let (there, back) =
+                        if left { (Op::Shl, Op::ShrU) } else { (Op::ShrU, Op::Shl) };
+                    self.amount(b, false)?;
+                    self.i(I::I32Const(i32::from(bits) - 1));
+                    self.i(I::I32And);
+                    self.i(I::LocalSet(amount));
+                    self.get(a)?;
+                    self.i(I::LocalGet(amount));
+                    self.op(there, false);
+                    self.get(a)?;
+                    self.i(I::I32Const(i32::from(bits)));
+                    self.i(I::LocalGet(amount));
+                    self.i(I::I32Sub);
+                    self.i(I::I32Const(i32::from(bits) - 1));
+                    self.i(I::I32And);
+                    self.op(back, false);
+                    self.i(I::I32Or);
+                    self.mask(bits);
+                }
+            }
+            Opcode::Umin | Opcode::Umax | Opcode::Smin | Opcode::Smax => {
+                let pick = match opcode {
+                    Opcode::Umin => Op::LtU,
+                    Opcode::Umax => Op::GtU,
+                    Opcode::Smin => Op::LtS,
+                    _ => Op::GtS,
+                };
+                self.get(a)?;
+                self.get(b)?;
+                self.compare(pick, a, b)?;
+                self.i(I::Select);
+            }
+            Opcode::Umulhi | Opcode::Smulhi if long => {
+                let (x, y) = (self.local(a)?, self.local(b)?);
+                self.multiply_high(x, y, opcode == Opcode::Smulhi);
+            }
+            Opcode::UaddOverflow | Opcode::UsubOverflow => {
+                let add = opcode == Opcode::UaddOverflow;
+                self.get(a)?;
+                self.get(b)?;
+                self.op(if add { Op::Add } else { Op::Sub }, long);
+                self.mask_for(class);
+                self.set(result)?;
+                // A sum that wrapped is below what went in, and a difference wraps when
+                // more is taken than there is.
+                self.get(if add { result } else { a })?;
+                self.get(if add { a } else { b })?;
+                self.op(Op::LtU, long);
+                return self.set(results[1]);
+            }
+            Opcode::SaddOverflow | Opcode::SsubOverflow if long => {
+                let add = opcode == Opcode::SaddOverflow;
+                self.get(a)?;
+                self.get(b)?;
+                self.op(if add { Op::Add } else { Op::Sub }, true);
+                self.set(result)?;
+                // The sign is wrong when both operands differ from the sum in it, and for a
+                // difference when the operands differ and the result is not on `a`'s side.
+                self.get(a)?;
+                self.get(if add { result } else { b })?;
+                self.i(I::I64Xor);
+                self.get(if add { b } else { a })?;
+                self.get(result)?;
+                self.i(I::I64Xor);
+                self.i(I::I64And);
+                self.i(I::I64Const(0));
+                self.i(I::I64LtS);
+                return self.set(results[1]);
+            }
+            Opcode::SaddOverflow | Opcode::SsubOverflow | Opcode::SmulOverflow if !long => {
+                // In 64 bits nothing overflows: the result fits the type when extending its
+                // low bits gives it back.
+                let exact = self.temp(ValType::I64);
+                for value in [a, b] {
+                    self.get_signed(value)?;
+                    self.i(I::I64ExtendI32S);
+                }
+                self.i(match opcode {
+                    Opcode::SaddOverflow => I::I64Add,
+                    Opcode::SsubOverflow => I::I64Sub,
+                    _ => I::I64Mul,
+                });
+                self.i(I::LocalTee(exact));
+                self.i(I::I32WrapI64);
+                self.mask_for(class);
+                self.set(result)?;
+                self.i(I::LocalGet(exact));
+                self.i(I::LocalGet(exact));
+                self.i(match bits {
+                    8 => I::I64Extend8S,
+                    16 => I::I64Extend16S,
+                    _ => I::I64Extend32S,
+                });
+                self.i(I::I64Ne);
+                return self.set(results[1]);
+            }
+            Opcode::UmulOverflow if !long => {
+                let exact = self.temp(ValType::I64);
+                for value in [a, b] {
+                    self.get(value)?;
+                    self.i(I::I64ExtendI32U);
+                }
+                self.i(I::I64Mul);
+                self.i(I::LocalTee(exact));
+                self.i(I::I32WrapI64);
+                self.mask_for(class);
+                self.set(result)?;
+                self.i(I::LocalGet(exact));
+                self.i(I::I64Const(i64::from(bits)));
+                self.i(I::I64ShrU);
+                self.i(I::I64Const(0));
+                self.i(I::I64Ne);
+                return self.set(results[1]);
+            }
+            Opcode::UmulOverflow | Opcode::SmulOverflow => {
+                let signed = opcode == Opcode::SmulOverflow;
+                let (x, y) = (self.local(a)?, self.local(b)?);
+                self.get(a)?;
+                self.get(b)?;
+                self.i(I::I64Mul);
+                self.set(result)?;
+                // The upper half of the full product has to be nothing but the sign of the
+                // lower one.
+                self.multiply_high(x, y, signed);
+                if signed {
+                    self.get(result)?;
+                    self.i(I::I64Const(63));
+                    self.i(I::I64ShrS);
+                } else {
+                    self.i(I::I64Const(0));
+                }
+                self.i(I::I64Ne);
+                return self.set(results[1]);
+            }
+            _ => return Err(format!("wasm: {opcode}")),
+        }
+        self.set(result)
+    }
+
+    /// Pushes the upper 64 bits of the product of two `i64` locals.
+    fn multiply_high(&mut self, a: u32, b: u32, signed: bool) {
+        let [low, cross] = [(); 2].map(|()| self.temp(ValType::I64));
+        let half = |this: &mut Self, local: u32, upper: bool| {
+            this.i(I::LocalGet(local));
+            if upper {
+                this.i(I::I64Const(32));
+                this.i(I::I64ShrU);
+            } else {
+                this.i(I::I64Const(0xffff_ffff));
+                this.i(I::I64And);
+            }
+        };
+        // Schoolbook multiplication on 32-bit halves, carrying through the middle.
+        half(self, a, true);
+        half(self, b, false);
+        self.i(I::I64Mul);
+        half(self, a, false);
+        half(self, b, false);
+        self.i(I::I64Mul);
+        self.i(I::I64Const(32));
+        self.i(I::I64ShrU);
+        self.i(I::I64Add);
+        self.i(I::LocalSet(cross));
+        half(self, a, false);
+        half(self, b, true);
+        self.i(I::I64Mul);
+        half(self, cross, false);
+        self.i(I::I64Add);
+        self.i(I::LocalSet(low));
+        half(self, a, true);
+        half(self, b, true);
+        self.i(I::I64Mul);
+        half(self, cross, true);
+        self.i(I::I64Add);
+        half(self, low, true);
+        self.i(I::I64Add);
+        if signed {
+            // A negative operand counted as 2^64 more than it is, times the other.
+            for (negative, other) in [(a, b), (b, a)] {
+                self.i(I::LocalGet(other));
+                self.i(I::I64Const(0));
+                self.i(I::LocalGet(negative));
+                self.i(I::I64Const(0));
+                self.i(I::I64LtS);
+                self.i(I::Select);
+                self.i(I::I64Sub);
+            }
+        }
+    }
+
+    fn binary_wide(
+        &mut self,
+        opcode: Opcode,
+        results: &[Value],
+        a: Value,
+        b: Value,
+    ) -> Result<(), String> {
+        let result = results[0];
+        let out = self.local(result)?;
+        match opcode {
+            Opcode::Band | Opcode::Bor | Opcode::Bxor => {
+                let op = match opcode {
+                    Opcode::Band => Op::And,
+                    Opcode::Bor => Op::Or,
+                    _ => Op::Xor,
+                };
+                self.get_low(a)?;
+                self.get_low(b)?;
+                self.op(op, true);
+                self.get_high(a)?;
+                self.get_high(b)?;
+                self.op(op, true);
+                self.set(result)
+            }
+            Opcode::Iadd
+            | Opcode::Isub
+            | Opcode::UaddOverflow
+            | Opcode::UsubOverflow
+            | Opcode::SaddOverflow
+            | Opcode::SsubOverflow => {
+                let add =
+                    matches!(opcode, Opcode::Iadd | Opcode::UaddOverflow | Opcode::SaddOverflow);
+                let op = if add { Op::Add } else { Op::Sub };
+                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                self.get_low(a)?;
+                self.get_low(b)?;
+                self.op(op, true);
+                self.i(I::LocalSet(low));
+                self.get_high(a)?;
+                self.get_high(b)?;
+                self.op(op, true);
+                // What the low halves carry or borrow.
+                if add {
+                    self.i(I::LocalGet(low));
+                    self.get_low(a)?;
+                } else {
+                    self.get_low(a)?;
+                    self.get_low(b)?;
+                }
+                self.i(I::I64LtU);
+                self.i(I::I64ExtendI32U);
+                self.op(op, true);
+                self.i(I::LocalSet(high));
+                match opcode {
+                    Opcode::UaddOverflow | Opcode::UsubOverflow => {
+                        // As for one word, over both: the high halves decide unless equal.
+                        let (x_low, x_high, y) = if add { (low, high, a) } else { (0, 0, b) };
+                        if add {
+                            self.i(I::LocalGet(x_low));
+                            self.get_low(y)?;
+                            self.i(I::I64LtU);
+                            self.i(I::LocalGet(x_high));
+                            self.get_high(y)?;
+                            self.i(I::I64LtU);
+                            self.i(I::LocalGet(x_high));
+                            self.get_high(y)?;
+                            self.i(I::I64Eq);
+                            self.i(I::Select);
+                        } else {
+                            self.compare(Op::LtU, a, y)?;
                         }
-                        data_relocs.push((
-                            R_WASM_MEMORY_ADDR_I32,
-                            payload_start + off,
-                            sym_idx,
-                            Some(addend),
-                        ));
+                        self.set(results[1])?;
                     }
-                }
-                for &(off, target_fid) in &blob.fn_relocs {
-                    let (sym_idx, _) = func_sym_index[&target_fid];
-                    let slot = off as usize;
-                    if slot + 4 <= patched_bytes.len() {
-                        patched_bytes[slot..slot + 4].fill(0);
-                        data_relocs.push((
-                            R_WASM_TABLE_INDEX_I32,
-                            payload_start + off,
-                            sym_idx,
-                            None,
-                        ));
+                    Opcode::SaddOverflow | Opcode::SsubOverflow => {
+                        self.get_high(a)?;
+                        if add {
+                            self.i(I::LocalGet(high));
+                        } else {
+                            self.get_high(b)?;
+                        }
+                        self.i(I::I64Xor);
+                        if add {
+                            self.get_high(b)?;
+                        } else {
+                            self.get_high(a)?;
+                        }
+                        self.i(I::LocalGet(high));
+                        self.i(I::I64Xor);
+                        self.i(I::I64And);
+                        self.i(I::I64Const(0));
+                        self.i(I::I64LtS);
+                        self.set(results[1])?;
                     }
+                    _ => {}
                 }
-                data_sec.extend_from_slice(&len_buf);
-                data_sec.extend_from_slice(&patched_bytes);
+                self.i(I::LocalGet(low));
+                self.i(I::LocalSet(out));
+                self.i(I::LocalGet(high));
+                self.i(I::LocalSet(out + 1));
+                Ok(())
             }
-        }
-
-        // Custom section: "linking"
-        let mut linking_payload = Vec::new();
-        write_str(&mut linking_payload, "linking");
-        write_uleb(&mut linking_payload, 2); // version 2
-
-        if !defined_datas.is_empty() {
-            // WASM_SEGMENT_INFO (subsection 5)
-            let mut seg_info = Vec::new();
-            write_uleb(&mut seg_info, defined_datas.len() as u64);
-            for (_, name, _, _, blob) in &defined_datas {
-                write_str(&mut seg_info, &format!(".rodata.{name}"));
-                let p2align = blob.align.max(1).trailing_zeros();
-                write_uleb(&mut seg_info, u64::from(p2align));
-                write_uleb(&mut seg_info, 0); // flags
+            Opcode::Imul => {
+                let (x, y) = (self.local(a)?, self.local(b)?);
+                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                self.i(I::LocalGet(x));
+                self.i(I::LocalGet(y));
+                self.i(I::I64Mul);
+                self.i(I::LocalSet(low));
+                self.multiply_high(x, y, false);
+                self.i(I::LocalGet(x));
+                self.i(I::LocalGet(y + 1));
+                self.i(I::I64Mul);
+                self.i(I::I64Add);
+                self.i(I::LocalGet(x + 1));
+                self.i(I::LocalGet(y));
+                self.i(I::I64Mul);
+                self.i(I::I64Add);
+                self.i(I::LocalSet(high));
+                self.i(I::LocalGet(low));
+                self.i(I::LocalSet(out));
+                self.i(I::LocalGet(high));
+                self.i(I::LocalSet(out + 1));
+                Ok(())
             }
-            linking_payload.push(5);
-            write_uleb(&mut linking_payload, seg_info.len() as u64);
-            linking_payload.extend_from_slice(&seg_info);
-        }
-
-        // WASM_SYMBOL_TABLE (subsection 8)
-        let mut symtab = Vec::new();
-        write_uleb(&mut symtab, u64::from(next_sym));
-        // Symbol 0: __stack_pointer
-        symtab.push(2); // SYMTAB_GLOBAL
-        write_uleb(&mut symtab, 0x10); // WASM_SYM_UNDEFINED
-        write_uleb(&mut symtab, 0); // element_index = 0
-        // Imported functions
-        for (i, _) in imported_funcs.iter().enumerate() {
-            symtab.push(0); // SYMTAB_FUNCTION
-            write_uleb(&mut symtab, 0x10); // WASM_SYM_UNDEFINED
-            write_uleb(&mut symtab, i as u64);
-        }
-        // Defined functions
-        for (i, (_, name, linkage, _)) in defined_funcs.iter().enumerate() {
-            symtab.push(0); // SYMTAB_FUNCTION
-            let flags = match linkage {
-                Linkage::Local => 0x02u64,  // WASM_SYM_BINDING_LOCAL
-                Linkage::Hidden => 0x04u64, // WASM_SYM_VISIBILITY_HIDDEN
-                _ => 0x00u64,               // global default
-            };
-            write_uleb(&mut symtab, flags);
-            write_uleb(&mut symtab, (num_func_imports as usize + i) as u64);
-            write_str(&mut symtab, name);
-        }
-        if emit_trampolines {
-            let m = defined_funcs.len();
-            for (i, (_, name, _, _)) in defined_funcs.iter().enumerate() {
-                symtab.push(0); // SYMTAB_FUNCTION
-                write_uleb(&mut symtab, 0x00u64); // global default
-                write_uleb(&mut symtab, (num_func_imports as usize + m + i) as u64);
-                write_str(&mut symtab, &format!("__rustd_impl_{name}"));
-            }
-        }
-        // Imported datas
-        for (_, name) in &imported_datas {
-            symtab.push(1); // SYMTAB_DATA
-            write_uleb(&mut symtab, 0x10); // WASM_SYM_UNDEFINED
-            write_str(&mut symtab, name);
-        }
-        // Defined datas
-        for (seg_idx, (_, name, linkage, _, blob)) in defined_datas.iter().enumerate() {
-            symtab.push(1); // SYMTAB_DATA
-            let flags = match linkage {
-                Linkage::Local => 0x02u64,
-                Linkage::Hidden => 0x04u64,
-                _ => 0x00u64,
-            };
-            write_uleb(&mut symtab, flags);
-            write_str(&mut symtab, name);
-            write_uleb(&mut symtab, seg_idx as u64);
-            write_uleb(&mut symtab, 0); // offset within segment
-            write_uleb(&mut symtab, blob.bytes.len() as u64);
-        }
-        linking_payload.push(8);
-        write_uleb(&mut linking_payload, symtab.len() as u64);
-        linking_payload.extend_from_slice(&symtab);
-
-        // 1. Type section (id = 1)
-        let mut type_sec = Vec::new();
-        write_uleb(&mut type_sec, types.len() as u64);
-        for wsig in &types {
-            type_sec.push(0x60);
-            write_uleb(&mut type_sec, wsig.params.len() as u64);
-            for p in &wsig.params {
-                type_sec.push(p.byte());
-            }
-            write_uleb(&mut type_sec, wsig.returns.len() as u64);
-            for r in &wsig.returns {
-                type_sec.push(r.byte());
-            }
-        }
-
-        // Assemble final Wasm `.o` file.
-        let mut out = Vec::new();
-        out.extend_from_slice(b"\0asm\x01\x00\x00\x00");
-
-        let push_sec = |out: &mut Vec<u8>, id: u8, payload: &[u8]| {
-            out.push(id);
-            write_uleb(out, payload.len() as u64);
-            out.extend_from_slice(payload);
-        };
-        push_sec(&mut out, 1, &type_sec);
-        push_sec(&mut out, 2, &import_sec);
-        push_sec(&mut out, 3, &func_sec);
-        if emit_patch_exports {
-            push_sec(&mut out, 7, &export_sec);
-        }
-        push_sec(&mut out, 10, &code_sec);
-        if !defined_datas.is_empty() {
-            push_sec(&mut out, 11, &data_sec);
-        }
-        push_sec(&mut out, 0, &linking_payload);
-
-        let encode_reloc_sec =
-            |sec_name: &str, target_sec: u32, entries: &[(u8, u32, u32, Option<i64>)]| -> Vec<u8> {
-                let mut p = Vec::new();
-                write_str(&mut p, sec_name);
-                write_uleb(&mut p, u64::from(target_sec));
-                write_uleb(&mut p, entries.len() as u64);
-                for &(rty, off, idx, addend) in entries {
-                    p.push(rty);
-                    write_uleb(&mut p, u64::from(off));
-                    write_uleb(&mut p, u64::from(idx));
-                    if let Some(add) = addend {
-                        write_sleb(&mut p, add);
+            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
+                let x = self.local(a)?;
+                let amount = self.temp(ValType::I64);
+                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                self.amount(b, true)?;
+                self.i(I::I64Const(127));
+                self.i(I::I64And);
+                self.i(I::LocalSet(amount));
+                // `near` is the half the bits leave and `far` the one they arrive in.
+                let left = opcode == Opcode::Ishl;
+                let signed = opcode == Opcode::Sshr;
+                let (near, far, near_out, far_out) =
+                    if left { (x, x + 1, low, high) } else { (x + 1, x, high, low) };
+                let (there, back) = if left { (Op::Shl, Op::ShrU) } else { (Op::ShrU, Op::Shl) };
+                let near_shift = if signed { Op::ShrS } else { there };
+                self.i(I::LocalGet(amount));
+                self.i(I::I64Const(64));
+                self.i(I::I64GeU);
+                self.i(I::If(BlockType::Empty));
+                {
+                    // Everything crosses over: wasm takes the amount modulo 64 itself.
+                    self.i(I::LocalGet(near));
+                    self.i(I::LocalGet(amount));
+                    self.op(near_shift, true);
+                    self.i(I::LocalSet(far_out));
+                    if signed {
+                        self.i(I::LocalGet(near));
+                        self.i(I::I64Const(63));
+                        self.i(I::I64ShrS);
+                    } else {
+                        self.i(I::I64Const(0));
                     }
+                    self.i(I::LocalSet(near_out));
                 }
-                p
-            };
-
-        if !code_relocs.is_empty() {
-            let reloc_code = encode_reloc_sec("reloc.CODE", code_section_index, &code_relocs);
-            push_sec(&mut out, 0, &reloc_code);
+                self.i(I::Else);
+                {
+                    self.i(I::LocalGet(near));
+                    self.i(I::LocalGet(amount));
+                    self.op(near_shift, true);
+                    self.i(I::LocalSet(near_out));
+                    self.i(I::LocalGet(far));
+                    self.i(I::LocalGet(amount));
+                    self.op(there, true);
+                    // What crosses over, in two steps so that an amount of zero moves
+                    // nothing rather than everything.
+                    self.i(I::LocalGet(near));
+                    self.i(I::I64Const(1));
+                    self.op(back, true);
+                    self.i(I::I64Const(63));
+                    self.i(I::LocalGet(amount));
+                    self.i(I::I64Sub);
+                    self.op(back, true);
+                    self.i(I::I64Or);
+                    self.i(I::LocalSet(far_out));
+                }
+                self.i(I::End);
+                self.i(I::LocalGet(low));
+                self.i(I::LocalSet(out));
+                self.i(I::LocalGet(high));
+                self.i(I::LocalSet(out + 1));
+                Ok(())
+            }
+            _ => Err(format!("wasm: {opcode} of a wide integer")),
         }
-        if !data_relocs.is_empty() {
-            let reloc_data = encode_reloc_sec("reloc.DATA", data_section_index, &data_relocs);
-            push_sec(&mut out, 0, &reloc_data);
-        }
+    }
+}
 
-        Ok(out)
+impl Op {
+    fn strict_unsigned_or_equal(self) -> Op {
+        match self {
+            Op::LeS | Op::LeU => Op::LeU,
+            _ => Op::GeU,
+        }
     }
 }

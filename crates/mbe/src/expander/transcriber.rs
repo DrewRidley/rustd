@@ -10,23 +10,23 @@ use super::TokensOrigin;
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
     expander::{Binding, Bindings, Fragment},
-    parser::{ConcatMetaVarExprElem, MetaVarKind, Op, RepeatKind, Separator},
+    parser::{ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
 impl<'t> Bindings<'t> {
-    fn get(&self, name: &Symbol, span: Span) -> Result<&Binding<'t>, ExpandError> {
+    fn get(&self, name: &MetaVar, span: Span) -> Result<&Binding<'t>, ExpandError> {
         match self.inner.get(name) {
             Some(binding) => Ok(binding),
             None => Err(ExpandError::new(
                 span,
-                ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.as_str()))),
+                ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.sym().as_str()))),
             )),
         }
     }
 
     fn get_fragment(
         &self,
-        name: &Symbol,
+        name: &MetaVar,
         mut span: Span,
         nesting: &mut [NestingState],
         marker: impl Fn(&mut Span),
@@ -171,7 +171,8 @@ fn expand_subtree(
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     let mut err = None;
-    'ops: for op in template.iter() {
+    let mut ops = template.iter().peekable();
+    'ops: while let Some(op) = ops.next() {
         match op {
             Op::Literal(it) => builder.push(tt::Leaf::from({
                 let mut it = it.clone();
@@ -201,8 +202,12 @@ fn expand_subtree(
                 err = err.or(e);
             }
             Op::Var { name, id, .. } => {
+                let before_angle = matches!(
+                    ops.peek(),
+                    Some(Op::Punct(puncts)) if puncts.first().is_some_and(|it| it.char == '<')
+                );
                 let ExpandResult { value: (), err: e } =
-                    expand_var(ctx, name, *id, builder, marker);
+                    expand_var(ctx, name, *id, before_angle, builder, marker);
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
@@ -301,7 +306,7 @@ fn expand_subtree(
                             // err at it.
                             // FIXME: Do what rustc does for repetitions.
                             let var_value = match ctx.bindings.get_fragment(
-                                &var.sym,
+                                &MetaVar::new(var.sym.clone(), var.span),
                                 var.span,
                                 &mut ctx.nesting,
                                 marker,
@@ -379,13 +384,14 @@ fn expand_subtree(
 
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
-    v: &Symbol,
+    v: &MetaVar,
     id: Span,
+    before_angle: bool,
     builder: &mut tt::TopSubtreeBuilder,
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     // We already handle $crate case in mbe parser
-    debug_assert!(*v != sym::crate_);
+    debug_assert!(*v.sym() != sym::crate_);
 
     match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
         Ok(fragment) => {
@@ -418,20 +424,50 @@ fn expand_var(
                         ])
                     );
 
-                    let wrap_in_parens = !is_negative_literal
-                        && !matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]))
-                        && sub.try_into_subtree().is_none_or(|it| {
-                            it.top_subtree().delimiter.kind == tt::DelimiterKind::Invisible
-                        });
-                    if wrap_in_parens {
-                        builder.open(tt::DelimiterKind::Parenthesis, span);
+                    // A fragment is one token tree to the macro it is passed on to, also when
+                    // it is one token: the `0` of an expression is not the `0` of a rule.
+                    let is_leaf =
+                        matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
+                    let delimiter = if is_leaf {
+                        Some(tt::DelimiterKind::Invisible)
+                    } else if is_negative_literal
+                        || sub.try_into_subtree().is_some_and(|it| {
+                            it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
+                        })
+                    {
+                        None
+                    } else {
+                        Some(tt::DelimiterKind::Parenthesis)
+                    };
+                    if let Some(delimiter) = delimiter {
+                        builder.open(delimiter, span);
                     }
                     builder.extend_with_tt_alone(sub);
-                    if wrap_in_parens {
+                    if delimiter.is_some() {
                         builder.close(span);
                     }
                 }
-                Fragment::Path(tt) => fix_up_and_push_path_tt(ctx, builder, tt),
+                Fragment::Path(tt) => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    fix_up_and_push_path_tt(ctx, builder, tt);
+                    builder.close(span);
+                }
+                Fragment::Ty(tt) if before_angle => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Parenthesis, span);
+                    builder.extend_with_tt_alone(tt);
+                    builder.close(span);
+                }
+                Fragment::Ty(tt) => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    builder.extend_with_tt_alone(tt);
+                    builder.close(span);
+                }
                 Fragment::Empty => (),
             };
             ExpandResult::ok(())
@@ -450,9 +486,12 @@ fn expand_var(
             //     }
             // ```
             // We just treat it a normal tokens
+            let mut span = id;
+            marker(&mut span);
+            let sym = v.sym().clone();
             builder.extend([
-                tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span: id }),
-                tt::Leaf::from(tt::Ident { sym: v.clone(), span: id, is_raw: tt::IdentIsRaw::No }),
+                tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span }),
+                tt::Leaf::from(tt::Ident { sym, span, is_raw: tt::IdentIsRaw::No }),
             ]);
             ExpandResult::ok(())
         }

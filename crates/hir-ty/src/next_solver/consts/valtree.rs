@@ -1,4 +1,4 @@
-use std::{fmt, hash::Hash, num::NonZero};
+use std::{borrow::Cow, fmt, hash::Hash, num::NonZero};
 
 use hir_def::{AdtId, VariantId};
 use intern::{Interned, InternedRef, impl_internable};
@@ -226,8 +226,8 @@ pub(super) fn allocation_to_const<'db>(
                 return Const::error(interner);
             };
             let mut items = Vec::new();
-            let (variant, layout): (VariantId, &Layout) = match def.def_id() {
-                AdtId::StructId(id) => (id.into(), &layout),
+            let (variant, layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
+                AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
                 AdtId::UnionId(_) => return Const::error(interner),
                 AdtId::EnumId(id) => {
                     let Some((variant, layout)) =

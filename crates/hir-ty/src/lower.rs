@@ -125,6 +125,23 @@ impl ImplTraitLoweringState {
     }
 }
 
+/// A signature whose binder binds the lifetimes left out of it: that of a function pointer, or
+/// of a `Fn(&u8) -> &u8` bound.
+struct Elision<'db> {
+    /// The binder's place in `bound_vars`.
+    binder: usize,
+    /// How many variables the binder had before the lifetimes left out.
+    named: usize,
+    /// How many lifetimes left out it has bound.
+    anonymous: usize,
+    /// The lifetimes the arguments name, as the binder sees them. A lifetime left out of the
+    /// return type is the one of them, when there is one.
+    of_arguments: Vec<Region<'db>>,
+    /// A bound is a signature only once its path turns out to be written as one.
+    is_signature: bool,
+    in_return_type: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum LifetimeElisionKind<'db> {
     /// Create a new anonymous lifetime parameter and reference it.
@@ -246,6 +263,7 @@ pub struct TyLoweringContext<'db, 'a> {
     infer_vars: Option<&'a mut dyn TyLoweringInferVarsCtx<'db>>,
     is_lowering_impl_trait_bounds: bool,
     bound_vars: Vec<(Vec<Name>, BoundVarKinds<'db>)>,
+    elisions: Vec<Elision<'db>>,
     lifetime_lowering_mode: LifetimeLoweringMode,
 }
 
@@ -288,6 +306,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             infer_vars: None,
             is_lowering_impl_trait_bounds: false,
             bound_vars,
+            elisions: Vec::new(),
             lifetime_lowering_mode,
         }
     }
@@ -404,6 +423,110 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     fn peek_bound_vars(&self) -> BoundVarKinds<'db> {
         self.bound_vars.last().unwrap().1
+    }
+
+    /// The variables of the innermost binder, with the lifetimes left out that it binds.
+    fn bound_vars_with_elided(&self) -> BoundVarKinds<'db> {
+        let named = self.peek_bound_vars();
+        let anonymous = match self.elisions.last() {
+            Some(elision) if elision.binder == self.bound_vars.len() - 1 => elision.anonymous,
+            _ => 0,
+        };
+        if anonymous == 0 {
+            return named;
+        }
+        let anonymous = iter::repeat_n(BoundVariableKind::Region(BoundRegionKind::Anon), anonymous);
+        BoundVarKinds::new_from_iter(named.iter().chain(anonymous))
+    }
+
+    /// Lowers a signature of the innermost binder, which then binds the lifetimes left out.
+    fn with_elision<T>(&mut self, is_signature: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.elisions.push(Elision {
+            binder: self.bound_vars.len() - 1,
+            named: self.bound_vars_with_elided().len(),
+            anonymous: 0,
+            of_arguments: Vec::new(),
+            is_signature,
+            in_return_type: false,
+        });
+        let result = f(self);
+        self.elisions.pop();
+        result
+    }
+
+    fn signature_mut(&mut self) -> Option<&mut Elision<'db>> {
+        self.elisions.iter_mut().rfind(|it| it.is_signature)
+    }
+
+    /// The path of the bound being lowered is written as a signature: `Fn(&u8) -> &u8`.
+    pub(crate) fn bound_is_signature(&mut self) {
+        let innermost = self.bound_vars.len() - 1;
+        if let Some(elision) = self.elisions.last_mut()
+            && elision.binder == innermost
+        {
+            elision.is_signature = true;
+        }
+    }
+
+    /// Lowers the return type of the signature being lowered.
+    pub(crate) fn in_return_type<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let innermost = self.bound_vars.len() - 1;
+        let Some(at) =
+            self.elisions.iter().rposition(|it| it.is_signature && it.binder == innermost)
+        else {
+            return f(self);
+        };
+        self.elisions[at].in_return_type = true;
+        let result = f(self);
+        self.elisions[at].in_return_type = false;
+        result
+    }
+
+    /// A lifetime that is left out (`&u8`, `'_`, `Ref<u8>`), when a signature binds it.
+    pub(crate) fn elided_lifetime(&mut self) -> Option<Region<'db>> {
+        let binders = self.bound_vars.len();
+        let interner = self.interner;
+        let elision = self.signature_mut()?;
+        let depth = binders - 1 - elision.binder;
+        let region = if elision.in_return_type {
+            let &[region] = elision.of_arguments.as_slice() else { return None };
+            region
+        } else {
+            let var = BoundVar::from_usize(elision.named + elision.anonymous);
+            elision.anonymous += 1;
+            let bound = BoundRegion { var, kind: BoundRegionKind::Anon };
+            let region = Region::new_bound(interner, DebruijnIndex::ZERO, bound);
+            elision.of_arguments.push(region);
+            region
+        };
+        Some(match region.kind() {
+            RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), bound) => {
+                Region::new_bound(interner, debruijn.shifted_in(depth as u32), bound)
+            }
+            _ => region,
+        })
+    }
+
+    /// Notes a lifetime that an argument of the signature being lowered names.
+    fn named_lifetime(&mut self, region: Region<'db>) {
+        let binders = self.bound_vars.len();
+        let interner = self.interner;
+        let Some(elision) = self.signature_mut() else { return };
+        if elision.in_return_type {
+            return;
+        }
+        let depth = binders - 1 - elision.binder;
+        let region = match region.kind() {
+            RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), bound) => {
+                // What a binder inside the signature binds is not a lifetime of the signature.
+                let Some(outside) = debruijn.as_usize().checked_sub(depth) else { return };
+                Region::new_bound(interner, DebruijnIndex::from_usize(outside), bound)
+            }
+            _ => region,
+        };
+        if !elision.of_arguments.contains(&region) {
+            elision.of_arguments.push(region);
+        }
     }
 
     fn bound_vars(
@@ -628,15 +751,23 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 Ty::new_slice(interner, inner_ty)
             }
             TypeRef::Reference(ref_) => {
-                let inner_ty = self.lower_ty(ref_.ty);
                 // FIXME: It should infer the eldided lifetimes instead of stubbing with error
-                let lifetime =
-                    ref_.lifetime.map_or(self.types.regions.error, |lr| self.lower_lifetime(lr));
+                let lifetime = match ref_.lifetime {
+                    Some(lifetime) => self.lower_lifetime(lifetime),
+                    None => self.elided_lifetime().unwrap_or(self.types.regions.error),
+                };
+                let inner_ty = match &self.store[ref_.ty] {
+                    // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
+                    TypeRef::DynTrait(bounds) if !lifetime.is_error() => {
+                        self.lower_dyn_trait(bounds, lifetime)
+                    }
+                    _ => self.lower_ty(ref_.ty),
+                };
                 Ty::new_ref(interner, lifetime, inner_ty, lower_mutability(ref_.mutability))
             }
             TypeRef::Placeholder => self.next_ty_var(type_ref_id.into()),
             TypeRef::Fn(fn_) => self.lower_fn_ptr(fn_),
-            TypeRef::DynTrait(bounds) => self.lower_dyn_trait(bounds),
+            TypeRef::DynTrait(bounds) => self.lower_dyn_trait(bounds, Region::new_static(interner)),
             TypeRef::ImplTrait(bounds) => {
                 match self.impl_trait_mode.mode {
                     ImplTraitLoweringMode::Opaque => {
@@ -749,19 +880,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     fn lower_pattern_type(&mut self, pat: PatId, ty: Ty<'db>) -> Option<Pattern<'db>> {
         let pat_kind = match self.store[pat] {
-            hir_def::hir::Pat::Range { start, end, range_type: _ } => {
+            hir_def::hir::Pat::Range { start: Some(start), end: Some(end), range_type: _ } => {
                 // rustc allows using generic params in pattern types.
                 // In practice this does not matter since this feature is internal and I didn't find a way to actually use generic params,
                 // but it doesn't matter so...
                 rustc_type_ir::PatternKind::Range {
-                    start: match start {
-                        Some(s) => self.lower_expr_as_const(s, ty, true),
-                        None => Const::error(self.interner),
-                    },
-                    end: match end {
-                        Some(e) => self.lower_expr_as_const(e, ty, true),
-                        None => Const::error(self.interner),
-                    },
+                    start: self.lower_expr_as_const(start, ty, true),
+                    end: self.lower_expr_as_const(end, ty, true),
                 }
             }
             hir_def::hir::Pat::NotNull => rustc_type_ir::PatternKind::NotNull,
@@ -786,12 +911,15 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let old_lifetime_elision = self.lifetime_elision;
         let mut args = Vec::with_capacity(fn_.params.len());
         let binder = fn_.binder.as_ref().map(|b| b.as_ref()).unwrap_or_default();
-        let (_, binder) = self.with_shifted_in(binder, |ctx: &mut TyLoweringContext<'_, '_>| {
-            ctx.lifetime_elision =
-                LifetimeElisionKind::AnonymousCreateParameter { report_in_path: false };
-            args.extend(params.iter().map(|&(_, tr)| ctx.lower_ty(tr)));
-            ctx.lifetime_elision = LifetimeElisionKind::for_fn_ret(interner);
-            args.push(ctx.lower_ty(ret_ty));
+        let (binder, _) = self.with_shifted_in(binder, |ctx: &mut TyLoweringContext<'_, '_>| {
+            ctx.with_elision(true, |ctx| {
+                ctx.lifetime_elision =
+                    LifetimeElisionKind::AnonymousCreateParameter { report_in_path: false };
+                args.extend(params.iter().map(|&(_, tr)| ctx.lower_ty(tr)));
+                ctx.lifetime_elision = LifetimeElisionKind::for_fn_ret(interner);
+                args.push(ctx.in_return_type(|ctx| ctx.lower_ty(ret_ty)));
+                ctx.bound_vars_with_elided()
+            })
         });
         self.lifetime_elision = old_lifetime_elision;
 
@@ -878,7 +1006,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         if matches!(resolution, TypeNs::TraitId(_)) && remaining_index.is_none() {
             // trait object type without dyn
             let bound = TypeBound::Path(path_id, TraitBoundModifier::None);
-            let ty = self.lower_dyn_trait(&[bound]);
+            let ty = self.lower_dyn_trait(&[bound], Region::new_static(self.interner));
             return (ty, None);
         }
 
@@ -965,9 +1093,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let mut clause = None;
 
         let mut lower_path_bound = |ctx: &mut TyLoweringContext<'db, '_>, path| {
-            let binder = ctx.peek_bound_vars();
-
-            if let Some((trait_ref, mut ctx)) = ctx.lower_trait_ref_from_path(path, self_ty) {
+            let Some((trait_ref, mut ctx)) = ctx.lower_trait_ref_from_path(path, self_ty) else {
+                return;
+            };
+            // Lowering the path bound the lifetimes left out of it.
+            let binder = ctx.ty_ctx().bound_vars_with_elided();
+            {
                 // FIXME(sized-hierarchy): Remove this bound modifications once we have implemented
                 // sized-hierarchy correctly.
                 if meta_sized.is_some_and(|it| it == trait_ref.def_id.0) {
@@ -999,9 +1130,14 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
         match bound {
             &TypeBound::ForLifetime(ref binder, path) => {
-                self.with_shifted_in(binder, |ctx| lower_path_bound(ctx, path)).0
+                self.with_shifted_in(binder, |ctx| {
+                    ctx.with_elision(false, |ctx| lower_path_bound(ctx, path))
+                })
+                .0
             }
-            &TypeBound::Path(path, TraitBoundModifier::None) => lower_path_bound(self, path),
+            &TypeBound::Path(path, TraitBoundModifier::None) => {
+                self.with_elision(false, |ctx| lower_path_bound(ctx, path))
+            }
             &TypeBound::Path(path, TraitBoundModifier::Maybe) => {
                 let sized_trait = self.lang_items.Sized;
                 // Don't lower associated type bindings as the only possible relaxed trait bound
@@ -1037,10 +1173,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             .chain(assoc_bounds.into_iter().flatten())
     }
 
-    fn lower_dyn_trait(&mut self, bounds: &[TypeBound]) -> Ty<'db> {
+    /// `default_region` is the lifetime of the type when the bounds name none.
+    fn lower_dyn_trait(&mut self, bounds: &[TypeBound], default_region: Region<'db>) -> Ty<'db> {
         let interner = self.interner;
         let dummy_self_ty = self.types.types.dyn_trait_dummy_self;
         let mut region = None;
+        // `trait Any: 'static` makes `dyn Any` be `dyn Any + 'static` wherever it is written.
+        let mut region_of_trait = None;
         // INVARIANT: The principal trait bound, if present, must come first. Others may be in any
         // order but should be in the same order for the same set but possibly different order of
         // bounds in the input.
@@ -1164,6 +1303,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
                     let bound_predicate = clause.kind();
                     match bound_predicate.skip_binder() {
+                        ClauseKind::TypeOutlives(OutlivesPredicate(ty, outlived))
+                            if ty == dummy_self_ty && !outlived.has_escaping_bound_vars() =>
+                        {
+                            if region_of_trait.is_none() || outlived.is_static() {
+                                region_of_trait = Some(outlived);
+                            }
+                        }
                         ClauseKind::Trait(pred) => {
                             // FIXME(negative_bounds): Handle this correctly...
                             let trait_ref = interner
@@ -1297,11 +1443,11 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         };
 
         if let Some(bounds) = bounds {
-            let region = match region {
-                Some(it) => it,
-                None => Region::new_static(self.interner),
-            };
-            Ty::new_dynamic(self.interner, bounds, region)
+            Ty::new_dynamic(
+                self.interner,
+                bounds,
+                region.or(region_of_trait).unwrap_or(default_region),
+            )
         } else {
             // FIXME: report error
             // (additional non-auto traits, associated type rebound, or no resolved trait)
@@ -1367,6 +1513,17 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     pub(crate) fn lower_lifetime(&mut self, lifetime: LifetimeRefId) -> Region<'db> {
+        if let LifetimeRef::Placeholder = self.store[lifetime]
+            && let Some(region) = self.elided_lifetime()
+        {
+            return region;
+        }
+        let region = self.named_region(lifetime);
+        self.named_lifetime(region);
+        region
+    }
+
+    fn named_region(&mut self, lifetime: LifetimeRefId) -> Region<'db> {
         if let Some(region) = self.find_and_lower_hrtb_lifetime(lifetime) {
             return region;
         };

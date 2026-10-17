@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 cases = { path = "../cases" }
+
+[features]
+nightly = ["cases/nightly"]

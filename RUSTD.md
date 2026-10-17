@@ -164,10 +164,20 @@ deserves its own check: compare RA's computed layout for every type in a target 
 `rustc -Zprint-type-sizes` and count disagreements. Any disagreement is a silent miscompile
 waiting to happen, and today we do not measure it.
 
-The pin is `harness/toolchain`, and it has to be the rustc that rust-analyzer's `ra-ap-rustc_abi`
-was cut from. This is not hypothetical: with stable 1.99 and `ra-ap-rustc_abi` 0.166 the two
-picked different niche values for `Result<(Comparator, ..), Error>` in semver, and every `?` on
-it took the wrong branch.
+The pin is `harness/toolchain`, a stable release, and the layout code has to be that release's.
+rustd computes layouts with rustc's `rustc_abi`, and the `ra-ap-rustc_abi` snapshots on crates.io
+are cut from rustc's master weekly, so none is the code of a stable release. With 0.166 (master
+of 2026-05-10) against stable 1.97.1 and 1.99.0, `None` of an `Option` around a struct holding two
+`Option<u64>` was 2 to rustc and `u64::MAX` to us, as was `Err` of semver's
+`Result<(Comparator, ..), Error>`, so every `?` on it took the wrong branch; and against 1.99.0 an
+`Option` of `#[repr(i8)] enum { A = -128, B = 127, C = 5 }` was one byte to rustc and two to us.
+So `lib/rustc_abi` is `compiler/rustc_abi/src` of the pinned tag, unchanged, patched in for the
+crates.io crate, and a toolchain bump copies that directory again. Sizes alone do not show such
+a difference: the corpus case `niche_values` makes these values on one side of the crate
+boundary and reads them on the other.
+
+What a bump has also moved so far: how rustc hashes a type into its `TypeId`
+(`codegen/type_id.rs` follows 1.99.0), and what std's constants ask of the const evaluator.
 
 **cargo.** The daemon needs the unit graph, the rustc command line for each crate and the final
 link line. Today that is scraped from `cargo rustc -- --print link-args`. The cleaner source is
@@ -181,6 +191,28 @@ because it needs crate-private access; the goal is to shrink that to a small set
 additions so the backend can sit in its own crate.
 
 **Cranelift.** Used as a library through `cranelift-object`. No changes needed so far.
+
+**LLVM.** An optional second producer of a function's machine code, built with
+`cargo build -p rustd --release --features llvm` (needs LLVM 20; set `LLVM_SYS_201_PREFIX` to
+its prefix) and chosen with `RUSTD_BACKEND=llvm`. `RUSTD_OPT=0..3` sets the level, 2 by
+default. It takes the Cranelift IR the front half builds, so layout and calling conventions
+are decided once for both, and gives back the same thing Cranelift does: bytes, relocations
+against the function's requests, and unwind rules (`codegen/backend.rs` says what a producer
+owes, `codegen/llvm.rs` how LLVM pays it). Each function is compiled alone, with nothing
+inlined across functions. A function LLVM has no answer for is compiled by Cranelift and
+counted with the reason on the `backend:` lines of the log. `harness/backends.py` compares
+the producers on a program.
+
+**The target.** What rustd emits for is an input of the process and not a property of the
+machine it runs on: `rustd --target <triple>`, then `CARGO_BUILD_TARGET`, then the host. It is
+named once, before anything is compiled, and one process has one target. `codegen/target.rs`
+turns the triple into a `Target` (architecture, object format, C calling convention, unwind
+format), and code that differs between platforms asks that and never `cfg!(target_arch)`.
+The triple is in the key of the code cache. `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` are accepted today; another triple is turned down by name. The
+splice does not take the target from the daemon: it reads the machine from the executable.
+The harnesses build for and run another target with `RUSTD_TARGET=<triple>` (`difftest.py`
+has the linker, the emulator and the binutils of each). `AARCH64.md` is the state of AArch64.
 
 **CAS.** Keys are (toolchain, crate source hash, flags, dependency keys) for rustc artifacts and
 (function MIR hash, instance args, toolchain) for rustd objects. Independent of the backend

@@ -11,7 +11,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
-use hir_def::{DefWithBodyId, StaticId, TraitId};
+use hir_def::{DefWithBodyId, FunctionId, StaticId, TraitId};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -24,7 +24,8 @@ use crate::{
 };
 
 use super::{
-    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, unwind::FunctionUnwind,
+    CodegenError, ConstBlob, DataIdentity, Instance, InstanceDef, Result, Target,
+    unwind::FunctionUnwind,
 };
 
 /// A function that compiled code calls or takes the address of.
@@ -36,6 +37,8 @@ pub(super) enum FuncTarget {
     Path(String),
     /// Whatever stands for the instance in the build: rustc's copy or ours.
     Instance(Instance, StoredParamEnvAndCrate),
+    /// The function an `asm!` block is assembled as, by its assembly.
+    Asm(String),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -62,6 +65,9 @@ pub(super) enum DataRequest {
     /// A `core::panic::Location` for a place in a body. Looked up when stitching, so that code
     /// does not change when lines above it are added.
     Location(Option<(DefWithBodyId, MirSpan)>),
+    /// A `core::panic::Location` of where a function is declared: what a pointer to a
+    /// `#[track_caller]` function passes it.
+    Declaration(FunctionId),
     /// The path of a file as rustc reports it, without a terminator.
     FilePath(FileId),
 }
@@ -129,10 +135,20 @@ pub struct CompiledStatic {
     pub(super) writable: bool,
 }
 
+/// How many requests a [`Recorder`] had at some point, to tell the ones made since.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "llvm"), expect(dead_code))]
+pub(super) struct Mark {
+    pub(super) funcs: usize,
+    pub(super) datas: usize,
+}
+
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db dyn HirDatabase,
     pub(super) isa: &'static dyn TargetIsa,
+    /// What `isa` generates code for.
+    pub(super) target: &'static Target,
     requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -140,13 +156,20 @@ pub(super) struct Recorder<'db> {
     statics: FxHashMap<StaticId, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
+    /// The assembly of the function, when it is a `#[naked]` one.
+    pub(super) naked: Option<String>,
 }
 
 impl<'db> Recorder<'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, isa: &'static dyn TargetIsa) -> Self {
+    pub(super) fn new(
+        db: &'db dyn HirDatabase,
+        isa: &'static dyn TargetIsa,
+        target: &'static Target,
+    ) -> Self {
         Recorder {
             db,
             isa,
+            target,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -154,6 +177,7 @@ impl<'db> Recorder<'db> {
             statics: FxHashMap::default(),
             layouts: std::env::var_os("RUSTD_LAYOUTS").map(|_| Default::default()),
             builder_ctx: FunctionBuilderContext::new(),
+            naked: None,
         }
     }
 
@@ -166,6 +190,17 @@ impl<'db> Recorder<'db> {
                 .collect()
         });
         (self.requests, layouts)
+    }
+
+    #[cfg(feature = "llvm")]
+    pub(super) fn mark(&self) -> Mark {
+        Mark { funcs: self.requests.funcs.len(), datas: self.requests.datas.len() }
+    }
+
+    /// The requests made since `mark`.
+    #[cfg(feature = "llvm")]
+    pub(super) fn since(&self, mark: Mark) -> (&[FuncRequest], &[DataRequest]) {
+        (&self.requests.funcs[mark.funcs..], &self.requests.datas[mark.datas..])
     }
 
     fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
@@ -210,6 +245,10 @@ impl<'db> Recorder<'db> {
 
     pub(super) fn import_path(&mut self, path: &str, sig: &Signature) -> FuncId {
         self.func(FuncTarget::Path(path.to_owned()), sig)
+    }
+
+    pub(super) fn assembly(&mut self, text: String, sig: &Signature) -> FuncId {
+        self.func(FuncTarget::Asm(text), sig)
     }
 
     pub(super) fn define_const(&mut self, blob: ConstBlob) -> Result<DataId> {
@@ -264,6 +303,10 @@ impl<'db> Recorder<'db> {
         self.data(DataRequest::Location(at))
     }
 
+    pub(super) fn declaration(&mut self, func: FunctionId) -> DataId {
+        self.data(DataRequest::Declaration(func))
+    }
+
     pub(super) fn file_path(&mut self, file: FileId) -> DataId {
         self.data(DataRequest::FilePath(file))
     }
@@ -273,7 +316,20 @@ impl<'db> Recorder<'db> {
     }
 
     pub(super) fn target_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
-        self.isa.frontend_config()
+        let config = self.isa.frontend_config();
+        // The ISA is only there for its calling convention: WebAssembly's pointers are 32 bits.
+        #[cfg(feature = "wasm")]
+        let config = cranelift_codegen::isa::TargetFrontendConfig {
+            pointer_width: target_lexicon::PointerWidth::U32,
+            ..config
+        };
+        config
+    }
+
+    /// Whether what another object defines is reached as what this one does: the linker of
+    /// a PE image puts a stub where an import is called, and there is no other way.
+    fn within_image(&self) -> bool {
+        self.isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
     }
 
     /// Names a requested function in `func`. Whether the function ends up in this object is
@@ -288,7 +344,7 @@ impl<'db> Recorder<'db> {
         func.import_function(ir::ExtFuncData {
             name: ir::ExternalName::user(name),
             signature,
-            colocated: false,
+            colocated: self.within_image(),
             patchable: false,
         })
     }
@@ -311,7 +367,7 @@ impl<'db> Recorder<'db> {
             name: ir::ExternalName::user(name),
             offset: ir::immediates::Imm64::new(0),
             // Only a static can be another object's.
-            colocated: !matches!(request, DataRequest::Static(_)),
+            colocated: self.within_image() || !matches!(request, DataRequest::Static(_)),
             tls,
         })
     }
