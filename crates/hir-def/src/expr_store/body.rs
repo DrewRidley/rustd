@@ -134,7 +134,7 @@ impl Body {
         (Arc::new(body), source_map)
     }
 
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(lru = 512, returns(deref))]
     pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
         Self::with_source_map(db, def).0.clone()
     }

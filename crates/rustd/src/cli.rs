@@ -30,6 +30,8 @@ pub(crate) fn is_subcommand(arg: &str) -> bool {
             | "test"
             | "patch"
             | "sync"
+            | "start"
+            | "warm"
             | "status"
             | "stop"
             | "help"
@@ -49,6 +51,7 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
         "test" => cmd_test(&args),
         "patch" => cmd_request("patch", &args),
         "sync" => cmd_request("sync", &args),
+        "start" | "warm" => cmd_start(&args),
         "status" => cmd_status(&args),
         "stop" => cmd_stop(&args, false),
         _ => {
@@ -291,7 +294,8 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             | "--tests"
             | "--link-only"
             | "--cargo"
-            | "--full" => {}
+            | "--full"
+            | "--fast" => {}
             "-F" | "--features" => {
                 let val = it.next().context("--features requires feature name(s)")?;
                 for f in val.split([' ', ',']).map(str::trim).filter(|s| !s.is_empty()) {
@@ -745,6 +749,17 @@ fn prepare_link_script_and_symbols(
                     wild_cc.push(format!("-Wl,-force_load,{}", sr.display()));
                 }
             }
+        } else {
+            for sr in &sys_rlibs {
+                if let Some(fname) = sr.file_name().and_then(|n| n.to_str())
+                    && (fname.starts_with("libcore-") || fname.starts_with("liballoc-"))
+                {
+                    wild_cc.push(format!(
+                        "-Wl,--whole-archive,{},--no-whole-archive",
+                        sr.display()
+                    ));
+                }
+            }
         }
         wild_cc.push(format!("-Wl,{}", paths.base_o.with_extension("cave.o").display()));
         if let Some(o_pos) = wild_cc.iter().position(|x| x == "-o") {
@@ -788,14 +803,72 @@ fn send_unix_line(sock: &Path, line: &str) -> anyhow::Result<String> {
 
 fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<String>> {
     ensure_features_consistent(opts, paths);
-    if paths.rustd_sock.exists()
-        && let Ok(reply) = send_unix_line(&paths.rustd_sock, "patch")
-    {
-        return Ok(Some(reply));
+    let bin_crate = opts
+        .test_target
+        .as_deref()
+        .or(opts.pkg_name.as_deref())
+        .unwrap_or(&opts.bin_name)
+        .replace('-', "_");
+    if paths.rustd_sock.exists() {
+        let req = if paths.out_bin.exists() {
+            format!(
+                "switch\t{bin_crate}\t{}\t{}\t{}",
+                paths.base_o.display(),
+                paths.patch_o.display(),
+                paths.link_sh.display()
+            )
+        } else {
+            "patch".to_owned()
+        };
+        if let Ok(reply) = send_unix_line(&paths.rustd_sock, &req) {
+            return Ok(Some(reply));
+        }
     }
     let _ = fs::remove_file(&paths.rustd_sock);
     let _ = fs::remove_file(&paths.ack);
     let rlibs = prepare_link_script_and_symbols(opts, paths)?;
+
+    // Check if another daemon is already running in this workspace with the same feature set
+    let rustd_root = opts.workspace_root.join("target").join("rustd");
+    let expected_feat = features_fingerprint(opts);
+    if let Ok(entries) = fs::read_dir(&rustd_root) {
+        for e in entries.flatten() {
+            let dir = e.path();
+            if dir == paths.dir || !dir.is_dir() {
+                continue;
+            }
+            let other_sock = dir.join("rustd.sock");
+            let other_feat = fs::read_to_string(dir.join("features.key")).unwrap_or_default();
+            if other_sock.exists() && other_feat == expected_feat {
+                if !paths.out_bin.exists() {
+                    let base_src = rustd_root
+                        .iter()
+                        .next()
+                        .and_then(|_| dir.join("base.o").exists().then(|| dir.join("base.o")));
+                    if let Some(bs) = base_src {
+                        let _ = fs::copy(&bs, &paths.base_o);
+                        let _ = fs::copy(bs.with_extension("rt.o"), &paths.rt_o);
+                        let _ = fs::copy(
+                            bs.with_extension("cave.o"),
+                            paths.base_o.with_extension("cave.o"),
+                        );
+                        let _ = fs::copy(&bs, &paths.patch_o);
+                        let _ = Command::new("sh").arg("-c").arg(&paths.link_sh).status();
+                    }
+                }
+                let switch_req = format!(
+                    "switch\t{bin_crate}\t{}\t{}\t{}",
+                    paths.base_o.display(),
+                    paths.patch_o.display(),
+                    paths.link_sh.display()
+                );
+                if let Ok(reply) = send_unix_line(&other_sock, &switch_req) {
+                    let _ = std::os::unix::fs::symlink(&other_sock, &paths.rustd_sock);
+                    return Ok(Some(reply));
+                }
+            }
+        }
+    }
 
     let exe = env::current_exe()?;
     let mut cmd = Command::new(&exe);
@@ -806,12 +879,6 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
     for c in &opts.crates {
         cmd.args(["--crate", c]);
     }
-    let bin_crate = opts
-        .test_target
-        .as_deref()
-        .or(opts.pkg_name.as_deref())
-        .unwrap_or(&opts.bin_name)
-        .replace('-', "_");
     if opts.cfg_test {
         cmd.arg("--cfg-test");
     }
@@ -1148,8 +1215,43 @@ fn ensure_clippy_script(
     Ok(clippy_sh)
 }
 
+fn workspace_source_fingerprint(workspace_root: &Path, extra: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut files = Vec::new();
+    let mut stack = vec![workspace_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if !p.ends_with("target") && !p.ends_with(".git") {
+                    stack.push(p);
+                }
+            } else if p.extension().is_some_and(|ext| ext == "rs" || ext == "toml")
+                && let Ok(m) = p.metadata()
+            {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                files.push((p, m.len(), mtime));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = rustc_hash::FxHasher::default();
+    extra.hash(&mut h);
+    for (p, len, mtime) in files {
+        p.hash(&mut h);
+        len.hash(&mut h);
+        mtime.hash(&mut h);
+    }
+    h.finish()
+}
+
 fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
-    let full = args.iter().any(|a| a == "--full");
+    let fast = args.iter().any(|a| a == "--fast");
     let with_tests = args.iter().any(|a| a == "--tests" || a == "--test");
     let mut opts = parse_opts_with_mode(args, true)?;
     opts.cfg_test = true;
@@ -1161,13 +1263,39 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
         eprintln!("[rustd] package excluded by --exclude; skipping clippy");
         return Ok(());
     }
-    if !full {
+    if fast {
         return cmd_check(args, "clippy");
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
     let clippy_sh = ensure_clippy_script(&opts, &paths, with_tests)?;
+    let clippy_cache = paths.dir.join(if with_tests {
+        "clippy_tests.cache"
+    } else {
+        "clippy.cache"
+    });
     let run_once = || -> anyhow::Result<bool> {
         let t0 = Instant::now();
+        let extra_key = format!("{}:{:?}", clippy_sh.display(), opts.run_args);
+        let fp = workspace_source_fingerprint(&opts.workspace_root, &extra_key);
+        let fp_prefix = format!("{fp:016x} ");
+        if let Ok(cached) = fs::read_to_string(&clippy_cache)
+            && let Some((first_line, rest)) = cached.split_once('\n')
+            && let Some(status_str) = first_line.strip_prefix(&fp_prefix)
+        {
+            let ok = status_str.trim() == "1";
+            if !rest.is_empty() {
+                eprint!("{rest}");
+            }
+            if ok {
+                let elapsed = t0.elapsed();
+                eprintln!(
+                    "    \x1b[1;32mFinished\x1b[0m `dev` profile [unoptimized + debuginfo] target(s) in {:.2}s ({:.1?})",
+                    elapsed.as_secs_f64(),
+                    elapsed
+                );
+            }
+            return Ok(ok);
+        }
         let out = Command::new(&clippy_sh)
             .current_dir(&opts.workspace_root)
             .args(&opts.run_args)
@@ -1175,17 +1303,22 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
             .context("running cached clippy-driver")?;
         let elapsed = t0.elapsed();
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let ok = out.status.success();
+        let _ = fs::write(
+            &clippy_cache,
+            format!("{fp:016x} {}\n{stderr}", if ok { 1 } else { 0 }),
+        );
         if !stderr.is_empty() {
             eprint!("{stderr}");
         }
-        if out.status.success() {
+        if ok {
             eprintln!(
                 "    \x1b[1;32mFinished\x1b[0m `dev` profile [unoptimized + debuginfo] target(s) in {:.2}s ({:.1?})",
                 elapsed.as_secs_f64(),
                 elapsed
             );
         }
-        Ok(out.status.success())
+        Ok(ok)
     };
     let ok = run_once()?;
     if !opts.watch {
@@ -1468,15 +1601,38 @@ fn ensure_integration_test_bin(
                 );
             let _ = fs::write(&t_paths.link_sh, patched_sh);
         }
-        let status = Command::new("sh")
+        let linked_ok = Command::new("sh")
             .arg("-c")
             .arg(&t_paths.link_sh)
             .status()
-            .with_context(|| format!("linking integration test target `{target_krate}`"))?;
-        ensure!(
-            status.success(),
-            "linking integration test target `{target_krate}` failed ({status})"
-        );
+            .is_ok_and(|s| s.success());
+        if !linked_ok {
+            let deps_dir = opts.workspace_root.join("target").join("debug").join("deps");
+            let prefix = format!("{}-", target_krate.replace('-', "_"));
+            let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+            if let Ok(entries) = fs::read_dir(&deps_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                        && name.starts_with(&prefix)
+                        && p.extension().is_none()
+                        && let Ok(m) = p.metadata()
+                        && m.is_file()
+                        && (m.permissions().mode() & 0o111 != 0)
+                        && let Ok(mtime) = m.modified()
+                    {
+                        if best.as_ref().is_none_or(|(bm, _)| mtime > *bm) {
+                            best = Some((mtime, p));
+                        }
+                    }
+                }
+            }
+            if let Some((_, cargo_bin)) = best {
+                fs::copy(&cargo_bin, &t_paths.out_bin)?;
+            } else {
+                bail!("linking integration test target `{target_krate}` failed");
+            }
+        }
     }
     Ok(t_paths.out_bin)
 }
@@ -1529,6 +1685,26 @@ fn stop_target_daemon(paths: &TargetPaths) {
     let _ = fs::remove_file(&paths.pid_file);
 }
 
+fn cmd_start(args: &[String]) -> anyhow::Result<()> {
+    let has_test_flag = args
+        .iter()
+        .any(|a| a == "-p" || a == "--package" || a == "--test" || a == "--tests");
+    let mut opts = parse_opts_with_mode(args, has_test_flag)?;
+    if opts.bin_name.starts_with("test-") {
+        opts.cfg_test = true;
+    }
+    let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
+    ensure_daemon(&opts, &paths)?;
+    let pid = fs::read_to_string(&paths.pid_file).unwrap_or_default();
+    eprintln!(
+        "[rustd] daemon warm and ready: bin={} pid={} socket={}",
+        opts.bin_name,
+        pid.trim(),
+        paths.rustd_sock.display()
+    );
+    Ok(())
+}
+
 fn cmd_test(args: &[String]) -> anyhow::Result<()> {
     let opts = parse_opts_with_mode(args, true)?;
     if opts
@@ -1547,7 +1723,6 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    let had_daemon = paths.rustd_sock.exists();
 
     if let Some(sha) = &opts.since {
         let diff_files = crate::ci::analyze_git_diff_since(&opts.workspace_root, sha)?;
@@ -1559,19 +1734,11 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
             &diff_files,
         )?;
         let since_sha_file = paths.base_o.with_extension("since.sha");
-        let prev_sha = fs::read_to_string(&since_sha_file).unwrap_or_default();
-        if had_daemon && prev_sha.trim() != sha {
-            stop_target_daemon(&paths);
-        }
         let _ = fs::write(&since_sha_file, format!("{sha}\n"));
     }
 
     let reply = ensure_daemon(&opts, &paths)?;
-    let cleanup_oneshot = || {
-        if (opts.since.is_some() || opts.backtest) && !had_daemon {
-            stop_target_daemon(&paths);
-        }
-    };
+    let cleanup_oneshot = || {};
 
     if opts.backtest {
         let bt_reply =

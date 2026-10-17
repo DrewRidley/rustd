@@ -793,7 +793,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     // A crate with fewer transitive dependencies must be resolved before one that depends on it.
     crates.sort_by_cached_key(|&c| c.transitive_deps(db).len());
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(16);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let db = db.clone();
@@ -1019,8 +1019,14 @@ fn build(
         let mut candidate_crates = Vec::new();
         for &file in dirty_files {
             for &krate in ide_db::base_db::relevant_crates(db, file) {
-                if seen_crates.insert(krate) {
-                    candidate_crates.push(Crate::from(krate));
+                let c = Crate::from(krate);
+                let is_bench_or_example = resolver.crate_root(c).is_some_and(|p| {
+                    p.components().any(|comp| {
+                        matches!(comp.as_os_str().to_str(), Some("benches" | "examples"))
+                    })
+                });
+                if !is_bench_or_example && seen_crates.insert(krate) {
+                    candidate_crates.push(c);
                 }
             }
         }
@@ -2791,13 +2797,20 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
 }
 
 /// What a client asks of the daemon, as the one line it sends.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Request {
     /// Bring the objects and the linked program up to date with the files on disk.
     Sync,
     /// Bring the objects up to date and leave the linking to the client, which loads the
     /// patch object into a program that is running.
     Patch,
+    /// Switch active target package/binary in the shared workspace daemon and build/patch it.
+    Switch {
+        bin_crate: String,
+        out: PathBuf,
+        patch: PathBuf,
+        link_cmd: String,
+    },
     /// Compact accumulated patches into the base binary via a full `wild` link and reset baseline.
     Rebase,
     /// Run incremental syntax and semantic diagnostics and write a cargo-style report.
@@ -2814,6 +2827,14 @@ impl Request {
             let n = rest.trim().parse::<usize>().unwrap_or(20).max(1);
             return Some(Request::Backtest(n));
         }
+        if let Some(rest) = line.strip_prefix("switch\t") {
+            let mut parts = rest.split('\t');
+            let bin_crate = parts.next()?.to_owned();
+            let out = PathBuf::from(parts.next()?);
+            let patch = PathBuf::from(parts.next()?);
+            let link_cmd = parts.next()?.to_owned();
+            return Some(Request::Switch { bin_crate, out, patch, link_cmd });
+        }
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
@@ -2824,10 +2845,10 @@ impl Request {
         }
     }
 
-    fn line(self) -> &'static str {
+    fn line(&self) -> &'static str {
         match self {
             Request::Sync => "sync\n",
-            Request::Patch => "patch\n",
+            Request::Patch | Request::Switch { .. } => "patch\n",
             Request::Rebase => "rebase\n",
             Request::Check => "check\n",
             Request::Clippy => "clippy\n",
@@ -3128,7 +3149,17 @@ fn main() -> anyhow::Result<()> {
     {
         return cli::dispatch(&first, std::env::args().skip(2).collect());
     }
-    let args = Args::parse()?;
+    let mut args = Args::parse()?;
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", "8");
+        }
+    }
+    if std::env::var_os("RA_LRU_CAP").is_none() {
+        unsafe {
+            std::env::set_var("RA_LRU_CAP", "256");
+        }
+    }
     if args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
         hir_ty::mir::codegen::WASM32_TARGET.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3178,7 +3209,7 @@ fn main() -> anyhow::Result<()> {
             std::env::set_var("RUSTD_CACHE_BS", args.out.with_extension("bs.cache"));
         }
     }
-    let baseline_cache_path =
+    let mut baseline_cache_path =
         (!args.out.is_dir()).then(|| args.out.with_extension("baseline.cache"));
     let sym_cache_path = (!args.out.is_dir()).then(|| args.out.with_extension("symbols.cache"));
     let table = std::thread::spawn(move || {
@@ -3254,7 +3285,7 @@ fn main() -> anyhow::Result<()> {
     eprint!("cold: ");
     report(&cold);
     report_stats(&known.stats);
-    let cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
+    let mut cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
     let skip_cold_link = args.krate.is_none()
         && cold_bin_path.as_ref().is_some_and(|bp| {
             let base_p = bp.with_extension("base");
@@ -3390,11 +3421,18 @@ fn main() -> anyhow::Result<()> {
         Vec::new()
     };
     let check_root = args.root()?;
-    let check_report_path = args.out.with_extension("check.txt");
+    let mut check_report_path = args.out.with_extension("check.txt");
     let _ = std::fs::write(&check_report_path, "errors=0 warnings=0 us=0\n");
     let mut last_check_report = CheckReport::default();
     let mut last_failed: Option<String> = None;
+    let mut last_baseline_mtime: Option<SystemTime> = baseline_cache_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
     loop {
+        if !args.project.exists() || args.socket.as_ref().is_some_and(|s| !s.exists()) {
+            return Ok(());
+        }
         if WatchedFile::watch_included(&mut files, &mut db) {
             known.touch(&db, None);
         }
@@ -3405,7 +3443,103 @@ fn main() -> anyhow::Result<()> {
                 None
             }
         };
-        let mut noticed = None;
+        let mut switched_target = false;
+        if let Some((Request::Switch { ref bin_crate, ref out, ref patch, ref link_cmd }, _)) = client {
+            let cur_bc = std::env::var("RUSTD_BIN_CRATE").unwrap_or_default();
+            if cur_bc != *bin_crate || args.out != *out {
+                unsafe {
+                    std::env::set_var("RUSTD_BIN_CRATE", bin_crate);
+                }
+                args.out = out.clone();
+                args.patch = Some(patch.clone());
+                args.link_cmd = Some(link_cmd.clone());
+                baseline_cache_path = Some(args.out.with_extension("baseline.cache"));
+                check_report_path = args.out.with_extension("check.txt");
+                cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
+                bin_index = cold_bin_path
+                    .as_ref()
+                    .filter(|p| p.exists())
+                    .and_then(|bp| incremental_link::BinaryIndex::from_cold_binary(bp));
+                last_baseline_mtime = None;
+                switched_target = true;
+            }
+        }
+        let cur_baseline_mtime = baseline_cache_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+        if cur_baseline_mtime != last_baseline_mtime {
+            last_baseline_mtime = cur_baseline_mtime;
+            let mut new_base: FxHashMap<PathBuf, String> = FxHashMap::default();
+            if let Some(bp) = &baseline_cache_path
+                && let Ok(bytes) = std::fs::read(bp)
+                && bytes.starts_with(b"RUSTDBAS")
+            {
+                let mut pos = 8usize;
+                let get_u32 = |pos: &mut usize| -> Option<u32> {
+                    let v = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?);
+                    *pos += 4;
+                    Some(v)
+                };
+                let get_str = |pos: &mut usize| -> Option<String> {
+                    let len = get_u32(pos)? as usize;
+                    let s = std::str::from_utf8(bytes.get(*pos..*pos + len)?).ok()?.to_owned();
+                    *pos += len;
+                    Some(s)
+                };
+                if get_str(&mut pos).is_some()
+                    && let Some(count) = get_u32(&mut pos)
+                {
+                    for _ in 0..count {
+                        if let (Some(p), Some(txt)) = (get_str(&mut pos), get_str(&mut pos)) {
+                            new_base.insert(PathBuf::from(p), txt);
+                        }
+                    }
+                }
+            }
+            let mut base_change = ChangeWithProcMacros::default();
+            let mut has_base_change = false;
+            for wf in &mut files {
+                if let Watched::Source(id) = wf.file {
+                    if let Some(orig_text) = new_base.get(&wf.path) {
+                        base_change.change_file(id, Some(orig_text.clone()));
+                        initial_texts.remove(&id);
+                        initial_adts.remove(&id);
+                        for &krate in ide_db::base_db::relevant_crates(&db, id) {
+                            let l = listed.of(&db, Crate::from(krate));
+                            hir::attach_db(&db, || {
+                                for &func in &l.functions {
+                                    let f = func
+                                        .lookup(&db)
+                                        .id
+                                        .file_id
+                                        .original_file_respecting_includes(&db)
+                                        .file_id(&db);
+                                    if f == id {
+                                        initial_serials.remove(&func);
+                                    }
+                                }
+                            });
+                        }
+                        wf.mtime = SystemTime::UNIX_EPOCH;
+                        has_base_change = true;
+                    } else if dirty_files.remove(&id)
+                        && let Ok(disk_txt) = std::fs::read_to_string(&wf.path)
+                    {
+                        base_change.change_file(id, Some(disk_txt));
+                        initial_texts.remove(&id);
+                        initial_adts.remove(&id);
+                        wf.mtime = SystemTime::UNIX_EPOCH;
+                        has_base_change = true;
+                    }
+                }
+            }
+            baseline_by_path = new_base;
+            if has_base_change {
+                db.apply_change(base_change);
+            }
+        }
+        let mut noticed = switched_target.then(|| (Instant::now(), Duration::ZERO));
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
         // Files are read after that: a timestamp can be that of a write still under way, and
         // the rest of that write may not change it again. Whoever asks for a build has finished

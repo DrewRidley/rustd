@@ -295,7 +295,7 @@ impl<'db> Filler<'db> {
     }
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_cycle_result)]
+#[salsa::tracked(lru = 256, returns(as_ref), cycle_result = monomorphized_mir_body_cycle_result)]
 pub fn monomorphized_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     owner: InferBodyId<'db>,
@@ -334,7 +334,7 @@ fn monomorphized_mir_body_cycle_result<'db>(
     Err(MirLowerError::Loop)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_closure_cycle_result)]
+#[salsa::tracked(lru = 256, returns(as_ref), cycle_result = monomorphized_mir_body_for_closure_cycle_result)]
 pub fn monomorphized_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
@@ -358,7 +358,7 @@ fn monomorphized_mir_body_for_closure_cycle_result<'db>(
     Err(MirLowerError::Loop)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_coroutine_cycle_result)]
+#[salsa::tracked(lru = 256, returns(as_ref), cycle_result = monomorphized_mir_body_for_coroutine_cycle_result)]
 pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
