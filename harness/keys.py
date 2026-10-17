@@ -28,6 +28,14 @@ def replace(path, old, new):
     return edit
 
 
+def append(path, text):
+    return lambda ws, env, args: open(os.path.join(ws, path), "a").write(text)
+
+
+def both(*changes):
+    return lambda ws, env, args: [change(ws, env, args) for change in changes]
+
+
 def setenv(name, value):
     return lambda ws, env, args: env.__setitem__(name, value)
 
@@ -37,13 +45,7 @@ def arg(*more):
 
 
 # What rustd does not do yet: these differ, and are told apart when they do.
-OPEN = {
-    # rustd reads `env!` and `option_env!` from what cargo and build scripts set, not from the
-    # variables of whoever asked for the build.
-    "a variable of the process read by option_env!",
-    # rustd has no profile: it compiles as `dev` does, with debug assertions and overflow checks.
-    "the release profile",
-}
+OPEN = set()
 
 # (name, the change, the line of the program's output it has to show in or None for no line)
 CASES = [
@@ -58,6 +60,9 @@ CASES = [
     ("a variable of .cargo/config.toml", replace(".cargo/config.toml", '"config"', '"config anew"'), "config_env"),
     ("a cfg of RUSTFLAGS", setenv("RUSTFLAGS", "--cfg keys_flag"), "flag_cfg"),
     ("the release profile", arg("--release"), "assertions"),
+    ("overflow checks of the dev profile", append("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n"), "overflows"),
+    ("debug assertions of the dev profile", append("Cargo.toml", "\n[profile.dev]\ndebug-assertions = false\n"), "assertions"),
+    ("a profile of its own", both(append("Cargo.toml", '\n[profile.quick]\ninherits = "dev"\noverflow-checks = false\n'), arg("--profile", "quick")), "overflows"),
     ("a constant of a dependency", replace("kdep/src/lib.rs", "SCALE: u32 = 3", "SCALE: u32 = 4"), "scaled"),
     ("an inlined function of a dependency", replace("kdep/src/lib.rs", "x + 1", "x + 2"), "scaled"),
     ("the layout of a type of a dependency", replace("kdep/src/lib.rs", "pub side: u32,", "pub side: u32,\n    pub other: u64,"), "shape"),
@@ -75,7 +80,7 @@ def build(ws, env, args):
     os.environ.update(env)
     try:
         fx = Fixture(ws, ["kapp", "klib", "kdep"], ["-p", "kapp", *args])
-        fx.rustd_args = [it for at, it in enumerate(args) if "--features" in args[max(0, at - 1):at + 1]]
+        fx.rustd_args = list(args)
         fx.rustc_build()
         fx.rustd_build()
         left = sum(row[0] == "skipped" and "no rustc symbol" not in row[2] for rows in fx.reports.values() for row in rows)

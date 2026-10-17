@@ -41,10 +41,10 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
         package.readme.as_ref().map(ToString::to_string).unwrap_or_default(),
     );
 
-    env.set(
-        "CARGO_PKG_RUST_VERSION",
-        package.rust_version.as_ref().map(ToString::to_string).unwrap_or_default(),
-    );
+    env.set("CARGO_PKG_RUST_VERSION", package.rust_version_as_written().unwrap_or_default());
+    if package.primary {
+        env.set("CARGO_PRIMARY_PACKAGE", "1");
+    }
 }
 
 pub(crate) fn inject_cargo_env(env: &mut Env, cargo_path: &Utf8Path) {

@@ -121,6 +121,11 @@ impl fmt::Debug for RootDatabase {
 }
 
 impl RootDatabase {
+    /// Whether the file has a text: one that is not UTF-8 is known to the VFS and has none.
+    pub fn has_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.has_text(file_id)
+    }
+
     /// The files outside the VFS that an `include_bytes!` or `include_str!` has read.
     pub fn included_files(&self) -> Vec<vfs::AbsPathBuf> {
         self.files.included_files()

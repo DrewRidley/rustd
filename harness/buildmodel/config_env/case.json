@@ -1,0 +1,20 @@
+{
+  "row": "`.cargo/config.toml`: `[env]`",
+  "package": "app",
+  "crates": [
+    "app"
+  ],
+  "steps": [
+    {
+      "what": "the value in the configuration changes",
+      "expect": "refused",
+      "edit": [
+        [
+          ".cargo/config.toml",
+          "first",
+          "second"
+        ]
+      ]
+    }
+  ]
+}

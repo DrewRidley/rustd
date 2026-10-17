@@ -819,6 +819,7 @@ fn match_meta_var<'t>(
         MetaVarKind::Ident | MetaVarKind::Tt | MetaVarKind::Lifetime | MetaVarKind::Literal => {
             let span = input.next_span();
             let savepoint = input.savepoint();
+            let mut negative = false;
             let err = match kind {
                 MetaVarKind::Ident => input.expect_ident().map(drop).map_err(|()| {
                     ExpandError::binding_error(span.unwrap_or(delim_span.close), "expected ident")
@@ -836,7 +837,7 @@ fn match_meta_var<'t>(
                     )
                 }),
                 MetaVarKind::Literal => {
-                    eat_char(input, '-');
+                    negative = eat_char(input, '-');
                     expect_literal(input).map_err(|()| {
                         ExpandError::binding_error(
                             span.unwrap_or(delim_span.close),
@@ -849,6 +850,8 @@ fn match_meta_var<'t>(
             .err();
             let value = match err {
                 Some(_) => Fragment::Empty,
+                // A sign and a number are one operand where they go, as an expression is.
+                None if negative => Fragment::Expr(input.from_savepoint(savepoint)),
                 None => {
                     let tree = input.from_savepoint(savepoint);
                     // A fragment taken as a token tree is still that fragment where it goes.
@@ -1035,9 +1038,11 @@ fn expect_lifetime<'a>(iter: &mut TtIter<'a>) -> Result<tt::Ident, ()> {
     iter.expect_ident_or_underscore()
 }
 
-fn eat_char(iter: &mut TtIter<'_>, c: char) {
-    if matches!(iter.peek(), Some(TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char, .. }))) if char == c)
-    {
-        iter.next().expect("already peeked");
+/// Takes the next token if it is the punctuation `c`, and says whether it was.
+fn eat_char(iter: &mut TtIter<'_>, c: char) -> bool {
+    let found = matches!(iter.peek(), Some(TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char, .. }))) if char == c);
+    if found {
+        iter.next();
     }
+    found
 }

@@ -48,6 +48,7 @@ tracing-tree.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true
+cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 base-db.workspace = true

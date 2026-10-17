@@ -11,7 +11,7 @@ use std::{ffi::OsString, path::Path, process::Command};
 use anyhow::Context as _;
 
 /// The flags of rustc that cargo passes with their value as the next argument.
-const VALUED: &[&str] = &[
+pub(crate) const VALUED: &[&str] = &[
     "-C",
     "-L",
     "-Z",

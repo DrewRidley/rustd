@@ -15,40 +15,41 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, bail};
 use rustc_hash::FxHashMap;
-use sha2::{Digest, Sha256};
 
-use crate::remote::{Remote, transfer};
+use crate::remote::{Digest, Fetched, Remote, Tally, project_name, runtime};
 
 /// The directories of a profile that hold units, the one cargo trusts last.
 const PLACES: [&str; 3] = ["deps", "build", ".fingerprint"];
 
 /// The units a project's builds used and the archive of each: `unit hash` a line.
-struct Listed(BTreeMap<String, String>);
+struct Listed(BTreeMap<String, Digest>);
 
 impl Listed {
     fn at(project: &str) -> String {
         format!("deps/{project}")
     }
 
-    fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
-        let bytes = remote.fetch(&Listed::at(project))?.unwrap_or_default();
-        let text = String::from_utf8(bytes).context("the list of units is not text")?;
-        let units = text
+    fn parse(lines: &str) -> Listed {
+        let units = lines
             .lines()
             .filter_map(|line| line.split_once(' '))
-            .filter(|(unit, archive)| hash_of(unit).is_some() && is_hex(archive, 64))
-            .map(|(unit, archive)| (unit.to_owned(), archive.to_owned()));
-        Ok(Listed(units.collect()))
+            .filter(|(unit, _)| hash_of(unit).is_some())
+            .filter_map(|(unit, archive)| Some((unit.to_owned(), Digest::parse(archive)?)));
+        Listed(units.collect())
     }
 
-    fn send(&self, remote: &Remote, project: &str) -> anyhow::Result<()> {
-        let text: String =
-            self.0.iter().map(|(unit, archive)| format!("{unit} {archive}\n")).collect();
-        remote.send(&Listed::at(project), text.as_bytes())
+    fn lines(&self) -> String {
+        self.0.iter().map(|(unit, archive)| format!("{unit} {archive}\n")).collect()
+    }
+
+    async fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Listed> {
+        let lines = remote.read_list(&Listed::at(project)).await?;
+        Ok(Listed::parse(&lines.unwrap_or_default()))
     }
 }
 
@@ -131,79 +132,107 @@ fn archive(dir: &Path, unit: &str, outputs: &[String]) -> anyhow::Result<Vec<u8>
     Ok(tar.into_inner()?.finish()?)
 }
 
-/// Sends the units of `dir` the project's list lacks, and lists them.
-fn push(
+/// Sends the units of `dir` the project's list lacks, and lists the ones that arrived.
+async fn push(
     dir: &Path,
     remote: &Remote,
     project: &str,
     local: &BTreeSet<String>,
 ) -> anyhow::Result<String> {
-    let mut listed = Listed::fetch(remote, project)?;
-    let (units, outputs) = (units(dir, local)?, outputs(dir)?);
-    let missing: Vec<&String> = units.iter().filter(|it| !listed.0.contains_key(*it)).collect();
-    let sent = std::sync::Mutex::new(Vec::new());
-    let bytes = transfer(&missing, |unit| {
-        let none = Vec::new();
-        let outputs = hash_of(unit).and_then(|hash| outputs.get(hash)).unwrap_or(&none);
-        let bytes = archive(dir, unit, outputs)?;
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        remote.send(&format!("units/{hash}"), &bytes)?;
-        if let Ok(mut sent) = sent.lock() {
-            sent.push((unit.to_owned(), hash));
+    remote.may_write()?;
+    // A list this machine does not trust is one it does not add to: see `extend_list`.
+    let listed = Listed::fetch(remote, project).await.unwrap_or_else(|_| Listed(BTreeMap::new()));
+    let (units, outputs) = (units(dir, local)?, Arc::new(outputs(dir)?));
+    let missing = units.into_iter().filter(|it| !listed.0.contains_key(it));
+    let sent = Mutex::new(BTreeMap::new());
+    let send = |unit: String| {
+        let (outputs, sent) = (outputs.clone(), &sent);
+        async move {
+            let (dir, of) = (dir.to_owned(), unit.clone());
+            let pack = move || {
+                let outputs = hash_of(&of).and_then(|hash| outputs.get(hash));
+                archive(&dir, &of, outputs.map_or(&[], |it| it))
+            };
+            let bytes = tokio::task::spawn_blocking(pack).await??;
+            let (hash, len) = (Digest::of(&bytes), bytes.len() as u64);
+            remote.send_named_by_hash(&format!("units/{hash}"), bytes).await?;
+            if let Ok(mut sent) = sent.lock() {
+                sent.insert(unit, hash);
+            }
+            Ok(Fetched::Whole(len))
         }
-        Ok(bytes.len() as u64)
-    })?;
-    listed.0.extend(sent.into_inner().unwrap_or_default());
-    listed.send(remote, project)?;
-    Ok(format!("{} units added to `{project}`, {} MB sent", missing.len(), bytes >> 20))
+    };
+    let tally = Tally::of(missing, remote.jobs(), send).await;
+    let sent = sent.into_inner().unwrap_or_default();
+    if !sent.is_empty() {
+        let extend = |lines: &str| {
+            let mut listed = Listed::parse(lines);
+            listed.0.extend(sent.iter().map(|(unit, hash)| (unit.clone(), *hash)));
+            listed.lines()
+        };
+        remote.extend_list(&Listed::at(project), extend).await?;
+    }
+    let said = format!("{} units added to `{project}`, {} bytes sent", tally.done, tally.bytes);
+    tally.settle(said, remote.traffic())
+}
+
+/// Unpacks the archive of `unit` into `dir`, and only what is of this unit: an archive is
+/// not trusted to say where it goes.
+fn unpack(dir: &Path, unit: &str, archive: &Path) -> anyhow::Result<()> {
+    let mut tar = tar::Archive::new(zstd::Decoder::new(std::fs::File::open(archive)?)?);
+    tar.set_preserve_mtime(true);
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let mut parts = path.components().map(|it| it.as_os_str().to_str());
+        let (Some(Some(place)), Some(Some(name))) = (parts.next(), parts.next()) else {
+            bail!("{unit} holds {}", path.display());
+        };
+        let of_unit = match place {
+            "deps" => hash_of(name.split('.').next().unwrap_or(name)) == hash_of(unit),
+            "build" | ".fingerprint" => name == unit,
+            _ => false,
+        };
+        if !of_unit {
+            bail!("{unit} holds {}", path.display());
+        }
+        entry.unpack_in(dir)?;
+    }
+    Ok(())
 }
 
 /// Fetches the units of the project's list that `dir` has no fingerprint of.
-fn pull(
+async fn pull(
     dir: &Path,
     remote: &Remote,
     project: &str,
     local: &BTreeSet<String>,
 ) -> anyhow::Result<String> {
-    std::fs::create_dir_all(dir)?;
-    let listed = Listed::fetch(remote, project)?;
-    let missing: Vec<&String> = listed
-        .0
-        .keys()
-        .filter(|unit| !dir.join(".fingerprint").join(unit).exists())
-        .filter(|unit| unit.rsplit_once('-').is_some_and(|(package, _)| !local.contains(package)))
-        .collect();
-    let bytes = transfer(&missing, |unit| {
-        let hash = &listed.0[unit];
-        let Some(bytes) = remote.fetch(&format!("units/{hash}"))? else {
-            bail!("`{project}` lists {unit}, which is not there");
-        };
-        if format!("{:x}", Sha256::digest(&bytes)) != *hash {
-            bail!("{unit} is not what was sent under that name");
-        }
-        let mut tar = tar::Archive::new(zstd::Decoder::new(&bytes[..])?);
-        tar.set_preserve_mtime(true);
-        for entry in tar.entries()? {
-            let mut entry = entry?;
-            // Only what is of this unit: an archive is not trusted to say where it goes.
-            let path = entry.path()?.into_owned();
-            let mut parts = path.components().map(|it| it.as_os_str().to_str());
-            let (Some(Some(place)), Some(Some(name))) = (parts.next(), parts.next()) else {
-                bail!("{unit} holds {}", path.display());
-            };
-            let of_unit = match place {
-                "deps" => hash_of(name.split('.').next().unwrap_or(name)) == hash_of(unit),
-                "build" | ".fingerprint" => name == unit,
-                _ => false,
-            };
-            if !of_unit {
-                bail!("{unit} holds {}", path.display());
+    tokio::fs::create_dir_all(dir).await?;
+    let listed = Listed::fetch(remote, project).await?;
+    let missing =
+        listed.0.iter().filter(|(unit, _)| !dir.join(".fingerprint").join(unit).exists()).filter(
+            |(unit, _)| unit.rsplit_once('-').is_some_and(|(package, _)| !local.contains(package)),
+        );
+    let fetch = |(unit, hash): (&String, &Digest)| {
+        let (unit, hash) = (unit.clone(), *hash);
+        async move {
+            let archive = dir.join(format!("{hash}.unit"));
+            let fetched =
+                remote.fetch_file(&format!("units/{hash}"), &hash, &archive, |_| true).await?;
+            if let Fetched::Whole(_) = fetched {
+                let (dir, from) = (dir.to_owned(), archive.clone());
+                let unpacked = tokio::task::spawn_blocking(move || unpack(&dir, &unit, &from));
+                let unpacked = unpacked.await;
+                tokio::fs::remove_file(&archive).await?;
+                unpacked??;
             }
-            entry.unpack_in(dir)?;
+            Ok(fetched)
         }
-        Ok(bytes.len() as u64)
-    })?;
-    Ok(format!("{} units of `{project}` fetched, {} MB", missing.len(), bytes >> 20))
+    };
+    let tally = Tally::of(missing, remote.jobs(), fetch).await;
+    let said = format!("{} units of `{project}` fetched, {} bytes", tally.done, tally.bytes);
+    tally.settle(said, remote.traffic())
 }
 
 /// `rustd deps push|pull REMOTE DIR [PROJECT]`, in the directory of `Cargo.lock`.
@@ -212,19 +241,21 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let (Some(verb), Some(remote), Some(dir)) = (args.next(), args.next(), args.next()) else {
         bail!(USAGE);
     };
-    let project = args.next().unwrap_or_else(|| "default".to_owned());
-    if project.contains(['/', '\\']) || project.starts_with('.') {
-        bail!("`{project}` is not the name of a project");
-    }
+    let project = project_name(args.next())?;
     let lock = std::fs::read_to_string("Cargo.lock").context("there is no Cargo.lock here")?;
     let local = local_packages(&lock);
-    let (remote, dir) = (Remote::parse(&remote)?, Path::new(&dir));
+    let dir = Path::new(&dir);
     let start = std::time::Instant::now();
-    let done = match verb.as_str() {
-        "push" => push(dir, &remote, &project, &local)?,
-        "pull" => pull(dir, &remote, &project, &local)?,
-        _ => bail!(USAGE),
-    };
+    let done = runtime()?.block_on(async {
+        let remote = Remote::open(&remote).await?;
+        let done = match verb.as_str() {
+            "push" => push(dir, &remote, &project, &local).await,
+            "pull" => pull(dir, &remote, &project, &local).await,
+            _ => bail!(USAGE),
+        };
+        eprintln!("remote: {}", remote.traffic());
+        done
+    })?;
     println!("{done} in {:.1?}", start.elapsed());
     Ok(())
 }

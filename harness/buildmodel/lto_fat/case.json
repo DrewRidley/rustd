@@ -1,0 +1,15 @@
+{
+  "row": "`lto = true`",
+  "package": "app",
+  "crates": [
+    "app",
+    "dep"
+  ],
+  "cargo": [
+    "--release"
+  ],
+  "rustd": [
+    "--release"
+  ],
+  "expect": "refused"
+}

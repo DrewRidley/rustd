@@ -26,14 +26,14 @@ use hir_def::{
     VariantId,
     attrs::AttrFlags,
     expr_store::Body,
-    hir::ExprId,
+    hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
     src::HasSource,
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use la_arena::ArenaMap;
-use rustc_abi::{ExternAbi, Integer, Size};
+use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::Idx;
@@ -42,7 +42,7 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
 
 use crate::mir::is_by_move_coroutine;
@@ -65,9 +65,10 @@ use crate::{
 };
 use hir_def::lang_item::LangItems;
 
+use self::debuginfo::{DebugContext, FunctionDebug, LineRow, VariableDebug};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Recorder,
-    Requests,
+    Requests, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -82,6 +83,7 @@ mod asm;
 mod backend;
 pub use backend::Backend;
 mod cached;
+mod debuginfo;
 mod float_pair;
 mod fragment;
 mod home;
@@ -95,7 +97,11 @@ mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
 
 pub use patch::{Stale, StaleSteps, empty_object};
-pub use store::{pack_name, seal_left_open};
+pub use store::{
+    Collected, FORMAT as STORE_FORMAT, FetchMissing, Stats, StoreDir, Verified, compiles_against,
+    fetch_missing_with, is_pack, limit_from_env, name_file_whole, pack_format, pack_keys,
+    pack_name, parse_size, write_file_whole,
+};
 mod type_id;
 mod unwind;
 mod vtable;
@@ -143,6 +149,11 @@ pub trait SymbolResolver {
     fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The name rustc gives a source file in panic messages.
     fn source_path(&self, file: base_db::FileId) -> Option<String>;
+    /// The directory the names of [`Self::source_path`] are relative to, when the build is
+    /// to tell a debugger where its code comes from.
+    fn debug_directory(&self) -> Option<String> {
+        None
+    }
     /// Whether the program's rustc build has the symbol, defined or referred to.
     fn defines(&self, _symbol: &str) -> bool {
         false
@@ -842,6 +853,8 @@ struct ObjectCodegen<'a, 'db> {
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
     unwind: UnwindContext,
+    /// What a debugger is told about the functions, when the build tells one anything.
+    debug: Option<DebugContext>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -1275,6 +1288,25 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
         fx.args = Some(args);
         fx.codegen()
     })
+}
+
+/// Whether the crate is built with `-C overflow-checks`, when cargo builds it. The standard
+/// library is built already, without.
+fn crate_checks_overflow(db: &dyn HirDatabase, krate: Crate) -> Option<bool> {
+    if krate.data(db).origin.is_lang() {
+        return None;
+    }
+    let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
+    Some(krate.cfg_options(db).check_atom(&flag))
+}
+
+/// Whether the crates cargo builds have `-C overflow-checks`, when they all agree.
+#[salsa::tracked(returns(copy))]
+fn build_checks_overflow(db: &dyn HirDatabase) -> Option<bool> {
+    let crates = base_db::all_crates(db);
+    let mut settings = crates.iter().filter_map(|&krate| crate_checks_overflow(db, krate));
+    let first = settings.next()?;
+    settings.all(|it| it == first).then_some(first)
 }
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
@@ -1794,6 +1826,38 @@ fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<Compil
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
 }
 
+/// What a debugger is told of `variables`, which are of the body of `owner`. A name the body
+/// gives to more than one local is left out: nothing says yet from where to where each of
+/// them is the one meant. So is a variable of a type that is not told of.
+fn described_variables(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    env: &StoredParamEnvAndCrate,
+    variables: &[Variable],
+) -> Vec<VariableDebug> {
+    let body = Body::of(db, owner);
+    let mut uses: FxHashMap<&hir_expand::name::Name, u32> = FxHashMap::default();
+    for (_, binding) in body.bindings() {
+        *uses.entry(&binding.name).or_default() += 1;
+    }
+    let types = debuginfo::Types::new(db, env.as_ref(db));
+    variables
+        .iter()
+        .filter_map(|variable| {
+            let name = &body[variable.binding].name;
+            if uses.get(name) != Some(&1) {
+                return None;
+            }
+            Some(VariableDebug {
+                name: name.as_str().to_owned(),
+                param: variable.param,
+                ty: types.describe(variable.ty.as_ref())?,
+                offset: variable.offset,
+            })
+        })
+        .collect()
+}
+
 /// File, line and column of a place in a body, as rustc reports them.
 #[salsa::tracked]
 fn source_location<'db>(
@@ -1804,10 +1868,26 @@ fn source_location<'db>(
     let source_map = &Body::with_source_map(db, owner).1;
     let source = match span {
         MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
+        // ends where the body does.
+        MirSpan::ExprEnd(expr) => {
+            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+                (Ok(written), _) => written,
+                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
+                    source_map.expr_syntax(*tail).ok()?
+                }
+                (Err(_), _) => return None,
+            }
+        }
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
     };
     let mut range = source.value.syntax_node_ptr().text_range();
+    if let MirSpan::ExprEnd(_) = span {
+        // The brace that closes a block, which is where rustc has a scope left.
+        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+        return location_of(db, source.file_id, TextRange::new(last?, range.end()));
+    }
     if source.value.syntax_node_ptr().kind() == SyntaxKind::METHOD_CALL_EXPR {
         // A method call is reported from the method's name on.
         let root = source.file_id.parse_or_expand(db);
@@ -1928,7 +2008,7 @@ pub fn exported_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String>
 }
 
 /// The symbol an item of an `extern` block links to.
-fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
         return None;
     };
@@ -1958,12 +2038,38 @@ fn compile<'db>(
             align: 16,
             relocs: Vec::new(),
             unwind: None,
+            lines: Vec::new(),
         },
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
+    let source = match body.map(|body| body.owner) {
+        Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
+        _ => None,
+    };
+    let variables = variables(&ctx, std::mem::take(&mut cg.named));
+    let variables = Some((env.store(), variables)).filter(|it| !it.1.is_empty());
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, layouts })
+    Ok(CompiledFunction { requests, code, source, variables, layouts })
+}
+
+/// Where the slots of named locals ended up in the frame Cranelift laid out. None of them
+/// is known when the code is another backend's, which keeps locals where it likes.
+fn variables(
+    ctx: &cranelift_codegen::Context,
+    named: Vec<(BindingId, bool, StoredTy, ir::StackSlot)>,
+) -> Vec<Variable> {
+    let Some(frame) = ctx.compiled_code().and_then(|code| code.buffer.frame_layout()) else {
+        return Vec::new();
+    };
+    let to_fp = i64::from(frame.frame_to_fp_offset);
+    named
+        .into_iter()
+        .filter_map(|(binding, param, ty, slot)| {
+            let offset = i64::from(frame.stackslots.get(slot)?.offset) - to_fp;
+            Some(Variable { binding, param, ty, offset })
+        })
+        .collect()
 }
 
 fn build<'db>(
@@ -1976,6 +2082,9 @@ fn build<'db>(
     let interner = DbInterner::new_with(cg.db, env.krate);
     let mut ctx = cranelift_codegen::Context::new();
     ctx.func.signature.call_conv = cg.isa.default_call_conv();
+    // Source locations are kept as distances from the first one set, and the distance of
+    // the one just below it is taken for none at all.
+    ctx.func.params.ensure_base_srcloc(ir::SourceLoc::new(0));
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut fx = FunctionCx {
         cg,
@@ -1989,6 +2098,8 @@ fn build<'db>(
         drop_flags: ArenaMap::new(),
         moved_paths: Vec::new(),
         deferred_drops: Vec::new(),
+        at: None,
+        moved_here: None,
         cleanup: None,
         inner_pad: None,
         drop_order: Vec::new(),
@@ -2008,6 +2119,7 @@ fn build<'db>(
         suspended_drop: None,
     };
     fill(&mut fx)?;
+    fx.note_variables();
     fx.builder.seal_all_blocks();
     let config = fx.cg.target_config();
     let guarded = fx.guarded;
@@ -2065,6 +2177,9 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, own))
                 .collect(),
             unwind: FunctionUnwind::of(isa, ctx)?,
+            lines: LineRow::of_ranges(
+                compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
+            ),
         })
     }));
     match outcome {
@@ -2089,7 +2204,14 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
     for reloc in &mut relocs {
         reloc.offset += body;
     }
-    Ok(Code { signature: func.signature.clone(), bytes, align: 1, relocs, unwind: None })
+    Ok(Code {
+        signature: func.signature.clone(),
+        bytes,
+        align: 1,
+        relocs,
+        unwind: None,
+        lines: Vec::new(),
+    })
 }
 
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
@@ -2134,11 +2256,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let builder = ObjectBuilder::new(target()?.clone(), "rustd", default_libcall_names())?;
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
+        let debug = symbols
+            .debug_directory()
+            .and_then(|directory| DebugContext::new(module.isa(), &directory));
+        let debugged = debug.is_some();
         Ok(ObjectCodegen {
             db,
             symbols,
             module,
             unwind,
+            debug,
             imports: FxHashMap::default(),
             assemblies: FxHashMap::default(),
             instances: FxHashMap::default(),
@@ -2182,7 +2309,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store::Store::global()
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
-                .map(|store| std::sync::Arc::new(cached::Entries::new(store))),
+                .map(|store| {
+                    let checked = build_checks_overflow(db);
+                    std::sync::Arc::new(cached::Entries::new(store, debugged, checked))
+                }),
             named: FxHashMap::default(),
             found: Vec::new(),
             found_pending: Vec::new(),
@@ -2194,12 +2324,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         })
     }
 
-    fn finish(self) -> Result<Vec<u8>> {
+    fn finish(mut self) -> Result<Vec<u8>> {
         if Target::current().writes_wasm_objects() {
             return self.finish_wasm();
         }
+        self.unwind.name_personality(&mut self.module).map_err(CodegenError::Backend)?;
         let mut product = self.module.finish();
         self.unwind.emit(&mut product).map_err(CodegenError::Backend)?;
+        if let Some(debug) = self.debug {
+            debug.emit(&mut product).map_err(CodegenError::Backend)?;
+        }
         product.emit().map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
@@ -2277,6 +2411,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.module.declare_function(&symbol, Linkage::Export, &compiled.code.signature)?;
         self.shape_origin(id, InstanceDef::Fn(func), &func, false, took);
         self.stitch(id, compiled)?;
+        let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+        self.describe(id, compiled, FunctionDebug::new(name, symbol.clone()), Some(func));
         Ok(symbol)
     }
 
@@ -2331,7 +2467,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// that the object has no use for is only wasted.
     fn compile_ahead(&mut self) {
         // A patch calls the base's copy of most of what it reaches.
-        if self.base.is_some() || self.pending.is_empty() {
+        if std::env::var_os("RUSTD_ALONE").is_none()
+            || self.patching
+            || self.base.is_some()
+            || self.pending.is_empty()
+        {
             return;
         }
         struct Ahead {
@@ -2447,8 +2587,48 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             );
         }
         let ids = self.stitch(id, compiled)?;
-        self.keep(instance, compiled, &ids);
+        let name = self.backtrace_name(instance);
+        let declared = match instance.def {
+            InstanceDef::Fn(func) => Some(func),
+            _ => None,
+        };
+        let debug = self.describe(id, compiled, FunctionDebug::new(name.clone(), name), declared);
+        self.keep(instance, compiled, &ids, debug);
         Ok(())
+    }
+
+    /// Tells the debugger about the compiled function `id`: what it is called, as `debug`
+    /// has it, and which line each of its instructions is of. `None` when no debugger is
+    /// told anything.
+    fn describe(
+        &mut self,
+        id: FuncId,
+        compiled: &CompiledFunction,
+        mut debug: FunctionDebug,
+        declared: Option<FunctionId>,
+    ) -> Option<FunctionDebug> {
+        self.debug.as_ref()?;
+        if let Some((file, line, column)) = declared.and_then(|func| self.declaration_at(func)) {
+            debug.declared = Some(debug.place(file, line, column));
+        }
+        if let Some((owner, spans)) = &compiled.source {
+            for row in &compiled.code.lines {
+                let Some(&span) = spans.get(row.span as usize) else { continue };
+                let Some((file, line, column)) = self.location_at(Some((*owner, span))) else {
+                    continue;
+                };
+                let place = debug.place(file, line, column);
+                debug.row(row.offset, place);
+            }
+        }
+        if let Some((owner, _)) = &compiled.source
+            && let Some((env, variables)) = &compiled.variables
+        {
+            debug.variables = described_variables(self.db, *owner, env, variables);
+        }
+        let len = compiled.code.bytes.len() as u32;
+        self.debug.as_mut()?.add_function(id, len, &debug);
+        Some(debug)
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
@@ -2462,20 +2642,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Adds a stitched instance to the store, when everything it is and refers to has a name
     /// that another run of the daemon can find it by.
-    fn keep(&mut self, instance: &Instance, compiled: &CompiledFunction, ids: &Resolved) {
+    fn keep(
+        &mut self,
+        instance: &Instance,
+        compiled: &CompiledFunction,
+        ids: &Resolved,
+        debug: Option<FunctionDebug>,
+    ) {
         // What a patch refers to is in its base under names of that one object.
         let Some(store) = store::Store::global().filter(|_| self.base.is_none()) else { return };
         let Some(name) = self.stable_name(instance) else {
             self.kept.unnamed += 1;
             return;
         };
-        let Some(key) = cached::Entry::key(&name) else { return };
-        let stored = store.get(&key);
-        let check = stored.is_some() && std::env::var_os("RUSTD_CACHE_CHECK").is_some();
-        if stored.is_some() && !check {
+        let checked = build_checks_overflow(self.db);
+        let Some(key) = cached::Entry::key(&name, debug.is_some(), checked) else { return };
+        let check = std::env::var_os("RUSTD_CACHE_CHECK").is_some();
+        if !check && store.has(&key) {
             return;
         }
-        let Some(entry) = self.entry(instance, compiled, ids) else {
+        let stored = store.get(&key).filter(|_| check);
+        let Some(entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
@@ -2491,7 +2678,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 eprintln!("entry of `{name}` is not what was compiled");
                 if let Some(path) = std::env::var_os("RUSTD_CACHE_CHECK").filter(|it| it != "1") {
                     let at = std::path::Path::new(&path).join(self.kept.differing.to_string());
-                    let was = cached::Entry::decode(stored);
+                    let was = cached::Entry::decode(&stored);
                     _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
                 }
             }
@@ -2509,6 +2696,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         instance: &Instance,
         compiled: &CompiledFunction,
         ids: &Resolved,
+        debug: Option<FunctionDebug>,
     ) -> Option<cached::Entry> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let mut funcs = Vec::with_capacity(ids.funcs.len());
@@ -2612,6 +2800,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             funcs,
             datas,
             code: cached::CachedCode::from(&compiled.code),
+            debug,
         })
     }
 
@@ -2711,6 +2900,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let code = entry.code.code();
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
+        if let (Some(debug), Some(of)) = (&mut self.debug, &entry.debug) {
+            debug.add_function(id, code.bytes.len() as u32, of);
+        }
         self.bodies += 1;
         self.kept.found += 1;
         Ok(())
@@ -3091,6 +3283,29 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.want(func);
             return self.import(&symbol, sig);
         }
+        if let InstanceDef::Fn(func) = def
+            && (!self.own_statics.crates.contains(&func.krate(self.db))
+                || (std::env::var_os("RUSTD_INCREMENTAL_ONLY").is_some()
+                    && !self.on_demand.contains(&func)))
+            && !returns_async_block(self.db, func)
+            && let Some(path) = self.instance_path(func, args)
+            && let Some(symbol) = self.symbols.path(&path)
+        {
+            return self.import(&symbol, sig);
+        }
+        if matches!(def, InstanceDef::DropGlue)
+            && std::env::var_os("RUSTD_ALONE").is_none()
+            && let Some(ty) = args.first().and_then(|a| a.ty())
+            && (self.patching
+                || !matches!(ty.kind(), TyKind::Adt(adt, _) if self.own_statics.crates.contains(&adt.def_id().krate(self.db))))
+            && let Some(ty_str) = self.symbol_type(ty)
+            && let Some(symbol) = self
+                .symbols
+                .path(&format!("core::ptr::drop_in_place::<{ty_str}>"))
+                .or_else(|| self.symbols.path(&format!("core::ptr::drop_in_place<{ty_str}>")))
+        {
+            return self.import(&symbol, sig);
+        }
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
             InstanceDef::Closure(_)
@@ -3231,6 +3446,40 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.named.insert(name, id);
         }
         Ok(id)
+    }
+
+    /// What a backtrace of a rustc build calls the instance, as far as that is reproduced:
+    /// the last name of it otherwise.
+    fn backtrace_name(&self, instance: &Instance) -> String {
+        let db = self.db;
+        let args = instance.args.as_ref();
+        let ty = || args.as_slice().first().and_then(|arg| arg.ty());
+        let of_closure = |owner: InferBodyId<'db>, expr| match owner {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                super::type_name::rustc_closure_name(db, func, args.as_slice(), expr)
+            }
+            _ => None,
+        };
+        let name = match instance.def {
+            InstanceDef::Fn(func) => {
+                super::type_name::rustc_function_name(db, func, args.as_slice())
+            }
+            InstanceDef::Closure(id) => {
+                let at = InternedClosureId::from_id(id).loc(db);
+                of_closure(at.owner, at.expr)
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let at = InternedCoroutineId::from_id(id).loc(db);
+                of_closure(at.owner, at.expr)
+            }
+            InstanceDef::DropGlue => ty()
+                .and_then(|ty| super::type_name::rustc_symbol_type(db, ty))
+                .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
+            InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        };
+        name.unwrap_or_else(|| self.callee_name(instance.def).to_owned())
     }
 
     fn callee_name(&self, def: InstanceDef) -> &'db str {
@@ -3625,6 +3874,14 @@ struct Relocations<'a, 'db> {
     defined: FxHashMap<usize, DataId>,
 }
 
+impl Relocations<'_, '_> {
+    /// The alignment to give the data object made for the memory at `start`: what const eval
+    /// made it with, or where it does not say, the most a value could need.
+    fn align_of(&self, start: usize) -> u64 {
+        self.map.align_at(start).map_or(16, |align| align as u64)
+    }
+}
+
 /// Whether a data object can be the same object as another with the same content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 enum DataIdentity {
@@ -3729,6 +3986,9 @@ impl DropFlag {
     }
 }
 
+/// A field of a local, by the fields that lead to it.
+type FieldOfLocal = (LocalId, Vec<u32>);
+
 struct MovedPath {
     local: LocalId,
     path: Vec<u32>,
@@ -3759,8 +4019,14 @@ struct FunctionCx<'cx, 'db> {
     /// the bits `moved_paths` hands out say which of its fields have been moved out since.
     drop_flags: ArenaMap<LocalId, DropFlag>,
     moved_paths: Vec<MovedPath>,
-    /// The block to generate each `Drop` terminator in, with its place and target.
-    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId)>,
+    /// The block to generate each `Drop` terminator in, with its place and target, the
+    /// statement the drop is of, and the block of the body it ends.
+    deferred_drops: Vec<(ir::Block, StoredPlace, BasicBlockId, MirSpan, BasicBlockId)>,
+    /// The block of the body being generated.
+    at: Option<BasicBlockId>,
+    /// While a `Drop` terminator is generated: the fields that may be moved out of their
+    /// locals when the body gets to it.
+    moved_here: Option<FxHashSet<FieldOfLocal>>,
     /// Where a call that unwinds lands, taking the exception.
     cleanup: Option<ir::Block>,
     /// A landing pad that takes over from `cleanup` for the calls made while it is set.
@@ -4134,6 +4400,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let mut modes = Vec::new();
         for ty in args {
+            if self.decays_in_c(ty)? {
+                int_regs = int_regs.saturating_sub(1);
+                modes.push(PassMode::Indirect);
+                continue;
+            }
             let mode = self.c_pass_mode(ty)?;
             let (ints, sses) = match mode {
                 PassMode::Ignore | PassMode::Indirect | PassMode::OnStack(_) => (0, 0),
@@ -4183,7 +4454,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let (mut ints, mut floats) = (0u8, 0u8);
         let mut modes = Vec::new();
         for ty in args {
-            modes.push(match self.aapcs64_class(ty)? {
+            let class = match self.decays_in_c(ty)? {
+                true => Aapcs64::Memory,
+                false => self.aapcs64_class(ty)?,
+            };
+            modes.push(match class {
                 Aapcs64::Ignore => PassMode::Ignore,
                 Aapcs64::Scalar(scalar) => {
                     let (used, wide) = match scalar.ty {
@@ -4372,6 +4647,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // MSVC passes an argument of no size by reference.
             return Ok(if is_ret { PassMode::Ignore } else { PassMode::Indirect });
         }
+        if !is_ret && self.decays_in_c(ty)? {
+            return Ok(PassMode::Indirect);
+        }
         Ok(match (layout.backend_repr, layout.size.bytes()) {
             (BackendRepr::SimdVector { .. }, _) => unsupported!("vector in the C ABI"),
             (BackendRepr::Scalar(scalar), size) if size <= 8 => {
@@ -4386,6 +4664,33 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (_, 8) => PassMode::Cast(types::I64),
             _ => PassMode::Indirect,
         })
+    }
+
+    /// Whether a C function is handed the address of a `ty` where Rust hands over the value,
+    /// as C does with a `va_list` that is an array. Mirrors rustc's
+    /// `TyAndLayout::pass_indirectly_in_non_rustic_abis`, which looks through transparent
+    /// wrappers for a struct marked `#[rustc_pass_indirectly_in_non_rustic_abis]`.
+    fn decays_in_c(&self, ty: Ty<'db>) -> Result<bool> {
+        let TyKind::Adt(def, subst) = ty.kind() else { return Ok(false) };
+        let AdtId::StructId(id) = def.def_id() else { return Ok(false) };
+        let db = self.cg.db;
+        if AttrFlags::query(db, id.into())
+            .contains(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+        {
+            return Ok(true);
+        }
+        let transparent = AttrFlags::repr(db, id.into())
+            .is_some_and(|repr| repr.flags.contains(ReprFlags::IS_TRANSPARENT));
+        if !transparent {
+            return Ok(false);
+        }
+        for (_, field) in db.field_types(id.into()).iter() {
+            let field = field.ty().instantiate(self.interner, subst).skip_norm_wip();
+            if !self.layout(field)?.is_1zst() {
+                return self.decays_in_c(field);
+            }
+        }
+        Ok(false)
     }
 
     /// How the C ABI passes one value when registers are left for it.
@@ -5088,8 +5393,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             self.builder.switch_to_block(self.blocks[id]);
+            self.at = Some(id);
             for statement in &block.statements {
-                self.span = statement.span;
+                self.at(statement.span);
                 match &statement.kind {
                     // A promoted constant already holds its value.
                     StatementKind::Assign(place, _)
@@ -5109,7 +5415,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let Some(terminator) = &block.terminator else {
                 unsupported!("block without terminator");
             };
-            self.span = terminator.span;
+            self.at(terminator.span);
             let target = match &terminator.kind {
                 // A promoted call already holds its value, and that value is read-only.
                 TerminatorKind::Call { destination, target: Some(target), .. }
@@ -5132,8 +5438,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.clear_moved_now(&place);
             self.builder.ins().jump(target, &[]);
         }
-        for (block, place, target) in std::mem::take(&mut self.deferred_drops) {
+        let drops = std::mem::take(&mut self.deferred_drops);
+        let mut moved = match drops.is_empty() || self.moved_paths.is_empty() {
+            true => FxHashMap::default(),
+            false => self.moved_where_blocks_end(body),
+        };
+        for (block, place, target, span, from) in drops {
+            self.moved_here = moved.remove(&from);
             self.builder.switch_to_block(block);
+            self.at(span);
             // `place = value` drops what `place` held and then writes to it. If that drop
             // unwinds the write still happens, so that `place` is not dropped twice.
             let replace =
@@ -5166,11 +5479,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 _ => self.drop_place(&place, target)?,
             }
         }
+        self.moved_here = None;
         // So is dropping a suspended future, which drops the same locals as unwinding does.
         // Nothing is unwinding then, so a destructor that panics leaves the rest to be dropped.
         if let Some((suspended, done)) = self.suspended_drop.take() {
             self.builder.switch_to_block(suspended);
-            self.drop_live_locals()?;
+            self.at(Self::returns_at(body));
+            self.drop_live_locals(Some(&Self::scope_ends(body)))?;
             self.builder.ins().jump(done, &[]);
         }
         self.emit_cleanup()
@@ -5476,16 +5791,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let layout = self.layout(ty)?;
             let mut fields: Vec<_> = fields.into_iter().enumerate().collect();
             if matches!(ty.kind(), TyKind::Array(..)) {
-                // An array that has lost elements drops what is left from the back, except
-                // that a run of whole elements is dropped front to back.
+                // An array that may have lost elements drops what is left from the back,
+                // except that a run of whole elements is dropped front to back.
                 let mut runs: Vec<Vec<(usize, Ty<'db>)>> = Vec::new();
                 let mut in_run = false;
                 for (i, field) in fields {
                     path.push(i as u32);
-                    let whole = !self
-                        .moved_paths
-                        .iter()
-                        .any(|it| it.local == local && it.path.starts_with(path));
+                    let whole = !self.may_have_lost(local, path);
                     path.pop();
                     match runs.last_mut() {
                         Some(run) if whole && in_run => run.push((i, field)),
@@ -5513,6 +5825,83 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         Ok(())
+    }
+
+    /// Whether something may be moved out of the field at `path` of `local` where the drop
+    /// being generated is. Without a place in the body to ask about, anything the function
+    /// moves out anywhere counts.
+    fn may_have_lost(&self, local: LocalId, path: &[u32]) -> bool {
+        self.moved_paths.iter().filter(|it| it.local == local && it.path.starts_with(path)).any(
+            |it| match &self.moved_here {
+                Some(moved) => moved.contains(&(local, it.path.clone())),
+                None => true,
+            },
+        )
+    }
+
+    /// The fields that may be moved out of their locals where each block ends: moved out on
+    /// some way there, and not assigned since.
+    fn moved_where_blocks_end(
+        &self,
+        body: &MirBody<'db>,
+    ) -> FxHashMap<BasicBlockId, FxHashSet<FieldOfLocal>> {
+        let mut starts: FxHashMap<BasicBlockId, FxHashSet<FieldOfLocal>> = FxHashMap::default();
+        let mut ends = FxHashMap::default();
+        starts.insert(body.start_block, FxHashSet::default());
+        let mut pending = vec![body.start_block];
+        while let Some(id) = pending.pop() {
+            let mut moved = starts[&id].clone();
+            self.moves_of_block(&body.basic_blocks[id], &mut moved);
+            for next in successors(body, id) {
+                let known = starts.entry(next).or_insert_with(|| {
+                    pending.push(next);
+                    FxHashSet::default()
+                });
+                let before = known.len();
+                known.extend(moved.iter().cloned());
+                if known.len() != before && !pending.contains(&next) {
+                    pending.push(next);
+                }
+            }
+            ends.insert(id, moved);
+        }
+        ends
+    }
+
+    /// Follows a block: adds the fields it moves out to `moved`, and takes out the ones it
+    /// assigns.
+    fn moves_of_block(&self, block: &crate::mir::BasicBlock, moved: &mut FxHashSet<FieldOfLocal>) {
+        for statement in &block.statements {
+            if let StatementKind::Assign(place, rvalue) = &statement.kind {
+                operands_of(rvalue).into_iter().for_each(|it| self.note_move(it, moved));
+                self.note_assignment(place, moved);
+            }
+        }
+        match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Call { args, destination, .. }) => {
+                args.iter().for_each(|it| self.note_move(it, moved));
+                self.note_assignment(destination, moved);
+            }
+            Some(TerminatorKind::DropAndReplace { place, value, .. }) => {
+                self.note_move(value, moved);
+                self.note_assignment(place, moved);
+            }
+            _ => (),
+        }
+    }
+
+    fn note_move(&self, operand: &Operand, moved: &mut FxHashSet<FieldOfLocal>) {
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else { return };
+        if self.drop_flags.contains_idx(place.local) {
+            let paths = self.moved_out_paths(place).unwrap_or_default();
+            moved.extend(paths.into_iter().map(|path| (place.local, path)));
+        }
+    }
+
+    fn note_assignment(&self, place: &StoredPlace, moved: &mut FxHashSet<FieldOfLocal>) {
+        if let Some(path) = self.field_path(place) {
+            moved.retain(|(local, field)| *local != place.local || !field.starts_with(&path));
+        }
     }
 
     /// Field types can still be projections such as `<str as ToOwned>::Owned`.
@@ -6057,7 +6446,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
-                    align: 16,
+                    align: map.align_of(start),
                 };
                 let at = addr - start;
                 match pointee.kind() {
@@ -6253,7 +6642,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     bytes: memory.to_vec(),
                     relocs: Vec::new(),
                     fn_relocs: Vec::new(),
-                    align: 16,
+                    align: map.align_of(start),
                 };
                 // What the allocation is of is not known here, so as in a union, every word
                 // of it that is the address of something const eval kept is taken to be one.
@@ -6514,7 +6903,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let (src, ty) = self.operand(operand)?;
                 let size = self.layout(ty)?.size;
-                if len <= 16 {
+                if len == 0 {
+                    // No element takes a moved value, so it ends here. A constant was never made.
+                    if matches!(operand.kind, OperandKind::Move(_)) {
+                        self.drop_value(src, None, ty)?;
+                    }
+                } else if size.bytes() == 0 {
+                    // Elements that take no room are not written, however many there are.
+                } else if len <= 16 {
                     for i in 0..len as u64 {
                         let element = self.builder.ins().iadd_imm(dst, (i * size.bytes()) as i64);
                         self.copy(element, src, size);
@@ -6562,7 +6958,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             _ => self.builder.ins().ireduce(ty, zero),
                         };
                         let (value, overflow) = self.builder.ins().ssub_overflow(zero, value);
-                        self.panic_if(overflow, OverflowOp::Neg)?;
+                        self.panic_if_overflow(overflow, OverflowOp::Neg)?;
                         value
                     }
                 };
@@ -6936,7 +7332,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && self.builder.func.dfg.value_type(l) == types::I128
         {
             let (value, overflow) = self.wide_mul_overflow(l, r, signed)?;
-            self.panic_if(overflow, OverflowOp::Mul)?;
+            self.panic_if_overflow(overflow, OverflowOp::Mul)?;
             return Ok(value);
         }
         let ins = self.builder.ins();
@@ -6961,7 +7357,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     BinOp::Sub => OverflowOp::Sub,
                     _ => OverflowOp::Mul,
                 };
-                self.panic_if(overflow, op)?;
+                self.panic_if_overflow(overflow, op)?;
                 value
             }
             BinOp::Div | BinOp::Rem => {
@@ -6995,7 +7391,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (_, true) => (OverflowOp::Shr, self.builder.ins().sshr(l, r)),
                     (_, false) => (OverflowOp::Shr, self.builder.ins().ushr(l, r)),
                 };
-                self.panic_if(overflow, shift_op)?;
+                self.panic_if_overflow(overflow, shift_op)?;
                 value
             }
             BinOp::Offset => unsupported!("pointer offset"),
@@ -7099,6 +7495,35 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
+    /// Whether arithmetic of the body being compiled panics when it overflows. rustc decides
+    /// it twice: the crate the body is written in leaves the check out of what it keeps of the
+    /// body unless it has `-C overflow-checks` or the function takes the setting of its
+    /// callers, and the crate that compiles the body drops the check unless it has the flag.
+    fn checks_overflow(&self) -> Result<bool> {
+        let db = self.cg.db;
+        let Some(body) = self.body else { return Ok(false) };
+        let inherits = match body.owner {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+                AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS)
+            }
+            _ => false,
+        };
+        let written_with = crate_checks_overflow(db, body.owner.module(db).krate(db));
+        if written_with == Some(false) || (written_with.is_none() && !inherits) {
+            return Ok(false);
+        }
+        match build_checks_overflow(db) {
+            Some(checked) => Ok(checked),
+            // The body is compiled by whichever crate uses it, and that is not known here.
+            None => unsupported!("overflow checks differ between the packages of the build"),
+        }
+    }
+
+    /// Branches to a panic when `overflow` is set, if the body is one that checks.
+    fn panic_if_overflow(&mut self, overflow: Value, op: OverflowOp) -> Result<()> {
+        if self.checks_overflow()? { self.panic_if(overflow, op) } else { Ok(()) }
+    }
+
     /// Branches to a call of rustc's `panic_const_*` when `cond` is set.
     fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
         let name = match op {
@@ -7189,6 +7614,38 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(Some(addr))
     }
 
+    /// Notes the locals a debugger can be told of: the ones written with a name whose value
+    /// is in a stack slot of its own. A closure's are left out, where a name may be of what
+    /// the closure captured.
+    fn note_variables(&mut self) {
+        let Some(body) = self.body else { return };
+        if !matches!(body.owner, InferBodyId::DefWithBodyId(_)) || !body.upvar_locals.is_empty() {
+            return;
+        }
+        for (binding, &local) in body.binding_locals.iter() {
+            let Some(&LocalSlot { addr, borrowed: false }) = self.locals.get(local) else {
+                continue;
+            };
+            let dfg = &self.builder.func.dfg;
+            let ir::ValueDef::Result(inst, 0) = dfg.value_def(addr) else { continue };
+            let ir::InstructionData::StackAddr { stack_slot, offset, .. } = dfg.insts[inst] else {
+                continue;
+            };
+            if i32::from(offset) == 0 {
+                let param = body.param_locals.contains(&local);
+                let ty = body.locals[local].ty.clone();
+                self.cg.named.push((binding, param, ty, stack_slot));
+            }
+        }
+    }
+
+    /// Has what is built from here on be of the statement at `span`.
+    fn at(&mut self, span: MirSpan) {
+        self.span = span;
+        let loc = self.cg.source_loc(span);
+        self.builder.set_srcloc(loc);
+    }
+
     /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
     fn caller_location(&mut self) -> Result<Value> {
         if let Some(location) = self.location {
@@ -7248,7 +7705,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Drop { place, target, .. } => {
                 let block = self.builder.create_block();
                 self.builder.ins().jump(block, &[]);
-                self.deferred_drops.push((block, place.clone(), *target));
+                let Some(from) = self.at else { unsupported!("drop outside a block") };
+                self.deferred_drops.push((block, place.clone(), *target, self.span, from));
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 self.call(func, args, destination, *target)?
@@ -8749,7 +9207,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("overflow_checks", []) => {
-                let value = self.builder.ins().iconst(types::I8, 1);
+                let Some(checked) = build_checks_overflow(self.cg.db) else {
+                    unsupported!("overflow checks differ between the packages of the build");
+                };
+                let value = self.builder.ins().iconst(types::I8, i64::from(checked));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list])
@@ -9695,9 +10156,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         call: impl FnOnce(&mut FunctionBuilder<'_>) -> ir::Inst,
     ) -> Vec<Value> {
         self.guarded = true;
-        self.builder.set_srcloc(unwind::seh::guarded());
+        let loc = self.cg.source_loc(self.span);
+        self.builder.set_srcloc(unwind::seh::guarded(loc));
         let call = call(&mut self.builder);
-        self.builder.set_srcloc(ir::SourceLoc::default());
+        self.at(self.span);
         let results = self.builder.inst_results(call).to_vec();
         let frame = self.builder.ins().get_frame_pointer(ptr());
         let exception = self.builder.ins().load(ptr(), MEM, frame, unwind::seh::ARRIVAL);
@@ -9719,7 +10181,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.in_cleanup = true;
         self.builder.switch_to_block(cleanup);
         let exception = self.builder.block_params(cleanup)[0];
-        self.drop_live_locals()?;
+        self.drop_live_locals(None)?;
         if let Some(state) = &self.suspended {
             let (addr, ty) = (state.addr, state.ty);
             self.store_state(addr, ty, PANICKED);
@@ -9727,27 +10189,66 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.resume_unwinding(exception)
     }
 
-    /// Drops every local that holds a value.
-    fn drop_live_locals(&mut self) -> Result<()> {
-        // Locals the body never drops come first, last declared first, and of those the
-        // operands of the expression that unwound before the temporaries it borrowed, which
-        // live to the end of the statement. The rest go in the order the body drops them when
-        // nothing unwinds, which is innermost scope first.
-        let mut locals: Vec<LocalId> = self.drop_flags.iter().map(|(local, _)| local).collect();
-        locals.reverse();
-        let rank = |local: &LocalId| match self.drop_order.iter().position(|it| it == local) {
-            Some(at) => at + 2,
-            None => !self.operand_temps.contains(local) as usize,
-        };
-        locals.sort_by_key(rank);
-        for local in locals {
+    /// Drops every local that holds a value. Each is dropped at where `ends` has it, if that is
+    /// given, and where the code being generated is otherwise.
+    fn drop_live_locals(&mut self, ends: Option<&FxHashMap<LocalId, MirSpan>>) -> Result<()> {
+        for local in self.unwinding_order() {
             let next = self.builder.create_block();
             self.builder.set_cold_block(next);
             let place = crate::mir::Place::from(local).store();
+            if let Some(&end) = ends.and_then(|ends| ends.get(&local)) {
+                self.at(end);
+            }
             self.drop_place(&place, next)?;
             self.builder.switch_to_block(next);
         }
         Ok(())
+    }
+
+    /// Where the scope of each local the body drops ends.
+    fn scope_ends(body: &MirBody<'db>) -> FxHashMap<LocalId, MirSpan> {
+        let mut ends = FxHashMap::default();
+        for (_, block) in body.basic_blocks.iter() {
+            if let Some(crate::mir::Terminator {
+                kind: TerminatorKind::Drop { place, .. },
+                span: span @ MirSpan::ExprEnd(_),
+            }) = &block.terminator
+            {
+                ends.entry(place.local).or_insert(*span);
+            }
+        }
+        ends
+    }
+
+    /// The locals with a drop flag in the order a landing pad drops them.
+    fn unwinding_order(&self) -> Vec<LocalId> {
+        let body = self.body.expect("MIR body");
+        let named: rustc_hash::FxHashSet<LocalId> =
+            body.binding_locals.values().chain(&body.param_locals).copied().collect();
+        let flagged = |local: &LocalId| self.drop_flags.contains_idx(*local);
+        let mut undropped: Vec<LocalId> = self
+            .drop_flags
+            .iter()
+            .map(|(local, _)| local)
+            .filter(|local| !self.drop_order.contains(local))
+            .collect();
+        undropped.reverse();
+        // Temporaries the body never drops are moved by the expression that made them, so one
+        // that still holds a value belongs to the expression that unwound: its operands come
+        // first, before the temporaries it borrowed, which live to the end of the statement.
+        // The rest go in the order the body drops them when nothing unwinds, which is innermost
+        // scope first.
+        let (variables, mut order): (Vec<LocalId>, Vec<LocalId>) =
+            undropped.into_iter().partition(|local| named.contains(local));
+        order.sort_by_key(|local| !self.operand_temps.contains(local));
+        order.extend(self.drop_order.iter().copied().filter(flagged));
+        // A variable the body never drops is in a scope no path leaves by its end. It goes
+        // after what its scope holds and before the variables declared ahead of it.
+        for variable in variables {
+            let outer = order.iter().position(|it| named.contains(it) && *it < variable);
+            order.insert(outer.unwrap_or(order.len()), variable);
+        }
+        order
     }
 
     fn store_state(&mut self, state: Value, ty: Type, value: i64) {
@@ -9851,6 +10352,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().brif(is_suspended, suspended, &[], done, &[]);
         self.in_cleanup = true;
         self.builder.switch_to_block(unresumed);
+        self.at(Self::returns_at(body));
         let TyKind::Coroutine(_, args) = ty.kind() else {
             unsupported!("async body of {ty:?}");
         };
@@ -9864,6 +10366,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.suspended_drop = Some((suspended, done));
         self.builder.switch_to_block(done);
         self.return_()
+    }
+
+    /// Where the body is written to end, which is where rustc has an `async` block dropped.
+    fn returns_at(body: &MirBody<'db>) -> MirSpan {
+        let returns = body.basic_blocks.iter().find_map(|(_, block)| match &block.terminator {
+            Some(crate::mir::Terminator { kind: TerminatorKind::Return, span }) => Some(*span),
+            _ => None,
+        });
+        returns.unwrap_or(MirSpan::Unknown)
     }
 
     /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
@@ -10692,23 +11203,41 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
     forwarded
 }
 
-fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
-    let successors = |id: BasicBlockId| -> Vec<BasicBlockId> {
-        match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
-            Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
-            Some(
-                TerminatorKind::Goto { target }
-                | TerminatorKind::Drop { target, .. }
-                | TerminatorKind::DropAndReplace { target, .. }
-                | TerminatorKind::Assert { target, .. }
-                | TerminatorKind::FalseEdge { real_target: target, .. }
-                | TerminatorKind::FalseUnwind { real_target: target, .. },
-            ) => vec![*target],
-            Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
-            Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
-            _ => Vec::new(),
+/// The blocks a block goes on to when nothing unwinds.
+fn successors(body: &MirBody<'_>, id: BasicBlockId) -> Vec<BasicBlockId> {
+    match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+        Some(TerminatorKind::SwitchInt { targets, .. }) => targets.all_targets().to_vec(),
+        Some(
+            TerminatorKind::Goto { target }
+            | TerminatorKind::Drop { target, .. }
+            | TerminatorKind::DropAndReplace { target, .. }
+            | TerminatorKind::Assert { target, .. }
+            | TerminatorKind::FalseEdge { real_target: target, .. }
+            | TerminatorKind::FalseUnwind { real_target: target, .. },
+        ) => vec![*target],
+        Some(TerminatorKind::Call { target, .. }) => target.iter().copied().collect(),
+        Some(TerminatorKind::Yield { resume, .. }) => vec![*resume],
+        _ => Vec::new(),
+    }
+}
+
+/// The operands an rvalue reads.
+fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
+    match rvalue {
+        Rvalue::UnaryOp(_, it)
+        | Rvalue::Cast(_, it, _)
+        | Rvalue::Repeat(it, _)
+        | Rvalue::Use(it) => {
+            vec![it]
         }
-    };
+        Rvalue::CheckedBinaryOp(_, left, right) => vec![left, right],
+        Rvalue::Aggregate(_, operands) => operands.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn drop_order(body: &MirBody<'_>, reachable: &rustc_hash::FxHashSet<BasicBlockId>) -> Vec<LocalId> {
+    let successors = |id| successors(body, id);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut post_order = Vec::new();
     let mut stack = vec![(body.start_block, successors(body.start_block))];

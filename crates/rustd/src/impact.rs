@@ -310,20 +310,37 @@ pub(crate) fn select_dirty_and_tests(
         }
     });
 
+    let mut program_crates: FxHashSet<ide_db::base_db::Crate> = FxHashSet::default();
+    for krate in std::iter::once(&args.krate).chain(&args.batch) {
+        if let Ok(mut named) = crate::crates_named(db, krate, args) {
+            let linked = |krate: &Crate| {
+                let name = krate.display_name(db);
+                let root = crate::crate_root_file(db, *krate);
+                name.zip(root)
+                    .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+            };
+            if named.iter().any(linked) {
+                named.retain(linked);
+            }
+            for c in named {
+                program_crates.insert(c.into());
+            }
+        }
+    }
+    let in_program = |krate: ide_db::base_db::Crate| {
+        program_crates.is_empty() || program_crates.contains(&krate)
+    };
+
     // Build candidate crates in topological order (including transitive_rev_deps)
     let mut candidate_crates = Vec::new();
     let mut seen_crates = FxHashSet::default();
     for &file in &dirty_files {
         for &krate in ide_db::base_db::relevant_crates(db, file).iter() {
-            if !args.members.contains(&krate) {
+            if !args.members.contains(&krate) || !in_program(krate) {
                 continue;
             }
             let c = Crate::from(krate);
-            let is_bench_or_example = resolver.crate_root(c).is_some_and(|p| {
-                p.components()
-                    .any(|comp| matches!(comp.as_os_str().to_str(), Some("benches" | "examples")))
-            });
-            if !is_bench_or_example && seen_crates.insert(krate) {
+            if seen_crates.insert(krate) {
                 candidate_crates.push(c);
             }
         }
@@ -345,6 +362,7 @@ pub(crate) fn select_dirty_and_tests(
             for rev in raw_base.transitive_rev_deps(db) {
                 if bin_deps.contains(&rev)
                     && args.members.contains(&rev)
+                    && in_program(rev)
                     && seen_crates.insert(rev)
                 {
                     candidate_crates.push(Crate::from(rev));
@@ -352,7 +370,8 @@ pub(crate) fn select_dirty_and_tests(
             }
         }
         for bc_krate in bin_crates {
-            if seen_crates.insert(bc_krate.into()) {
+            let raw: ide_db::base_db::Crate = bc_krate.into();
+            if in_program(raw) && seen_crates.insert(raw) {
                 let l = listed.of(db, bc_krate);
                 if args.cfg_test || l.functions.len() <= 500 {
                     candidate_crates.push(bc_krate);
@@ -770,7 +789,11 @@ pub(crate) fn select_dirty_and_tests(
                     test_reach.extend(added);
                 }
 
-                let bin_crate_norm = bin_crate_env.replace('-', "_");
+                let bin_crate_norm = if bin_crate_env.ends_with(".rs") {
+                    String::new()
+                } else {
+                    bin_crate_env.replace('-', "_")
+                };
                 for &func in &l.functions {
                     let flags = hir_def::attrs::AttrFlags::query(db, func.into());
                     if test_reach.contains(&func)
@@ -810,7 +833,10 @@ pub(crate) fn select_dirty_and_tests(
                 && hir_ty::mir::codegen::SymbolResolver::function(resolver, func).is_some()
             {
                 entries.push(func);
-            } else if resolver.path(func).is_none() {
+            } else if direct_changed.contains(&func)
+                || global_need_callers.contains(&func)
+                || resolver.path(func).is_none()
+            {
                 on_demand.push(func);
             }
         }
@@ -846,6 +872,8 @@ pub(crate) fn run_backtest(
         base: args.base.clone(),
         rustc_commit: std::cell::OnceCell::new(),
         contents,
+        debug: args.debug,
+        listed,
     };
     let bin_crate = std::env::var("RUSTD_BIN_CRATE")
         .unwrap_or_else(|_| args.krate.clone())

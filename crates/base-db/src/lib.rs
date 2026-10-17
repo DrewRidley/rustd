@@ -103,6 +103,11 @@ impl Files {
         }
     }
 
+    /// Whether the file has a text: one that is not UTF-8 is known to the VFS and has none.
+    pub fn has_text(&self, file_id: vfs::FileId) -> bool {
+        self.files.contains_key(&file_id)
+    }
+
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
         match self.files.entry(file_id) {
             Entry::Occupied(mut occupied) => {
@@ -315,6 +320,32 @@ pub struct LibraryRoots {
 pub struct LocalRoots {
     #[returns(ref)]
     pub roots: FxHashSet<SourceRootId>,
+}
+
+/// The variables of the process a build is for, which `env!` and `option_env!` read where
+/// the crate's own have nothing: those of whoever asked for the build.
+#[salsa::input(singleton, debug)]
+pub struct ProcessEnv {
+    #[returns(ref)]
+    pub vars: Env,
+}
+
+/// The variable `key` of the process the build is for.
+pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
+    ProcessEnv::try_get(db)?.vars(db).get(key)
+}
+
+/// Has builds from here on be for a process with the variables `vars`.
+pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
+    use salsa::Setter as _;
+    match ProcessEnv::try_get(db) {
+        Some(env) => {
+            env.set_vars(db).to(vars);
+        }
+        None => {
+            ProcessEnv::new(db, vars);
+        }
+    }
 }
 
 #[salsa::input(debug)]

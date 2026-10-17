@@ -22,7 +22,7 @@ use super::{
     CodegenError, Instance, ObjectCodegen, OwnStatics, Phases, Rejections, Result, Roots,
     SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance, compiled_root,
     compiled_static, declaration_location,
-    fragment::{DataRequest, FuncTarget, Requests},
+    fragment::{CompiledFunction, DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
     instance_serial, is_thread_local, left_to_rustc, root_serial, source_location, static_serial,
     target,
@@ -34,6 +34,8 @@ struct Mark {
     serial: u64,
     /// The source locations it reports, which stitching fills in.
     locations: u64,
+    /// The lines its code is of, when a debugger is told them.
+    lines: u64,
 }
 
 impl Mark {
@@ -48,7 +50,25 @@ impl Mark {
                 _ => {}
             }
         }
-        Mark { serial, locations: hasher.finish() }
+        Mark { serial, locations: hasher.finish(), lines: 0 }
+    }
+
+    /// The mark of a function, whose code is a patch's to describe again when `debug` is set
+    /// and a line of it is another: an edit above it in the file moves them all.
+    fn of_function(
+        db: &dyn HirDatabase,
+        serial: u64,
+        compiled: &CompiledFunction,
+        debug: bool,
+    ) -> Mark {
+        let mut hasher = rustc_hash::FxHasher::default();
+        if debug && let Some((owner, spans)) = &compiled.source {
+            for row in &compiled.code.lines {
+                let span = spans.get(row.span as usize);
+                span.map(|span| source_location(db, *owner, *span)).hash(&mut hasher);
+            }
+        }
+        Mark { lines: hasher.finish(), ..Mark::new(db, serial, &compiled.requests) }
     }
 }
 
@@ -265,6 +285,8 @@ impl Frozen {
 /// The last object built in full, as far as patching it goes.
 #[derive(Clone)]
 pub(super) struct Base {
+    /// Whether the object says which lines its code is of, as a patch of it then does.
+    debug: bool,
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
     marks: Vec<Mark>,
@@ -425,11 +447,12 @@ impl Base {
         skipped: &[(FunctionId, CodegenError)],
     ) -> Option<Base> {
         let decls = cg.module.declarations();
+        let debug = cg.debug.is_some();
         let marks = compiled
             .iter()
             .map(|&(root, _)| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::new(db, root_serial(db, root), &compiled.requests))
+                Some(Mark::of_function(db, root_serial(db, root), compiled, debug))
             })
             .collect::<Option<Vec<_>>>()?;
         let mut instances = cg
@@ -443,7 +466,7 @@ impl Base {
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
                     mark: compiled.map(|it| {
                         let serial = instance_serial(db, instance.clone(), env.clone());
-                        Mark::new(db, serial, &it.requests)
+                        Mark::of_function(db, serial, it, debug)
                     }),
                     forwarded: cg.forwarded.contains(instance),
                     files: body_files(db, instance),
@@ -520,6 +543,7 @@ impl Base {
             .map(|(instance, it)| (instance.clone(), it.env.clone()))
             .collect();
         Some(Base {
+            debug,
             rejected,
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
@@ -637,7 +661,7 @@ impl Base {
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
                 let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::new(db, root_serial(db, root), &compiled.requests))
+                Some(Mark::of_function(db, root_serial(db, root), compiled, self.debug))
             });
             stale.steps.roots_asked += 1;
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
@@ -665,7 +689,7 @@ impl Base {
                 let compiled = compiled_instance(db, instance.clone(), was.env.clone());
                 compiled.as_ref().ok().map(|it| {
                     let serial = instance_serial(db, instance.clone(), was.env.clone());
-                    Mark::new(db, serial, &it.requests)
+                    Mark::of_function(db, serial, it, self.debug)
                 })
             });
             stale.steps.instances_asked += 1;

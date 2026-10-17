@@ -763,6 +763,7 @@ impl<'a> Patch<'a> {
             headers: Vec::new(),
             overwritten,
             redirected,
+            described: Default::default(),
         })
     }
 

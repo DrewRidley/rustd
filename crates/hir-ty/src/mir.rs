@@ -1720,12 +1720,24 @@ impl MirBody<'_> {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SalsaValue)]
 pub enum MirSpan {
     ExprId(ExprId),
+    /// Where the expression ends: what leaving a scope does is taken to be written there.
+    ExprEnd(ExprId),
     PatId(PatId),
     BindingId(BindingId),
     SelfParam,
     Unknown,
 }
 impl_from!(ExprId, PatId for MirSpan);
+
+impl MirSpan {
+    /// The end of what this is the whole of.
+    pub fn end(self) -> MirSpan {
+        match self {
+            MirSpan::ExprId(expr) => MirSpan::ExprEnd(expr),
+            other => other,
+        }
+    }
+}
 
 impl From<&ExprId> for MirSpan {
     fn from(value: &ExprId) -> Self {

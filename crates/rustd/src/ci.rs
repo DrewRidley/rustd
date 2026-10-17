@@ -488,19 +488,22 @@ pub(crate) struct TestCaseOutcome {
 }
 
 /// Expands HIR test names against `<test_bin> --list --format=terse` so parameterized (`#[rstest]`)
-/// tests expand to every exact `libtest` case name.
-pub(crate) fn expand_exact_tests(test_bin: &Path, wanted: &[String]) -> Vec<String> {
+/// tests expand to every exact `libtest` case name, also returning total test count in `<test_bin>`.
+pub(crate) fn expand_exact_tests_with_total(
+    test_bin: &Path,
+    wanted: &[String],
+) -> (Vec<String>, usize) {
     if wanted.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let Ok(out) = Command::new(test_bin)
         .args(["--list", "--format=terse"])
         .output()
     else {
-        return wanted.to_vec();
+        return (wanted.to_vec(), usize::MAX);
     };
     if !out.status.success() {
-        return wanted.to_vec();
+        return (wanted.to_vec(), usize::MAX);
     }
     let available: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -508,23 +511,23 @@ pub(crate) fn expand_exact_tests(test_bin: &Path, wanted: &[String]) -> Vec<Stri
         .map(str::trim)
         .map(str::to_owned)
         .collect();
+    let total = available.len();
     let mut expanded = Vec::new();
     for w in wanted {
         let prefix = format!("{w}::");
-        let mut matched_any = false;
         for av in &available {
             if av == w || av.starts_with(&prefix) || av.ends_with(&format!("::{w}")) {
                 if !expanded.contains(av) {
                     expanded.push(av.clone());
                 }
-                matched_any = true;
             }
         }
-        if !matched_any && !expanded.contains(w) {
-            expanded.push(w.clone());
-        }
     }
-    expanded
+    (expanded, total)
+}
+
+pub(crate) fn expand_exact_tests(test_bin: &Path, wanted: &[String]) -> Vec<String> {
+    expand_exact_tests_with_total(test_bin, wanted).0
 }
 
 /// Runs each test in its own isolated child process (`<test_bin> --exact <name>`), honouring

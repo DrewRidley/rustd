@@ -45,9 +45,22 @@ pub(in super::super) const RESUME: &str = "rustd.seh.resume";
 pub(in super::super) const RELEASE: &str = "rustd.seh.release";
 pub(in super::super) const PERSONALITY: &str = "rustd.seh.personality";
 
-/// What the calls that have a landing pad are marked with for [`function`] to find them.
-pub(in super::super) fn guarded() -> ir::SourceLoc {
-    ir::SourceLoc::new(1)
+/// The bit of a source location that marks a call that has a landing pad, for [`function`]
+/// to find them. The rest is the statement the call is of, as without it.
+const GUARDED: u32 = 1 << 31;
+
+/// The source location of a call of the statement at `loc` that has a landing pad.
+pub(in super::super) fn guarded(loc: ir::SourceLoc) -> ir::SourceLoc {
+    ir::SourceLoc::new(unguarded(loc).bits() | GUARDED)
+}
+
+pub(in super::super) fn is_guarded(loc: ir::SourceLoc) -> bool {
+    !loc.is_default() && loc.bits() & GUARDED != 0
+}
+
+/// The source location without the mark, which says the statement alone.
+pub(in super::super) fn unguarded(loc: ir::SourceLoc) -> ir::SourceLoc {
+    if loc.is_default() { ir::SourceLoc::new(0) } else { ir::SourceLoc::new(loc.bits() & !GUARDED) }
 }
 /// Where a call that unwound finds its exception, from the frame pointer: the first of
 /// the four slots a caller leaves above the return address for the function to use as it
@@ -118,7 +131,7 @@ pub(super) fn function(
         .buffer
         .get_srclocs_sorted()
         .iter()
-        .filter(|it| it.loc == guarded())
+        .filter(|it| is_guarded(it.loc))
         .map(|it| it.start..it.end)
         .collect();
     let mut calls = Pads::default();

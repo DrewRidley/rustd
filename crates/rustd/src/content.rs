@@ -34,11 +34,12 @@ impl Contents {
         checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> Option<u64> {
         if let Some(&known) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return known;
         }
-        let id = self.hash(db, checkouts, krate, stable_crate_id);
+        let id = self.hash(db, checkouts, krate, stable_crate_id, process_reads);
         self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, id);
         id
     }
@@ -65,6 +66,7 @@ impl Contents {
         checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> Option<u64> {
         let data = krate.data(db);
         let mut hasher = Sha256::new();
@@ -72,7 +74,7 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd crate 1");
+        field(b"rustd crate 2");
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.is_proc_macro).as_bytes());
@@ -132,6 +134,8 @@ impl Contents {
             self.places.lock().unwrap_or_else(|e| e.into_inner()).insert(out);
         }
         field(env.as_bytes());
+        // What `env!` and `option_env!` in it read of the process the build is for.
+        field(format!("{:?}", process_reads(krate)).as_bytes());
 
         // In the order of their names: the order they are listed in is the build's.
         let mut dependencies: Vec<_> = data.dependencies.iter().collect();
@@ -139,7 +143,7 @@ impl Contents {
         for dependency in dependencies {
             let on = dependency.crate_id;
             let id = match on.data(db).origin.is_local() {
-                true => self.id(db, checkouts, on, stable_crate_id)?,
+                true => self.id(db, checkouts, on, stable_crate_id, process_reads)?,
                 false => stable_crate_id(on).unwrap_or_else(|| Self::version(db, on)),
             };
             field(dependency.name.as_str().as_bytes());
@@ -158,6 +162,7 @@ impl Contents {
         krate: Crate,
         root: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> u64 {
         if let Some(&Some(id)) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return id;
@@ -167,20 +172,21 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"rustd library 1");
+        field(b"rustd library 2");
         field(&Self::version(db, krate).to_le_bytes());
         field(root.as_os_str().as_encoded_bytes());
         let mut cfgs: Vec<String> =
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
         cfgs.sort_unstable();
         field(cfgs.join("\n").as_bytes());
+        field(format!("{:?}", process_reads(krate)).as_bytes());
         let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dependency in dependencies {
             let on = dependency.crate_id;
             let id = match known(on) {
                 Some((Some(id), _)) => id,
-                Some((None, root)) => self.library(db, on, &root, known),
+                Some((None, root)) => self.library(db, on, &root, known, process_reads),
                 None => Self::version(db, on),
             };
             field(dependency.name.as_str().as_bytes());

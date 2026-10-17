@@ -163,6 +163,42 @@ fn declares_items(db: &RootDatabase, func: FunctionId) -> bool {
     })
 }
 
+/// A hash of everything in `text` except function bodies that nothing outside the function can
+/// see into. Used by the Clippy workspace wrapper to tell when an edit to an upstream crate is
+/// inside function bodies alone and cannot change what downstream crates check.
+pub(crate) fn syntax_outline_hash(text: &str) -> u64 {
+    let tree = syntax::SourceFile::parse(text, Edition::CURRENT).syntax_node();
+    let mut declaring = FxHashSet::default();
+    for node in tree.descendants() {
+        if node.kind() == SyntaxKind::FN
+            && let Some(func) = ast::Fn::cast(node.clone())
+            && let Some(body) = func.body()
+        {
+            let has_items_or_macros = body.syntax().descendants().skip(1).any(|it| {
+                matches!(
+                    it.kind(),
+                    SyntaxKind::FN
+                        | SyntaxKind::STRUCT
+                        | SyntaxKind::ENUM
+                        | SyntaxKind::UNION
+                        | SyntaxKind::TRAIT
+                        | SyntaxKind::IMPL
+                        | SyntaxKind::TYPE_ALIAS
+                        | SyntaxKind::MODULE
+                        | SyntaxKind::EXTERN_BLOCK
+                        | SyntaxKind::MACRO_RULES
+                        | SyntaxKind::MACRO_DEF
+                        | SyntaxKind::MACRO_CALL
+                )
+            });
+            if has_items_or_macros {
+                declaring.insert(node.text_range());
+            }
+        }
+    }
+    hash_outside_bodies(&tree, &declaring).0
+}
+
 /// The hash, and how many of the `declaring` functions were come by.
 fn hash_outside_bodies(file: &SyntaxNode, declaring: &FxHashSet<TextRange>) -> (u64, usize) {
     let mut hasher = FxHasher::default();

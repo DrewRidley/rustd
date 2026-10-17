@@ -55,6 +55,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
                 let ty = self.impl_opaque(ty);
+                if ty.has_escaping_bound_vars() {
+                    return Ok(ty);
+                }
 
                 let mut ocx = ObligationCtxt::new(&self.infcx);
                 let ty = ocx
@@ -130,11 +133,36 @@ impl<'db> Filler<'db> {
         if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
             return ty;
         }
-        let (either::Either::Left(implemented), args) =
-            db.lookup_impl_method(self.trait_env, func, alias.args)
+        let (mut func, mut idx, mut alias_args) = (func, idx, alias.args);
+        let (either::Either::Left(mut implemented), mut args) =
+            db.lookup_impl_method(self.trait_env, func, alias_args)
         else {
             return ty;
         };
+        if implemented == func
+            && let Some(hidden) = crate::opaques::rpit_hidden_types(db, func).get(idx)
+        {
+            let instantiated =
+                hidden.get().instantiate(self.infcx.interner, alias_args).skip_norm_wip();
+            if let TyKind::Alias(inner_alias) = instantiated.kind()
+                && let AliasTyKind::Opaque { def_id: inner_def } = inner_alias.kind
+                && let SolverDefId::InternedOpaqueTyId(inner_opaque) = inner_def.into()
+                && let crate::ImplTraitId::ReturnTypeImplTrait(inner_func, inner_idx) =
+                    inner_opaque.loc(db)
+                && inner_func != func
+                && !inner_alias.args.has_type_flags(TypeFlags::HAS_PARAM)
+                && !references_non_lt_error(&inner_alias.args)
+                && let (either::Either::Left(inner_impl), inner_args) =
+                    db.lookup_impl_method(self.trait_env, inner_func, inner_alias.args)
+            {
+                func = inner_func;
+                idx = inner_idx;
+                alias_args = inner_alias.args;
+                implemented = inner_impl;
+                args = inner_args;
+            }
+        }
+        let _ = alias_args;
         if implemented == func {
             return ty;
         }
@@ -153,7 +181,7 @@ impl<'db> Filler<'db> {
     fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError<'db>> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
+        if matches!(t.as_ref().kind(), TyKind::Error(_)) {
             Err(MirLowerError::NotSupported(format!(
                 "monomorphization resulted in errors: {:?}",
                 t.as_ref()
@@ -179,14 +207,7 @@ impl<'db> Filler<'db> {
     fn fill_args(&mut self, t: &mut StoredGenericArgs) -> Result<(), MirLowerError<'db>> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
-            Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
-            )))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     fn fill_operand(&mut self, op: &mut Operand) -> Result<(), MirLowerError<'db>> {
@@ -213,8 +234,16 @@ impl<'db> Filler<'db> {
     }
 
     fn fill_body(&mut self, body: &mut MirBody<'db>) -> Result<(), MirLowerError<'db>> {
-        for (_, l) in body.locals.iter_mut() {
-            self.fill_ty(&mut l.ty)?;
+        let mut used = rustc_hash::FxHashSet::default();
+        body.clone().walk_places(|place| {
+            used.insert(place.local);
+        });
+        for (id, l) in body.locals.iter_mut() {
+            if used.contains(&id) {
+                self.fill_ty(&mut l.ty)?;
+            } else {
+                let _ = self.fill_ty(&mut l.ty);
+            }
         }
         for (_, bb) in body.basic_blocks.iter_mut() {
             for statement in &mut bb.statements {

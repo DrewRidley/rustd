@@ -14,13 +14,13 @@ from difftest import Fixture, RUNNER
 
 CRATES = ["devdep", "blanket"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
-OPEN = set()
+OPEN = {"raw_write_then_match", "future_unwind_flags", "fragment_edition_through_macro"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
-LEFT = set()
+LEFT = {"caller_in_constant", "empty_array_by_impl"}
 
 
 def main():
-    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers"], ["-p", "breaker"])
+    fx = Fixture(os.path.join(HERE, "breakers"), ["breakers", "breakers2021"], ["-p", "breaker"])
     fx.rustc_build()
     fx.rustd_build()
     skipped = [r for rows in fx.reports.values() for r in rows if r[0] == "skipped" and "no rustc symbol" not in r[2]]

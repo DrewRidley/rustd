@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef};
 use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
-use hir_ty::mir::codegen::{SymbolResolver, exported_symbol};
+use hir_ty::mir::codegen::{SymbolResolver, exported_symbol, link_name};
 use ide_db::{RootDatabase, base_db::SourceDatabase as _};
 use syntax::{AstNode, SyntaxNode, ast, ast::HasName, match_ast};
 use vfs::FileId;
@@ -275,9 +275,13 @@ impl SymbolResolver for Resolver<'_> {
         if let Some(symbol) = self.table.get(&path) {
             return Some(symbol.to_owned());
         }
-        // rustc has built nothing of the crate: the function is ours to name.
+        // rustc has built nothing of the crate: the function is ours to name, unless an
+        // `extern` block declares it, and it is defined elsewhere under the name it links to.
         let krate = hir_def::HasModule::krate(&func, self.db);
         let id = self.own_crate_id(krate)?;
+        if let Some(symbol) = link_name(self.db, func) {
+            return Some(symbol);
+        }
         Some(format!("rustd.{id:x}.{path}"))
     }
 

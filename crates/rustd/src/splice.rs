@@ -23,6 +23,8 @@
 //!    whatever the headers say, so they are loaded exactly there: behind everything else,
 //!    where nothing has to reach them.
 //!
+//! Behind those, not loaded, is what a debugger reads of the new code: see [`debug`].
+//!
 //! The patch holds everything that differs from the object the executable was linked from, so
 //! each splice starts from the executable as the linker left it: the last one is undone
 //! first. Anything the splice has no answer for is an error, and the caller links in full.
@@ -48,6 +50,7 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
+mod debug;
 mod macho;
 mod pe;
 
@@ -163,6 +166,12 @@ impl Baseline {
         file.set_len(len)?;
         write_all_at(&file, &addition.appended, addition.offset)?;
         write_all_at(&file, &addition.headers, addition.headers_offset)?;
+        for moved in &addition.described.moved {
+            copy_within(&file, moved)?;
+        }
+        for (offset, bytes) in &addition.described.written {
+            write_all_at(&file, bytes, *offset)?;
+        }
         for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
             read_exact_at(&file, &mut old, *offset)?;
@@ -223,6 +232,19 @@ fn read_exact_at(mut file: &File, bytes: &mut [u8], offset: u64) -> std::io::Res
     use std::io::{Read as _, Seek as _, SeekFrom};
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(bytes)
+}
+
+/// Writes a run of the file again behind where it is.
+fn copy_within(file: &File, moved: &debug::Moved) -> std::io::Result<()> {
+    let mut buffer = vec![0; moved.len.min(1 << 20) as usize];
+    let mut done = 0;
+    while done < moved.len {
+        let part = &mut buffer[..(moved.len - done).min(1 << 20) as usize];
+        read_exact_at(file, part, moved.from + done)?;
+        write_all_at(file, part, moved.to + done)?;
+        done += part.len() as u64;
+    }
+    Ok(())
 }
 
 #[derive(PartialEq)]
@@ -473,6 +495,7 @@ struct Image {
     unwind: UnwindTable,
     /// `None` when the loader has no addresses to fix up.
     relocations: Option<LoadRelocations>,
+    described: debug::Described,
 }
 
 /// What a name stands for in the executable.
@@ -577,6 +600,7 @@ impl Image {
             imports,
             unwind: UnwindTable { segment: 0, address: 0, frames: 0, entries: Vec::new() },
             relocations: None,
+            described: debug::Described::read(&file)?,
         };
         image.unwind = UnwindTable::read(&image, bytes)?;
         image.relocations = LoadRelocations::read(&image, bytes)?;
@@ -1021,6 +1045,21 @@ impl<'a> Patch<'a> {
                 old,
             });
         }
+        let named: Vec<SymbolIndex> = (patch.described())
+            .flat_map(|section| section.relocations())
+            .filter_map(|(_, relocation)| match relocation.target() {
+                RelocationTarget::Symbol(index) => Some(index),
+                _ => None,
+            })
+            .collect();
+        for index in named {
+            let section = patch.file.symbol_by_index(index)?.section_index();
+            if section.is_some_and(|it| loaded.contains(&it)) && !patch.targets.contains_key(&index)
+            {
+                let target = patch.target(index, image, &loaded)?;
+                patch.targets.insert(index, target);
+            }
+        }
         let (mut slots, mut stubs) = (FxHashSet::default(), FxHashSet::default());
         for section in patch.file.sections().filter(|it| loaded.contains(&it.index())) {
             for (_, relocation) in section.relocations() {
@@ -1428,13 +1467,30 @@ impl<'a> Patch<'a> {
         point_to(&mut header, headers_at, headers_address, headers_len as u64);
         segments.push(header);
         let headers = object::bytes_of_slice(&segments).to_vec();
+        let headers_offset = offset + headers_at;
+        let described = self.describe(
+            &image.described,
+            machine,
+            headers_offset + headers.len() as u64,
+            |target, added| address(target, added, false),
+        )?;
         let mut header = image.header;
+        if let Some(at) = described.headers_offset {
+            header.e_shoff.set(e, at);
+        }
         header.e_phoff.set(e, offset + headers_at);
         header.e_phnum.set(e, u16::try_from(segments.len())?);
         overwritten.push((0, object::bytes_of(&header).to_vec()));
 
-        let headers_offset = offset + headers_at;
-        Ok(Addition { offset, appended, headers_offset, headers, overwritten, redirected })
+        Ok(Addition {
+            offset,
+            appended,
+            headers_offset,
+            headers,
+            overwritten,
+            redirected,
+            described,
+        })
     }
 }
 
@@ -1449,6 +1505,8 @@ struct Addition {
     /// What changes of the file the linker wrote, by where it is.
     overwritten: Vec<(u64, Vec<u8>)>,
     redirected: usize,
+    /// What a debugger reads of it, behind the headers.
+    described: debug::Tail,
 }
 
 fn read_i32(bytes: &[u8]) -> i32 {

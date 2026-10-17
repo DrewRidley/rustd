@@ -1,0 +1,17 @@
+{
+  "row": "weak `opt?/loud` with the optional dependency on",
+  "package": "app",
+  "crates": [
+    "app",
+    "lib",
+    "opt"
+  ],
+  "cargo": [
+    "--features",
+    "weak,with-opt"
+  ],
+  "rustd": [
+    "--features",
+    "weak,with-opt"
+  ]
+}

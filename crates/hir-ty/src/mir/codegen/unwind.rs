@@ -205,9 +205,33 @@ impl FunctionUnwind {
     }
 }
 
+/// The function the unwinder asks about a frame with landing pads: the program's own of that
+/// name when it defines one, the runtime's otherwise.
+fn personality(module: &mut dyn Module) -> Result<FuncId, String> {
+    const NAME: &str = "rust_eh_personality";
+    if let Some(cranelift_module::FuncOrDataId::Func(own)) = module.declarations().get_name(NAME) {
+        return Ok(own);
+    }
+    let pointer = module.target_config().pointer_type();
+    let signature = Signature {
+        params: vec![
+            AbiParam::new(types::I32),
+            AbiParam::new(types::I32),
+            AbiParam::new(types::I64),
+            AbiParam::new(pointer),
+            AbiParam::new(pointer),
+        ],
+        returns: vec![AbiParam::new(types::I32)],
+        call_conv: module.target_config().default_call_conv,
+    };
+    module.declare_function(NAME, Linkage::Import, &signature).map_err(|e| e.to_string())
+}
+
 pub(super) struct UnwindContext {
     frame_table: FrameTable,
     cies: Option<Cies>,
+    /// The pointer to the personality the frames name, where they reach it through one.
+    personality_ref: Option<DataId>,
     seh: seh::Tables,
 }
 
@@ -226,37 +250,21 @@ impl UnwindContext {
         let dwarf = module.isa().triple().binary_format != target_lexicon::BinaryFormat::Coff;
         // Nothing unwinds on wasm: a panic aborts there.
         if super::Target::current().is_wasm() {
-            return Ok(UnwindContext { frame_table, cies: None, seh });
+            return Ok(UnwindContext { frame_table, cies: None, personality_ref: None, seh });
         }
         let Some(mut cie) = module.isa().create_systemv_cie().filter(|_| dwarf) else {
-            return Ok(UnwindContext { frame_table, cies: None, seh });
+            return Ok(UnwindContext { frame_table, cies: None, personality_ref: None, seh });
         };
         let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
         cie.fde_address_encoding = pcrel;
         let plain = frame_table.add_cie(cie.clone());
         cie.lsda_encoding = Some(pcrel);
 
-        let pointer = module.target_config().pointer_type();
-        let personality = module
-            .declare_function(
-                "rust_eh_personality",
-                Linkage::Import,
-                &Signature {
-                    params: vec![
-                        AbiParam::new(types::I32),
-                        AbiParam::new(types::I32),
-                        AbiParam::new(types::I64),
-                        AbiParam::new(pointer),
-                        AbiParam::new(pointer),
-                    ],
-                    returns: vec![AbiParam::new(types::I32)],
-                    call_conv: module.target_config().default_call_conv,
-                },
-            )
-            .map_err(|e| e.to_string())?;
+        let macho = module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
         // The personality is reached through a pointer, as it can live in another DSO. The
         // linker of Mach-O makes that pointer, when asked for the one among its own.
-        if module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho {
+        if macho {
+            let personality = personality(module)?;
             cie.personality = Some((
                 gimli::DwEhPe(
                     gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
@@ -266,6 +274,7 @@ impl UnwindContext {
             let with_landing_pads = frame_table.add_cie(cie);
             return Ok(UnwindContext {
                 cies: Some(Cies { with_landing_pads, plain }),
+                personality_ref: None,
                 frame_table,
                 seh,
             });
@@ -274,13 +283,6 @@ impl UnwindContext {
         let personality_ref = module
             .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
             .map_err(|e| e.to_string())?;
-        let mut data = DataDescription::new();
-        data.define(
-            vec![0; usize::from(module.target_config().pointer_bytes())].into_boxed_slice(),
-        );
-        let func_ref = module.declare_func_in_data(personality, &mut data);
-        data.write_function_addr(0, func_ref);
-        module.define_data(personality_ref, &data).map_err(|e| e.to_string())?;
         // A linker of AArch64 may put more than four gigabytes between the two.
         let distance = match module.isa().triple().architecture {
             target_lexicon::Architecture::Aarch64(_) => gimli::DW_EH_PE_sdata8,
@@ -292,7 +294,26 @@ impl UnwindContext {
         ));
 
         let with_landing_pads = frame_table.add_cie(cie);
-        Ok(UnwindContext { cies: Some(Cies { with_landing_pads, plain }), frame_table, seh })
+        Ok(UnwindContext {
+            cies: Some(Cies { with_landing_pads, plain }),
+            personality_ref: Some(personality_ref),
+            frame_table,
+            seh,
+        })
+    }
+
+    /// Points the frames at the personality. Done once every function of the program is
+    /// declared: a program without `std` may define the personality itself.
+    pub(super) fn name_personality(&self, module: &mut dyn Module) -> Result<(), String> {
+        let Some(personality_ref) = self.personality_ref else { return Ok(()) };
+        let personality = personality(module)?;
+        let mut data = DataDescription::new();
+        data.define(
+            vec![0; usize::from(module.target_config().pointer_bytes())].into_boxed_slice(),
+        );
+        let func_ref = module.declare_func_in_data(personality, &mut data);
+        data.write_function_addr(0, func_ref);
+        module.define_data(personality_ref, &data).map_err(|e| e.to_string())
     }
 
     /// The function `symbol` names, when it is one this object has for its own unwinding

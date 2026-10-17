@@ -158,7 +158,7 @@ impl Backend {
         let Some((store, key)) = Store::global().zip(StoredCode::key(optimization, func)) else {
             return super::llvm::emit(recorder, func, optimization);
         };
-        if let Some(stored) = store.lookup(&key).and_then(StoredCode::decode)
+        if let Some(stored) = store.lookup(&key).and_then(|it| StoredCode::decode(&it))
             && let Some(code) = stored.restore(recorder)
         {
             return Ok(code);

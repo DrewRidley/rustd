@@ -137,6 +137,14 @@ impl Machine {
         thread_local! {
             static MACHINES: RefCell<FxHashMap<Optimization, TargetMachine>> = RefCell::default();
         }
+        // At no optimization LLVM selects AArch64 code with GlobalISel, whose selector
+        // lives in the machine and keeps the debug location of the last instruction it
+        // saw. That location belongs to a context which is gone by the next function,
+        // so such a machine serves one function.
+        let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
+        if emitted.arch == Arch::Aarch64 && optimization.level() == OptimizationLevel::None {
+            return work(&Self::create(optimization)?);
+        }
         MACHINES.with_borrow_mut(|machines| {
             let machine = match machines.entry(optimization) {
                 Entry::Occupied(known) => known.into_mut(),

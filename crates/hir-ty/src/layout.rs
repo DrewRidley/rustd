@@ -429,13 +429,21 @@ pub fn layout_of_ty_query(
             match pat.kind() {
                 PatternKind::Range { start, end } => {
                     if let BackendRepr::Scalar(scalar) = &mut layout.backend_repr {
-                        scalar.valid_range_mut().start = extract_const_value(start)?
-                            .try_to_bits(db, trait_env.as_ref(db))
-                            .ok_or(LayoutError::Unknown)?;
+                        scalar.valid_range_mut().start = extract_const_value(start)
+                            .ok()
+                            .and_then(|v| v.try_to_bits(db, trait_env.as_ref(db)))
+                            .unwrap_or(0);
 
-                        scalar.valid_range_mut().end = extract_const_value(end)?
-                            .try_to_bits(db, trait_env.as_ref(db))
-                            .ok_or(LayoutError::Unknown)?;
+                        scalar.valid_range_mut().end = extract_const_value(end)
+                            .ok()
+                            .and_then(|v| v.try_to_bits(db, trait_env.as_ref(db)))
+                            .unwrap_or_else(|| {
+                                if scalar.is_signed() {
+                                    layout.size.signed_int_max() as u128
+                                } else {
+                                    layout.size.unsigned_int_max()
+                                }
+                            });
 
                         // FIXME(pattern_types): create implied bounds from pattern types in signatures
                         // that require that the range end is >= the range start so that we can't hit
@@ -505,35 +513,37 @@ pub fn layout_of_ty_query(
                                     }
                                 })
                                 .collect();
-                            let mut variants = variants?;
                             if !scalar.is_signed() {
                                 return Err(LayoutError::HasErrorType);
                             }
-                            variants.sort();
-                            if variants.len() != 2 {
-                                return Err(LayoutError::HasErrorType);
-                            }
-
-                            // first is the one starting at the signed in range min
-                            let mut first = variants[0];
-                            let mut second = variants[1];
-                            if second.0
-                                == layout.size.truncate(layout.size.signed_int_min() as u128)
-                            {
-                                (second, first) = (first, second);
-                            }
-
-                            if layout.size.sign_extend(first.1) >= layout.size.sign_extend(second.0)
-                            {
-                                return Err(LayoutError::HasErrorType);
-                            }
-                            if layout.size.signed_int_max() as u128 != second.1 {
-                                return Err(LayoutError::HasErrorType);
-                            }
+                            let (second_start, first_end) = if let Ok(mut variants) = variants {
+                                variants.sort();
+                                if variants.len() != 2 {
+                                    return Err(LayoutError::HasErrorType);
+                                }
+                                let mut first = variants[0];
+                                let mut second = variants[1];
+                                if second.0
+                                    == layout.size.truncate(layout.size.signed_int_min() as u128)
+                                {
+                                    (second, first) = (first, second);
+                                }
+                                if layout.size.sign_extend(first.1)
+                                    >= layout.size.sign_extend(second.0)
+                                {
+                                    return Err(LayoutError::HasErrorType);
+                                }
+                                if layout.size.signed_int_max() as u128 != second.1 {
+                                    return Err(LayoutError::HasErrorType);
+                                }
+                                (second.0, first.1)
+                            } else {
+                                (1u128, layout.size.unsigned_int_max())
+                            };
 
                             // Now generate a wrapping range (which aren't allowed in surface syntax).
-                            scalar.valid_range_mut().start = second.0;
-                            scalar.valid_range_mut().end = first.1;
+                            scalar.valid_range_mut().start = second_start;
+                            scalar.valid_range_mut().end = first_end;
 
                             let niche = Niche {
                                 offset: Size::ZERO,

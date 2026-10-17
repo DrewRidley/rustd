@@ -202,12 +202,8 @@ fn expand_subtree(
                 err = err.or(e);
             }
             Op::Var { name, id, .. } => {
-                let before_angle = matches!(
-                    ops.peek(),
-                    Some(Op::Punct(puncts)) if puncts.first().is_some_and(|it| it.char == '<')
-                );
                 let ExpandResult { value: (), err: e } =
-                    expand_var(ctx, name, *id, before_angle, builder, marker);
+                    expand_var(ctx, name, *id, Follower::of(ops.peek().copied()), builder, marker);
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
@@ -382,11 +378,33 @@ fn expand_subtree(
     ExpandResult { value: (), err }
 }
 
+/// What a template has after a metavariable, where that says how the variable's tokens must
+/// be grouped to stay the operand they were matched as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follower {
+    /// `<`, which would take a type for a path to give generic arguments to.
+    Angle,
+    /// `.` or `?`, which bind tighter than the `-` of a negative literal.
+    Postfix,
+    Other,
+}
+
+impl Follower {
+    fn of(op: Option<&Op>) -> Follower {
+        let Some(Op::Punct(puncts)) = op else { return Follower::Other };
+        match puncts.as_slice() {
+            [first, ..] if first.char == '<' => Follower::Angle,
+            [only] if matches!(only.char, '.' | '?') => Follower::Postfix,
+            _ => Follower::Other,
+        }
+    }
+}
+
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
     v: &MetaVar,
     id: Span,
-    before_angle: bool,
+    follower: Follower,
     builder: &mut tt::TopSubtreeBuilder,
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
@@ -414,8 +432,9 @@ fn expand_var(
                     let mut span = id;
                     marker(&mut span);
 
-                    // Check if this is a simple negative literal (MINUS + LITERAL)
-                    // that should not be wrapped in parentheses
+                    // A negative literal can be a generic argument or a pattern as it is,
+                    // and neither in parentheses. It needs them only before what would
+                    // otherwise apply to the literal alone.
                     let is_negative_literal = matches!(
                         sub.iter().collect_array(),
                         Some([
@@ -430,7 +449,7 @@ fn expand_var(
                         matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]));
                     let delimiter = if is_leaf {
                         Some(tt::DelimiterKind::Invisible)
-                    } else if is_negative_literal
+                    } else if (is_negative_literal && follower != Follower::Postfix)
                         || sub.try_into_subtree().is_some_and(|it| {
                             it.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible
                         })
@@ -454,7 +473,7 @@ fn expand_var(
                     fix_up_and_push_path_tt(ctx, builder, tt);
                     builder.close(span);
                 }
-                Fragment::Ty(tt) if before_angle => {
+                Fragment::Ty(tt) if follower == Follower::Angle => {
                     let mut span = id;
                     marker(&mut span);
                     builder.open(tt::DelimiterKind::Parenthesis, span);

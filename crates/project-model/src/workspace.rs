@@ -1303,9 +1303,14 @@ fn cargo_to_crate_graph(
                     cfg_options.insert_atom(sym::rust_analyzer);
                 }
             }
-            // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
-            if sysroot_as_built() && !cargo.is_sysroot() {
-                cfg_options.insert_atom(sym::debug_assertions);
+            match &cargo[pkg].profile_cfg {
+                Some(profile) => cfg_options.apply_diff(profile.clone()),
+                // `rustc_cfg` is queried with `-O`, but cargo's dev profile builds without it.
+                None if sysroot_as_built() && !cargo.is_sysroot() => {
+                    cfg_options.insert_atom(sym::debug_assertions);
+                    cfg_options.insert_atom(sym::overflow_checks);
+                }
+                None => {}
             }
 
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
@@ -1837,6 +1842,27 @@ fn sysroot_to_crate_graph(
     crate_ws_data: Arc<CrateWorkspaceData>,
 ) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     let _p = tracing::info_span!("sysroot_to_crate_graph").entered();
+    let arch = rustc_cfg.iter().find_map(|atom| match atom {
+        CfgAtom::KeyValue { key, value } if key.as_str() == "target_arch" => Some(value.clone()),
+        _ => None,
+    });
+    let (public_deps, proc_macro) =
+        sysroot_crates_to_crate_graph(crate_graph, sysroot, rustc_cfg, load, crate_ws_data);
+    // The build script of `std` is not run: what it says of the target is said here.
+    let std = public_deps.deps.iter().find(|(name, ..)| name.as_str() == "std");
+    if let (Some(&(_, std, _)), Some(arch)) = (std, arch) {
+        crate_graph.set_env(std, "STD_ENV_ARCH", arch.as_str());
+    }
+    (public_deps, proc_macro)
+}
+
+fn sysroot_crates_to_crate_graph(
+    crate_graph: &mut CrateGraphBuilder,
+    sysroot: &Sysroot,
+    rustc_cfg: Vec<CfgAtom>,
+    load: FileLoader<'_>,
+    crate_ws_data: Arc<CrateWorkspaceData>,
+) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     match sysroot.workspace() {
         RustLibSrcWorkspace::Workspace { ws: cargo, .. } => {
             let (sysroot_cg, sysroot_pm) = cargo_to_crate_graph(
@@ -1847,7 +1873,10 @@ fn sysroot_to_crate_graph(
                 rustc_cfg,
                 &CfgOverrides {
                     global: if sysroot_as_built() {
-                        CfgDiff::new(vec![], vec![CfgAtom::Flag(sym::test)])
+                        CfgDiff::new(
+                            vec![CfgAtom::Flag(sym::bootstrap)],
+                            vec![CfgAtom::Flag(sym::test)],
+                        )
                     } else {
                         CfgDiff::new(
                             vec![

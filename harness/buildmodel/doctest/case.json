@@ -1,0 +1,9 @@
+{
+  "row": "doctests",
+  "package": "app",
+  "crates": [
+    "app"
+  ],
+  "expect": "refused",
+  "unbuilt": "rustdoc compiles and runs doctests itself, a crate for each: nothing asks rustd for them, and it has no way to be asked"
+}

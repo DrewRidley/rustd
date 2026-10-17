@@ -239,4 +239,5 @@ The fork is RA plus two things: the `rustd` crate and the codegen module. Policy
   write-up by a compiler engineer on how RA's memory could be reduced (not yet located) that
   should be read before designing anything here.
 - Unwinding. RA's MIR has no cleanup edges at all; adding them is real work inside RA's lowering.
-- Debug info. None today.
+- Debug info. Line tables, functions and (under Cranelift) variables on Linux x86-64 ELF,
+  following the profile's `debug` setting; see `DEBUGINFO.md` for what is covered and what is open.

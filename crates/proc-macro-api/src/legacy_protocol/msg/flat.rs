@@ -782,6 +782,19 @@ impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
                         let repr = &self.literal[idx];
                         let text = self.text[repr.text as usize].as_str();
                         let span = read_span(repr.id);
+                        // `Literal::i32_suffixed(-1)` is one token to the macro and a minus
+                        // sign and a literal to the compiler.
+                        let numeric = self.version < EXTENDED_LEAF_DATA
+                            || matches!(u16::to_le_bytes(repr.kind), [3 | 4, _]);
+                        let text = match text.strip_prefix('-') {
+                            Some(magnitude) if numeric => {
+                                let minus =
+                                    tt::Punct { char: '-', spacing: tt::Spacing::Alone, span };
+                                s.push(tt::Leaf::Punct(minus).into());
+                                magnitude
+                            }
+                            _ => text,
+                        };
                         s.push(
                             tt::Leaf::Literal(if self.version >= EXTENDED_LEAF_DATA {
                                 tt::Literal::new(

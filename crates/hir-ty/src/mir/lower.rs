@@ -22,7 +22,7 @@ use hir_expand::name::Name;
 use itertools::{EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts,
     inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
@@ -32,7 +32,7 @@ use span::Edition;
 
 use crate::{
     Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
-    consteval::ConstEvalError,
+    consteval::{ConstEvalError, try_const_usize},
     db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     generics::generics,
     infer::{
@@ -723,35 +723,31 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     };
                     (discr, current)
                 };
+                if bindings.is_some() && !self.edition().at_least_2024() {
+                    self.outlive_if_let();
+                }
                 let bound = bindings.is_some().then(|| self.drop_scopes.last().cloned()).flatten();
-                let drop_bound = |this: &mut Self, mut block: BasicBlockId| {
-                    if let Some(bound) = &bound {
-                        this.emit_drop_and_storage_dead_for_scope(
-                            bound,
-                            &mut block,
-                            (*condition).into(),
-                        );
-                    }
-                    block
-                };
+                let span = MirSpan::from(*condition);
                 let start_of_then = self.new_basic_block();
                 let end_of_then = self
                     .lower_expr_to_place(*then_branch, place, start_of_then)?
-                    .map(|block| drop_bound(self, block));
+                    .map(|block| self.end_of_branch(&bound, block, span));
+                self.forget_branch(&bound);
                 let start_of_else = self.new_basic_block();
                 // From the 2024 edition on, the `else` branch runs after the drops.
                 let early = self.edition().at_least_2024();
-                let else_block =
-                    if early { drop_bound(self, start_of_else) } else { start_of_else };
+                let else_block = match early {
+                    true => self.end_of_branch(&bound, start_of_else, span),
+                    false => start_of_else,
+                };
                 let end_of_else = if let Some(else_branch) = else_branch {
                     self.lower_expr_to_place(*else_branch, place, else_block)?
                 } else {
                     Some(else_block)
                 };
-                let end_of_else = if early {
-                    end_of_else
-                } else {
-                    end_of_else.map(|block| drop_bound(self, block))
+                let end_of_else = match early {
+                    true => end_of_else,
+                    false => end_of_else.map(|block| self.end_of_branch(&bound, block, span)),
                 };
                 if let Some(bindings) = bindings {
                     bindings.pop_assume_dropped(self);
@@ -1209,46 +1205,48 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 } else {
                     let source_ty = self.infer.expr_ty(*expr);
                     let target_ty = self.infer.expr_ty(expr_id);
-                    let (it, source_ty, current) =
-                        if let Some(VariantId::EnumVariantId(variant_id)) =
-                            self.infer.variant_resolution_for_expr(*expr)
-                        {
-                            self.lower_variant_discriminant(current, variant_id)?
-                        } else if let TyKind::Adt(adt, _) = source_ty.kind()
-                            && adt.is_enum()
-                        {
-                            let Some((enum_place, current)) =
-                                self.lower_expr_as_place(current, *expr, true)?
-                            else {
-                                return Ok(None);
-                            };
-                            let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
-                            let discr_place: Place<'db> =
-                                self.temp(discr_ty, current, expr_id.into())?.into();
-
-                            self.push_assignment(
-                                current,
-                                discr_place,
-                                Rvalue::Discriminant(enum_place.store()),
-                                expr_id.into(),
-                            );
-                            (
-                                Operand {
-                                    kind: OperandKind::Copy(discr_place.store()),
-                                    span: Some(expr_id.into()),
-                                },
-                                discr_ty,
-                                current,
-                            )
-                        } else {
-                            let Some((it, current)) =
-                                self.lower_expr_to_some_operand(*expr, current)?
-                            else {
-                                return Ok(None);
-                            };
-                            // The operand carries the cast's coercion, e.g. fn item to pointer.
-                            (it, self.expr_ty_after_adjustments(*expr), current)
+                    // A variant named as a value casts to its discriminant; one named as
+                    // its constructor function is a function like any other.
+                    let (it, source_ty, current) = if let Some(VariantId::EnumVariantId(variant_id)) =
+                        self.infer.variant_resolution_for_expr(*expr)
+                        && !matches!(source_ty.kind(), TyKind::FnDef(..))
+                    {
+                        self.lower_variant_discriminant(current, variant_id)?
+                    } else if let TyKind::Adt(adt, _) = source_ty.kind()
+                        && adt.is_enum()
+                    {
+                        let Some((enum_place, current)) =
+                            self.lower_expr_as_place(current, *expr, true)?
+                        else {
+                            return Ok(None);
                         };
+                        let discr_ty = Ty::new_int(self.interner(), rustc_type_ir::IntTy::I128);
+                        let discr_place: Place<'db> =
+                            self.temp(discr_ty, current, expr_id.into())?.into();
+
+                        self.push_assignment(
+                            current,
+                            discr_place,
+                            Rvalue::Discriminant(enum_place.store()),
+                            expr_id.into(),
+                        );
+                        (
+                            Operand {
+                                kind: OperandKind::Copy(discr_place.store()),
+                                span: Some(expr_id.into()),
+                            },
+                            discr_ty,
+                            current,
+                        )
+                    } else {
+                        let Some((it, current)) =
+                            self.lower_expr_to_some_operand(*expr, current)?
+                        else {
+                            return Ok(None);
+                        };
+                        // The operand carries the cast's coercion, e.g. fn item to pointer.
+                        (it, self.expr_ty_after_adjustments(*expr), current)
+                    };
                     // `f as *const ()` and `f as usize` go through a function pointer.
                     let (it, source_ty) = if let TyKind::FnDef(..) = source_ty.kind()
                         && !matches!(target_ty.kind(), TyKind::FnPtr(..))
@@ -1692,22 +1690,39 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     Ok(Some(current))
                 }
                 Array::Repeat { initializer, .. } => {
+                    let TyKind::Array(element, len) = self.expr_ty_without_adjust(expr_id).kind()
+                    else {
+                        return Err(MirLowerError::TypeError(
+                            "Array repeat expression with non array type",
+                        ));
+                    };
                     let Some((init, current)) =
                         self.lower_expr_to_some_operand(*initializer, current)?
                     else {
                         return Ok(None);
                     };
-                    let len = match self.expr_ty_without_adjust(expr_id).kind() {
-                        TyKind::Array(_, len) => len,
-                        _ => {
-                            return Err(MirLowerError::TypeError(
-                                "Array repeat expression with non array type",
-                            ));
+                    if self.names_constant(*initializer) {
+                        let r = Rvalue::Repeat(init, len.store());
+                        self.push_assignment(current, place, r, expr_id.into());
+                        return Ok(Some(current));
+                    }
+                    let span = expr_id.into();
+                    match (&init.kind, try_const_usize(self.db, len)) {
+                        // No element takes the value, so it ends here.
+                        (OperandKind::Copy(value), Some(0)) => {
+                            let value = value.as_ref();
+                            let current = self.drop_assigned(value, element, current, span);
+                            let empty = AggregateKind::Array(element.store());
+                            let r = Rvalue::Aggregate(empty, Box::new([]));
+                            self.push_assignment(current, place, r, span);
+                            Ok(Some(current))
                         }
-                    };
-                    let r = Rvalue::Repeat(init, len.store());
-                    self.push_assignment(current, place, r, expr_id.into());
-                    Ok(Some(current))
+                        _ => {
+                            let r = Rvalue::Repeat(self.moved(init), len.store());
+                            self.push_assignment(current, place, r, span);
+                            Ok(Some(current))
+                        }
+                    }
                 }
             },
             Expr::Literal(l) => {
@@ -2062,6 +2077,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
     }
 
+    /// Whether an expression is a constant item or a `const` block, which an array repeats by
+    /// making it once per element, rather than a value the array takes.
+    fn names_constant(&mut self, expr: ExprId) -> bool {
+        let Expr::Path(path) = &self.store[expr] else {
+            return matches!(self.store[expr], Expr::Const(_));
+        };
+        if let Some((candidate, _)) = self.infer.assoc_resolutions_for_expr(expr) {
+            return matches!(candidate, CandidateId::ConstId(_));
+        }
+        let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
+        let hygiene = self.store.expr_path_hygiene(expr);
+        let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
+        self.resolver.reset_to_guard(guard);
+        matches!(resolved, Some(ValueNs::ConstId(_)))
+    }
+
+    /// The operand that takes the value of the place another operand reads.
+    fn moved(&self, operand: Operand) -> Operand {
+        match operand.kind {
+            OperandKind::Copy(place) => {
+                Operand { kind: OperandKind::Move(place), span: operand.span }
+            }
+            _ => operand,
+        }
+    }
+
     fn is_promotable_unadjusted(&mut self, expr: ExprId) -> bool {
         let scalar = |this: &Self, expr| {
             matches!(
@@ -2087,7 +2128,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
                 self.resolver.reset_to_guard(guard);
                 match resolved {
-                    Some(ValueNs::ConstId(_) | ValueNs::EnumVariantId(_)) => true,
+                    Some(
+                        ValueNs::ConstId(_) | ValueNs::EnumVariantId(_) | ValueNs::GenericParam(_),
+                    ) => true,
                     Some(ValueNs::StructId(_)) => {
                         !matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..))
                     }
@@ -2428,6 +2471,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 } => {
                     if let Some(expr_id) = initializer {
                         let else_block;
+                        let held = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                         self.extend_temporaries(*expr_id, *pat);
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
@@ -2458,11 +2502,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 self.set_terminator(else_block, TerminatorKind::Unreachable, span);
                             }
                             (Some(else_block), Some(else_branch)) => {
-                                if let Some((_, b)) =
-                                    self.lower_expr_as_place(else_block, *else_branch, true)?
-                                {
-                                    self.set_terminator(b, TerminatorKind::Unreachable, span);
-                                }
+                                self.lower_let_else(else_block, *else_branch, held, span)?;
                             }
                         }
                         current = temporaries.pop_and_drop(self, current, span);
@@ -2887,7 +2927,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
-        self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span);
+        self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
     }
 
@@ -2901,6 +2941,72 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             implementation_error!("Mismatched count between drop scope push and pops");
         }
         Ok(current)
+    }
+
+    /// Where a branch of an `if` that has a `let` ends: what the condition bound is dropped,
+    /// after the temporaries the branch left to the `if`. `bound` is the scope of the `if` as
+    /// its condition left it.
+    fn end_of_branch(
+        &mut self,
+        bound: &Option<DropScope>,
+        mut block: BasicBlockId,
+        span: MirSpan,
+    ) -> BasicBlockId {
+        if let (Some(_), Some(scope)) = (bound, self.drop_scopes.last().cloned()) {
+            self.emit_drop_and_storage_dead_for_scope(&scope, &mut block, span);
+        }
+        block
+    }
+
+    /// Takes out of the scope of an `if` what the branch that was just lowered left to it:
+    /// the other branch never had those.
+    fn forget_branch(&mut self, bound: &Option<DropScope>) {
+        if let (Some(bound), Some(scope)) = (bound, self.drop_scopes.last_mut()) {
+            scope.locals.clone_from(&bound.locals);
+        }
+    }
+
+    /// Before the 2024 edition the temporaries of what an `if let` matches on live as long as
+    /// those of the expression the `if` is in. Only what it binds ends with its branches.
+    fn outlive_if_let(&mut self) {
+        let bindings: FxHashSet<LocalId> =
+            self.result.binding_locals.iter().map(|(_, &local)| local).collect();
+        if let [.., outer, scope] = &mut self.drop_scopes[..] {
+            let (bound, temporaries) =
+                scope.locals.drain(..).partition(|local| bindings.contains(local));
+            scope.locals = bound;
+            outer.locals.extend::<Vec<LocalId>>(temporaries);
+        }
+    }
+
+    /// The `else` of a `let ... else`, entered when the pattern did not match. The value and
+    /// the temporaries of the initializer are dropped before the block runs, those that would
+    /// have lived to the end of the enclosing block too: they are its locals from `held` on.
+    fn lower_let_else(
+        &mut self,
+        mut current: BasicBlockId,
+        else_branch: ExprId,
+        held: usize,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let take = |scope: &mut DropScope| std::mem::take(&mut scope.locals);
+        let locals = self.drop_scopes.last_mut().map(take).unwrap_or_default();
+        let dropped = DropScope { locals, temporaries: true };
+        self.emit_drop_and_storage_dead_for_scope(&dropped, &mut current, span);
+        let extended = match self.drop_scopes.iter().rev().nth(1) {
+            Some(block) => block.locals.get(held..).unwrap_or_default().to_vec(),
+            None => Vec::new(),
+        };
+        let extended = DropScope { locals: extended, temporaries: true };
+        self.emit_drop_and_storage_dead_for_scope(&extended, &mut current, span);
+        let lowered = self.lower_expr_as_place(current, else_branch, true);
+        if let Some(scope) = self.drop_scopes.last_mut() {
+            scope.locals = dropped.locals;
+        }
+        if let Some((_, end)) = lowered? {
+            self.set_terminator(end, TerminatorKind::Unreachable, span);
+        }
+        Ok(())
     }
 
     /// Drops the value an assignment is about to overwrite.
@@ -3253,7 +3359,7 @@ fn lower_closure_body<'db>(
     ctx.resolver.reset_to_guard(resolver_guard);
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, (*root).into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(*root).end());
     }
     if let Some(CoroutineLocals { poll, .. }) = ctx.result.coroutine {
         let ready = ctx.poll_variant(true)?;
@@ -3418,7 +3524,7 @@ pub fn promoted_mir_body_query<'db>(
         ctx.lower_expr_to_place_without_adjust(expr, return_slot().into(), current)?
     {
         let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, expr.into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
     }
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
@@ -3526,7 +3632,7 @@ pub fn lower_to_mir_with_store<'db>(
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
     }
     Ok(ctx.result)
 }

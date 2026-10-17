@@ -12,3 +12,20 @@ dependencies = [
 [[package]]
 name = "breakers"
 version = "0.0.0"
+dependencies = [
+ "breakers2021",
+ "foreign",
+ "literals",
+]
+
+[[package]]
+name = "breakers2021"
+version = "0.0.0"
+
+[[package]]
+name = "foreign"
+version = "0.0.0"
+
+[[package]]
+name = "literals"
+version = "0.0.0"

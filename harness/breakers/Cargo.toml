@@ -1,3 +1,3 @@
 [workspace]
-members = ["cases", "runner"]
+members = ["cases", "edition2021", "foreign", "literals", "runner"]
 resolver = "2"

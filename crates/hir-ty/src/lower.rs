@@ -880,13 +880,19 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     fn lower_pattern_type(&mut self, pat: PatId, ty: Ty<'db>) -> Option<Pattern<'db>> {
         let pat_kind = match self.store[pat] {
-            hir_def::hir::Pat::Range { start: Some(start), end: Some(end), range_type: _ } => {
+            hir_def::hir::Pat::Range { start, end, range_type: _ } => {
                 // rustc allows using generic params in pattern types.
                 // In practice this does not matter since this feature is internal and I didn't find a way to actually use generic params,
                 // but it doesn't matter so...
                 rustc_type_ir::PatternKind::Range {
-                    start: self.lower_expr_as_const(start, ty, true),
-                    end: self.lower_expr_as_const(end, ty, true),
+                    start: match start {
+                        Some(s) => self.lower_expr_as_const(s, ty, true),
+                        None => Const::error(self.interner),
+                    },
+                    end: match end {
+                        Some(e) => self.lower_expr_as_const(e, ty, true),
+                        None => Const::error(self.interner),
+                    },
                 }
             }
             hir_def::hir::Pat::NotNull => rustc_type_ir::PatternKind::NotNull,
@@ -3071,7 +3077,12 @@ fn generic_predicates<'db>(
         // prove that the trait applies to the types that were
         // used, and adding the predicate into this list ensures
         // that this is done.
-        if let GenericDefId::TraitId(def_id) = def {
+        //
+        // A trait alias holds of whatever its bounds hold of, so it has no such
+        // predicate: one would make proving the alias wait on itself.
+        if let GenericDefId::TraitId(def_id) = def
+            && !TraitSignature::of(interner.db(), def_id).flags.contains(TraitFlags::ALIAS)
+        {
             Some(TraitRef::identity(interner, def_id.into()).upcast(interner))
         } else {
             None

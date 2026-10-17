@@ -1475,53 +1475,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             }
             "const_deallocate" => Ok(()),
             "caller_location" => {
-                let Some(location_adt) = self.lang_items().PanicLocation else {
-                    not_supported!("`caller_location` requires the `panic_location` lang item");
-                };
-                let location_ty = self.db.ty(location_adt.into()).skip_binder();
-                let TyKind::Adt(_, subst) = location_ty.kind() else {
-                    return Err(MirEvalError::InternalError(
-                        "`panic_location` lang item is not an ADT".into(),
-                    ));
-                };
-                let layout = self.layout(location_ty)?;
-                let (file, line, col) = self.caller_location_fields(locals.body.owner, span);
-                let file_len = file.len();
-                let file_addr = self.heap_allocate(file_len + 1, 1)?;
-                self.write_memory(file_addr, file.as_bytes())?;
-                let ptr_size = self.ptr_size();
-                let field_types = self.db.field_types(location_adt.into());
-                let mut line_col = [line, col].into_iter();
-                let mut fields = Vec::with_capacity(field_types.iter().count());
-                for (_, field) in field_types.iter() {
-                    let field_ty = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
-                    let bytes =
-                        if matches!(field_ty.kind(), TyKind::Uint(rustc_type_ir::UintTy::U32)) {
-                            line_col.next().unwrap_or(0).to_le_bytes().to_vec()
-                        } else {
-                            let size =
-                                self.size_of_sized(field_ty, locals, "caller_location field")?;
-                            if size == ptr_size * 2 {
-                                // The string slice pointing at the file name: (data pointer, length).
-                                let mut bytes = file_addr.to_bytes()[..ptr_size].to_vec();
-                                bytes.extend_from_slice(&file_len.to_le_bytes()[..ptr_size]);
-                                bytes
-                            } else {
-                                vec![0; size]
-                            }
-                        };
-                    fields.push(IntervalOrOwned::Owned(bytes));
-                }
-                let location = self.construct_with_layout(
-                    layout.size.bytes_usize(),
-                    &layout,
-                    None,
-                    fields.into_iter(),
-                )?;
-                let location_addr =
-                    self.heap_allocate(layout.size.bytes_usize(), layout.align.bytes() as usize)?;
-                self.write_memory(location_addr, &location)?;
-                destination.write_from_bytes(self, &location_addr.to_bytes()[..ptr_size])
+                // A constant holds what rustc would name the file, which is known to whoever
+                // builds the program and not here.
+                not_supported!("the caller's location in a constant")
             }
             "box_new" => {
                 let ty = generic_args.type_at(0);

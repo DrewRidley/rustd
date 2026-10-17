@@ -25,6 +25,22 @@ literal!();
 }
 
 #[test]
+fn negative_literal_stays_one_operand() {
+    check(
+        r#"
+macro_rules! m { ($x:literal) => { $x.pow(2); $x..$x; -$x; }; }
+fn f() { m!(-4); }
+"#,
+        expect![[r#"
+macro_rules! m { ($x:literal) => { $x.pow(2); $x..$x; -$x; }; }
+fn f() { (-4).pow(2);
+-4..-4;
+--4;; }
+"#]],
+    );
+}
+
+#[test]
 fn test_expand_bad_literal() {
     check(
         r#"

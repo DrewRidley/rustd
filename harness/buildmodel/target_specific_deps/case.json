@@ -1,0 +1,7 @@
+{
+  "row": "target-specific dependencies and `cfg(target_*)` on the host",
+  "package": "app",
+  "crates": [
+    "app"
+  ]
+}

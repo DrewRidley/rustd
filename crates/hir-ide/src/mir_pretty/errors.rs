@@ -146,7 +146,7 @@ impl MirEvalError<'_> {
                     }
                 };
                 let span: InFile<SyntaxNodePtr> = match *span {
-                    MirSpan::ExprId(e) => match source_map.expr_syntax(e) {
+                    MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => match source_map.expr_syntax(e) {
                         Ok(s) => s.map(|it| it.into()),
                         Err(_) => continue,
                     },

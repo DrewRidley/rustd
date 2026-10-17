@@ -1,0 +1,16 @@
+{
+  "row": "build script: `cargo:rustc-env`",
+  "package": "app",
+  "crates": [
+    "app"
+  ],
+  "steps": [
+    {
+      "what": "the file the script reads has another value",
+      "expect": "refused",
+      "write": {
+        "value.txt": "second\n"
+      }
+    }
+  ]
+}

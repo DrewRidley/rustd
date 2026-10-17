@@ -277,6 +277,7 @@ define_symbols! {
     crate_type,
     CStr,
     debug_assertions,
+    overflow_checks,
     Debug,
     default,
     Default,

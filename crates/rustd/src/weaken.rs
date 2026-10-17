@@ -57,7 +57,7 @@ fn up_to_date(copy: &Path, file: &Path) -> bool {
 }
 
 /// Makes the definitions of an object, or of each object of an archive, weak.
-fn weaken(data: &mut [u8]) {
+pub(crate) fn weaken(data: &mut [u8]) {
     let members: Vec<Range<usize>> = match ArchiveFile::parse(&*data) {
         Ok(archive) => archive
             .members()
