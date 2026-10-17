@@ -176,6 +176,31 @@ impl SymbolTable {
         Ok(table)
     }
 
+    pub(crate) fn merge(&mut self, other: SymbolTable) {
+        for (k, v) in other.by_path {
+            let list = self.by_path.entry(k).or_default();
+            for item in v {
+                if !list.iter().any(|x| x.name == item.name) {
+                    list.push(item);
+                }
+            }
+        }
+        for (k, v) in other.nested {
+            let list = self.nested.entry(k).or_default();
+            for item in v {
+                if !list.iter().any(|x| x.name == item.name) {
+                    list.push(item);
+                }
+            }
+        }
+        for (k, v) in other.crates {
+            self.crates.entry(k).or_insert(v);
+        }
+        for (k, v) in other.by_root {
+            self.by_root.entry(k).or_insert(v);
+        }
+    }
+
     pub(crate) fn load_cached(
         files: &[PathBuf],
         root: &Path,

@@ -121,16 +121,17 @@ struct TargetPaths {
 
 impl TargetPaths {
     fn new(workspace_root: &Path, bin_name: &str) -> Self {
-        let dir = workspace_root.join("target").join("rustd").join(bin_name);
+        let rustd_root = workspace_root.join("target").join("rustd");
+        let dir = rustd_root.join(bin_name);
         let base_o = dir.join("base.o");
         let rt_o = dir.join("base.rt.o");
         let patch_o = dir.join("patch.o");
         let ack = dir.join("patch.ack");
         Self {
             out_bin: dir.join(bin_name),
-            rustd_sock: dir.join("rustd.sock"),
-            rustd_log: dir.join("rustd.log"),
-            pid_file: dir.join("rustd.pid"),
+            rustd_sock: rustd_root.join("rustd.sock"),
+            rustd_log: rustd_root.join("rustd.log"),
+            pid_file: rustd_root.join("rustd.pid"),
             link_args_txt: dir.join("link_args.txt"),
             link_sh: dir.join("link.sh"),
             hotpatch_map: dir.join("hotpatch_map.json"),
@@ -527,14 +528,26 @@ fn features_fingerprint(opts: &CliOpts) -> String {
 
 fn ensure_features_consistent(opts: &CliOpts, paths: &TargetPaths) {
     let feat_file = paths.dir.join("features.key");
+    let ws_feat_file = opts
+        .workspace_root
+        .join("target")
+        .join("rustd")
+        .join("features.key");
     let expected = features_fingerprint(opts);
-    if fs::read_to_string(&feat_file).ok().as_deref() != Some(expected.as_str()) {
+    let prev_pkg_feat = fs::read_to_string(&feat_file).ok();
+    let prev_ws_feat = fs::read_to_string(&ws_feat_file).ok();
+    if prev_ws_feat.as_deref().is_some_and(|p| p != expected.as_str()) {
         stop_target_daemon(paths);
-        let _ = fs::remove_file(&paths.link_args_txt);
-        let _ = fs::remove_file(paths.dir.join("clippy.sh"));
-        let _ = fs::remove_file(paths.out_bin.with_extension("base"));
+    }
+    if prev_pkg_feat.as_deref() != Some(expected.as_str()) {
+        if prev_pkg_feat.is_some() {
+            let _ = fs::remove_file(&paths.link_args_txt);
+            let _ = fs::remove_file(paths.dir.join("clippy.sh"));
+            let _ = fs::remove_file(paths.out_bin.with_extension("base"));
+        }
         let _ = fs::create_dir_all(&paths.dir);
-        let _ = fs::write(&feat_file, expected);
+        let _ = fs::write(&feat_file, &expected);
+        let _ = fs::write(&ws_feat_file, &expected);
     }
 }
 
@@ -786,6 +799,11 @@ fn prepare_link_script_and_symbols(
         }
     }
     rlibs.extend(sysroot_rlibs(&opts.workspace_root, opts.target.as_deref())?);
+    let rlibs_txt: String = rlibs
+        .iter()
+        .map(|p| format!("{}\n", p.display()))
+        .collect();
+    let _ = fs::write(paths.dir.join("rlibs.txt"), rlibs_txt);
     Ok(rlibs)
 }
 
@@ -810,18 +828,15 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
         .unwrap_or(&opts.bin_name)
         .replace('-', "_");
     if paths.rustd_sock.exists() {
-        let is_symlink = fs::symlink_metadata(&paths.rustd_sock)
-            .is_ok_and(|m| m.file_type().is_symlink());
-        let req = if is_symlink {
-            format!(
-                "switch\t{bin_crate}\t{}\t{}\t{}",
-                paths.base_o.display(),
-                paths.patch_o.display(),
-                paths.link_sh.display()
-            )
-        } else {
-            "patch".to_owned()
-        };
+        if !paths.link_sh.exists() || !paths.dir.join("rlibs.txt").exists() {
+            let _ = prepare_link_script_and_symbols(opts, paths)?;
+        }
+        let req = format!(
+            "switch\t{bin_crate}\t{}\t{}\t{}",
+            paths.base_o.display(),
+            paths.patch_o.display(),
+            paths.link_sh.display()
+        );
         if let Ok(reply) = send_unix_line(&paths.rustd_sock, &req) {
             if !reply.starts_with("error: unknown request") {
                 return Ok(Some(reply));
@@ -832,48 +847,6 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
     let _ = fs::remove_file(&paths.rustd_sock);
     let _ = fs::remove_file(&paths.ack);
     let rlibs = prepare_link_script_and_symbols(opts, paths)?;
-
-    // Check if another daemon is already running in this workspace with the same feature set
-    let rustd_root = opts.workspace_root.join("target").join("rustd");
-    let expected_feat = features_fingerprint(opts);
-    if let Ok(entries) = fs::read_dir(&rustd_root) {
-        for e in entries.flatten() {
-            let dir = e.path();
-            if dir == paths.dir || !dir.is_dir() {
-                continue;
-            }
-            let other_sock = dir.join("rustd.sock");
-            let other_feat = fs::read_to_string(dir.join("features.key")).unwrap_or_default();
-            if other_sock.exists() && other_feat == expected_feat {
-                if !paths.out_bin.exists() {
-                    let base_src = rustd_root
-                        .iter()
-                        .next()
-                        .and_then(|_| dir.join("base.o").exists().then(|| dir.join("base.o")));
-                    if let Some(bs) = base_src {
-                        let _ = fs::copy(&bs, &paths.base_o);
-                        let _ = fs::copy(bs.with_extension("rt.o"), &paths.rt_o);
-                        let _ = fs::copy(
-                            bs.with_extension("cave.o"),
-                            paths.base_o.with_extension("cave.o"),
-                        );
-                        let _ = fs::copy(&bs, &paths.patch_o);
-                        let _ = Command::new("sh").arg("-c").arg(&paths.link_sh).status();
-                    }
-                }
-                let switch_req = format!(
-                    "switch\t{bin_crate}\t{}\t{}\t{}",
-                    paths.base_o.display(),
-                    paths.patch_o.display(),
-                    paths.link_sh.display()
-                );
-                if let Ok(reply) = send_unix_line(&other_sock, &switch_req) {
-                    let _ = std::os::unix::fs::symlink(&other_sock, &paths.rustd_sock);
-                    return Ok(Some(reply));
-                }
-            }
-        }
-    }
 
     let exe = env::current_exe()?;
     let mut cmd = Command::new(&exe);
@@ -2076,6 +2049,17 @@ fn cmd_stop(args: &[String], quiet: bool) -> anyhow::Result<()> {
     let opts = parse_opts(args)?;
     let rustd_dir = opts.workspace_root.join("target").join("rustd");
     let mut stopped = Vec::new();
+    if rustd_dir.join("rustd.sock").exists() || rustd_dir.join("rustd.pid").exists() {
+        if let Ok(pid_str) = fs::read_to_string(rustd_dir.join("rustd.pid"))
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+            && pid > 0
+        {
+            let _ = Command::new("kill").arg("-15").arg(pid.to_string()).status();
+        }
+        let _ = fs::remove_file(rustd_dir.join("rustd.sock"));
+        let _ = fs::remove_file(rustd_dir.join("rustd.pid"));
+        stopped.push("workspace".to_owned());
+    }
     if let Ok(entries) = fs::read_dir(&rustd_dir) {
         for e in entries.flatten() {
             let p = e.path();

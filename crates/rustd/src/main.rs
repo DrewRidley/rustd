@@ -3411,6 +3411,9 @@ fn main() -> anyhow::Result<()> {
         Vec::new()
     };
     let check_root = args.root()?;
+    let initial_empty_base_o = args.out.clone();
+    let mut loaded_symbol_files: FxHashSet<PathBuf> =
+        args.symbol_files.iter().cloned().collect();
     let mut check_report_path = args.out.with_extension("check.txt");
     let _ = std::fs::write(&check_report_path, "errors=0 warnings=0 us=0\n");
     let mut last_check_report = CheckReport::default();
@@ -3440,12 +3443,38 @@ fn main() -> anyhow::Result<()> {
                 unsafe {
                     std::env::set_var("RUSTD_BIN_CRATE", bin_crate);
                 }
+                if let Some(target_dir) = out.parent()
+                    && let Ok(rlibs_txt) = std::fs::read_to_string(target_dir.join("rlibs.txt"))
+                {
+                    let new_files: Vec<PathBuf> = rlibs_txt
+                        .lines()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|p| p.exists() && loaded_symbol_files.insert(p.clone()))
+                        .collect();
+                    if !new_files.is_empty()
+                        && let Ok(extra) = SymbolTable::load(&new_files, &check_root)
+                    {
+                        table.merge(extra);
+                    }
+                }
+                if !out.exists() && initial_empty_base_o.exists() {
+                    let _ = std::fs::copy(&initial_empty_base_o, out);
+                    let _ = std::fs::copy(&initial_empty_base_o, patch);
+                }
+                if !args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
+                    let _ = inject_hotpatch_rt(out, patch, &check_root);
+                }
                 args.out = out.clone();
                 args.patch = Some(patch.clone());
                 args.link_cmd = Some(link_cmd.clone());
                 baseline_cache_path = Some(args.out.with_extension("baseline.cache"));
                 check_report_path = args.out.with_extension("check.txt");
                 cold_bin_path = args.out.parent().and_then(|d| Some(d.join(d.file_name()?)));
+                if cold_bin_path.as_ref().is_some_and(|bp| !bp.exists()) {
+                    let _ = link(&args);
+                }
                 bin_index = cold_bin_path
                     .as_ref()
                     .filter(|p| p.exists())
@@ -3529,7 +3558,8 @@ fn main() -> anyhow::Result<()> {
                 db.apply_change(base_change);
             }
         }
-        let mut noticed = switched_target.then(|| (Instant::now(), Duration::ZERO));
+        let mut noticed = (switched_target && !dirty_files.is_empty())
+            .then(|| (Instant::now(), Duration::ZERO));
         // Keep scanning until a pass finds nothing new, so one save of several files is one build.
         // Files are read after that: a timestamp can be that of a write still under way, and
         // the rest of that write may not change it again. Whoever asks for a build has finished
