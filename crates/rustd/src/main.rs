@@ -3521,27 +3521,33 @@ fn main() -> anyhow::Result<()> {
             for wf in &mut files {
                 if let Watched::Source(id) = wf.file {
                     if let Some(orig_text) = new_base.get(&wf.path) {
-                        base_change.change_file(id, Some(orig_text.clone()));
-                        initial_texts.remove(&id);
-                        initial_adts.remove(&id);
-                        for &krate in ide_db::base_db::relevant_crates(&db, id) {
-                            let l = listed.of(&db, Crate::from(krate));
-                            hir::attach_db(&db, || {
-                                for &func in &l.functions {
-                                    let f = func
-                                        .lookup(&db)
-                                        .id
-                                        .file_id
-                                        .original_file_respecting_includes(&db)
-                                        .file_id(&db);
-                                    if f == id {
-                                        initial_serials.remove(&func);
+                        let cur_orig = initial_texts
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| db.file_text(id).text(&db).clone());
+                        if cur_orig.as_ref() != orig_text.as_str() {
+                            base_change.change_file(id, Some(orig_text.clone()));
+                            initial_texts.remove(&id);
+                            initial_adts.remove(&id);
+                            for &krate in ide_db::base_db::relevant_crates(&db, id) {
+                                let l = listed.of(&db, Crate::from(krate));
+                                hir::attach_db(&db, || {
+                                    for &func in &l.functions {
+                                        let f = func
+                                            .lookup(&db)
+                                            .id
+                                            .file_id
+                                            .original_file_respecting_includes(&db)
+                                            .file_id(&db);
+                                        if f == id {
+                                            initial_serials.remove(&func);
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            }
+                            wf.mtime = SystemTime::UNIX_EPOCH;
+                            has_base_change = true;
                         }
-                        wf.mtime = SystemTime::UNIX_EPOCH;
-                        has_base_change = true;
                     } else if dirty_files.remove(&id)
                         && let Ok(disk_txt) = std::fs::read_to_string(&wf.path)
                     {
