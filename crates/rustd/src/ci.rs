@@ -477,6 +477,7 @@ pub(crate) struct TestCaseOutcome {
     pub(crate) package: String,
     pub(crate) name: String,
     pub(crate) passed: bool,
+    pub(crate) zero_matched: bool,
     pub(crate) attempts: usize,
     pub(crate) duration: Duration,
     pub(crate) output: String,
@@ -568,6 +569,7 @@ pub(crate) fn run_isolated_test_suite(
                     let max_attempts = cfg.retries + 1;
                     let mut attempts = 0usize;
                     let mut passed = false;
+                    let mut zero_matched = false;
                     let mut combined_out = String::new();
                     let t0 = Instant::now();
                     while attempts < max_attempts {
@@ -582,12 +584,13 @@ pub(crate) fn run_isolated_test_suite(
                                 String::from_utf8_lossy(&out.stdout),
                                 String::from_utf8_lossy(&out.stderr)
                             );
-                            if out.status.success() && !combined_out.contains("0 passed; 0 failed") {
-                                passed = true;
-                                break;
-                            } else if out.status.success()
-                                && combined_out.contains("1 passed; 0 failed")
+                            if combined_out.contains("running 0 tests")
+                                || combined_out.contains("0 passed; 0 failed")
                             {
+                                zero_matched = true;
+                                break;
+                            }
+                            if out.status.success() {
                                 passed = true;
                                 break;
                             }
@@ -595,7 +598,9 @@ pub(crate) fn run_isolated_test_suite(
                     }
                     let dur = t0.elapsed();
                     if !json_mode {
-                        let status_str = if passed {
+                        let status_str = if zero_matched {
+                            "\x1b[1;35mERROR (0 tests matched)\x1b[0m".to_owned()
+                        } else if passed {
                             if attempts > 1 {
                                 format!("\x1b[1;33mFLAKY PASS ({attempts}/{max_attempts})\x1b[0m")
                             } else {
@@ -628,6 +633,7 @@ pub(crate) fn run_isolated_test_suite(
                             package: pkg.to_owned(),
                             name: test_name.clone(),
                             passed,
+                            zero_matched,
                             attempts,
                             duration: dur,
                             output: combined_out,

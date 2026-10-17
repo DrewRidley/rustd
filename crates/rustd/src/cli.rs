@@ -73,6 +73,7 @@ pub(crate) fn dispatch(sub: &str, args: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
+#[derive(Clone)]
 struct CliOpts {
     manifest_path: PathBuf,
     workspace_root: PathBuf,
@@ -289,7 +290,8 @@ fn parse_opts_with_mode(args: &[String], cfg_test: bool) -> anyhow::Result<CliOp
             | "--bins"
             | "--tests"
             | "--link-only"
-            | "--cargo" => {}
+            | "--cargo"
+            | "--full" => {}
             "-F" | "--features" => {
                 let val = it.next().context("--features requires feature name(s)")?;
                 for f in val.split([' ', ',']).map(str::trim).filter(|s| !s.is_empty()) {
@@ -992,10 +994,15 @@ fn cmd_check(args: &[String], req_cmd: &str) -> anyhow::Result<()> {
     }
 }
 
-fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<PathBuf> {
+fn ensure_clippy_script(
+    opts: &CliOpts,
+    paths: &TargetPaths,
+    with_tests: bool,
+) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&paths.dir)?;
     ensure_features_consistent(opts, paths);
-    let clippy_sh = paths.dir.join("clippy.sh");
+    let script_name = if with_tests { "clippy_tests.sh" } else { "clippy.sh" };
+    let clippy_sh = paths.dir.join(script_name);
     if let Ok(meta) = fs::metadata(&clippy_sh)
         && let Ok(mtime) = meta.modified()
     {
@@ -1012,7 +1019,12 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
             let deps_exist = shell_words(&txt)
                 .into_iter()
                 .filter_map(|w| w.split_once('=').map(|(_, r)| r.to_owned()))
-                .filter(|p| p.ends_with(".rmeta") || p.ends_with(".rlib") || p.ends_with(".dylib") || p.ends_with(".so"))
+                .filter(|p| {
+                    p.ends_with(".rmeta")
+                        || p.ends_with(".rlib")
+                        || p.ends_with(".dylib")
+                        || p.ends_with(".so")
+                })
                 .all(|p| Path::new(&p).exists());
             if deps_exist {
                 return Ok(clippy_sh);
@@ -1041,7 +1053,13 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
     let mut clippy_cmd = Command::new("cargo");
     clippy_cmd
         .current_dir(&opts.workspace_root)
-        .args(["clippy", "-p", pkg, "--profile", "test", "--no-deps", "-vv"])
+        .args(["clippy", "-p", pkg]);
+    if with_tests {
+        clippy_cmd.args(["--profile", "test"]);
+    }
+    clippy_cmd
+        .args(["--no-deps", "-vv"])
+        .env("CARGO_INCREMENTAL", "1")
         .env("RUSTC_WRAPPER", "")
         .env("CARGO_BUILD_RUSTC_WRAPPER", "");
     apply_feature_args(&mut clippy_cmd, opts);
@@ -1070,7 +1088,12 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
     let mut argv = Vec::new();
     let mut in_env = true;
     let mut skip_next = false;
-    let incr_dir = paths.dir.join("clippy-incr");
+    let mut saw_incr = false;
+    let incr_dir = paths.dir.join(if with_tests {
+        "clippy-incr-tests"
+    } else {
+        "clippy-incr"
+    });
     for w in words {
         if skip_next {
             skip_next = false;
@@ -1090,9 +1113,20 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
         }
         if w.starts_with("incremental=") {
             argv.push(format!("incremental={}", incr_dir.display()));
+            saw_incr = true;
+            continue;
+        }
+        if w.starts_with("-Cincremental=") {
+            argv.push("-C".to_owned());
+            argv.push(format!("incremental={}", incr_dir.display()));
+            saw_incr = true;
             continue;
         }
         argv.push(w);
+    }
+    if !saw_incr {
+        argv.push("-C".to_owned());
+        argv.push(format!("incremental={}", incr_dir.display()));
     }
     argv.push("--color=always".to_owned());
 
@@ -1115,6 +1149,8 @@ fn ensure_clippy_script(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<P
 }
 
 fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
+    let full = args.iter().any(|a| a == "--full");
+    let with_tests = args.iter().any(|a| a == "--tests" || a == "--test");
     let mut opts = parse_opts_with_mode(args, true)?;
     opts.cfg_test = true;
     if opts
@@ -1125,8 +1161,11 @@ fn cmd_clippy(args: &[String]) -> anyhow::Result<()> {
         eprintln!("[rustd] package excluded by --exclude; skipping clippy");
         return Ok(());
     }
+    if !full {
+        return cmd_check(args, "clippy");
+    }
     let paths = TargetPaths::new(&opts.workspace_root, &opts.bin_name);
-    let clippy_sh = ensure_clippy_script(&opts, &paths)?;
+    let clippy_sh = ensure_clippy_script(&opts, &paths, with_tests)?;
     let run_once = || -> anyhow::Result<bool> {
         let t0 = Instant::now();
         let out = Command::new(&clippy_sh)
@@ -1378,7 +1417,7 @@ fn resolve_test_args(opts: &CliOpts, paths: &TargetPaths) -> Vec<String> {
         let impacted: Vec<String> = txt
             .lines()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.starts_with("@target="))
             .map(str::to_owned)
             .collect();
         if !impacted.is_empty() && impacted.len() <= 64 {
@@ -1397,6 +1436,86 @@ fn resolve_test_args(opts: &CliOpts, paths: &TargetPaths) -> Vec<String> {
         }
     }
     opts.run_args.clone()
+}
+
+fn ensure_integration_test_bin(
+    opts: &CliOpts,
+    lib_paths: &TargetPaths,
+    target_krate: &str,
+) -> anyhow::Result<PathBuf> {
+    let mut t_opts = opts.clone();
+    t_opts.test_target = Some(target_krate.to_owned());
+    t_opts.bin_name = format!("{}-{target_krate}", opts.bin_name);
+    let t_paths = TargetPaths::new(&opts.workspace_root, &t_opts.bin_name);
+    if !t_paths.out_bin.exists() {
+        let _ = prepare_link_script_and_symbols(&t_opts, &t_paths)?;
+        let _ = fs::copy(&lib_paths.base_o, &t_paths.base_o);
+        let _ = fs::copy(&lib_paths.rt_o, &t_paths.rt_o);
+        let _ = fs::copy(
+            lib_paths.base_o.with_extension("cave.o"),
+            t_paths.base_o.with_extension("cave.o"),
+        );
+        let _ = fs::copy(&lib_paths.patch_o, &t_paths.patch_o);
+        if let Ok(sh_txt) = fs::read_to_string(&t_paths.link_sh) {
+            let patched_sh = sh_txt
+                .replace(
+                    &t_paths.rt_o.display().to_string(),
+                    &lib_paths.rt_o.display().to_string(),
+                )
+                .replace(
+                    &t_paths.patch_o.display().to_string(),
+                    &lib_paths.patch_o.display().to_string(),
+                );
+            let _ = fs::write(&t_paths.link_sh, patched_sh);
+        }
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&t_paths.link_sh)
+            .status()
+            .with_context(|| format!("linking integration test target `{target_krate}`"))?;
+        ensure!(
+            status.success(),
+            "linking integration test target `{target_krate}` failed ({status})"
+        );
+    }
+    Ok(t_paths.out_bin)
+}
+
+fn find_package_dir(workspace_root: &Path, pkg_name: &str) -> Option<PathBuf> {
+    let mut stack = vec![workspace_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.exists()
+            && let Ok(txt) = fs::read_to_string(&manifest)
+        {
+            let mut in_pkg = false;
+            for line in txt.lines() {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    in_pkg = t == "[package]";
+                    continue;
+                }
+                if in_pkg
+                    && let Some(rest) = t.strip_prefix("name")
+                    && let Some((_, val)) = rest.split_once('=')
+                {
+                    let name = val.trim().trim_matches('"').trim_matches('\'');
+                    if name == pkg_name {
+                        return Some(dir);
+                    }
+                    break;
+                }
+            }
+        }
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && !p.ends_with("target") && !p.ends_with(".git") {
+                stack.push(p);
+            }
+        }
+    }
+    None
 }
 
 fn stop_target_daemon(paths: &TargetPaths) {
@@ -1510,7 +1629,13 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
         let tests_txt = paths.base_o.with_extension("tests.txt");
         if let Ok(txt) = fs::read_to_string(tests_txt) {
             for line in txt.lines().map(str::trim).filter(|s| !s.is_empty()) {
-                println!("{line}");
+                if let Some(rest) = line.strip_prefix("@target=")
+                    && let Some((tk, rel)) = rest.split_once('\t')
+                {
+                    println!("{tk}::{rel}");
+                } else {
+                    println!("{line}");
+                }
             }
         }
         cleanup_oneshot();
@@ -1528,8 +1653,9 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
             cleanup_oneshot();
             std::process::exit(101);
         }
+        let lib_only = args.iter().any(|a| a == "--lib");
         let tests_txt = paths.base_o.with_extension("tests.txt");
-        let mut wanted: Vec<String> = fs::read_to_string(&tests_txt)
+        let mut raw_wanted: Vec<String> = fs::read_to_string(&tests_txt)
             .unwrap_or_default()
             .lines()
             .map(str::trim)
@@ -1540,9 +1666,42 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
             && let Ok(also_txt) = fs::read_to_string(also_path)
         {
             for line in also_txt.lines().map(str::trim).filter(|s| !s.is_empty()) {
-                if !wanted.iter().any(|w| w == line) {
-                    wanted.push(line.to_owned());
+                if !raw_wanted.iter().any(|w| w == line) {
+                    raw_wanted.push(line.to_owned());
                 }
+            }
+        }
+        let mut lib_wanted = Vec::new();
+        let mut integration_wanted: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let pkg_dir = opts
+            .pkg_name
+            .as_deref()
+            .and_then(|p| find_package_dir(&opts.workspace_root, p))
+            .or_else(|| opts.manifest_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| opts.workspace_root.clone());
+        for w in raw_wanted {
+            if let Some(rest) = w.strip_prefix("@target=")
+                && let Some((tk, rel)) = rest.split_once('\t')
+            {
+                if !lib_only {
+                    let list = integration_wanted.entry(tk.to_owned()).or_default();
+                    if !list.iter().any(|x| x == rel) {
+                        list.push(rel.to_owned());
+                    }
+                }
+            } else if let Some((tk, rel)) = w.split_once("::")
+                && (pkg_dir.join("tests").join(tk).exists()
+                    || pkg_dir.join("tests").join(format!("{tk}.rs")).exists())
+            {
+                if !lib_only {
+                    let list = integration_wanted.entry(tk.to_owned()).or_default();
+                    if !list.iter().any(|x| x == rel) {
+                        list.push(rel.to_owned());
+                    }
+                }
+            } else if !lib_wanted.contains(&w) {
+                lib_wanted.push(w);
             }
         }
         let explain_txt = paths.base_o.with_extension("explain.txt");
@@ -1554,29 +1713,52 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
                 }
             }
         }
-        let exact_tests = crate::ci::expand_exact_tests(&paths.out_bin, &wanted);
-        let cfg = crate::ci::NextestConfig::load(&opts.workspace_root, opts.retries);
+        let exact_lib_tests = crate::ci::expand_exact_tests(&paths.out_bin, &lib_wanted);
+        let mut target_runs: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
         let raw_pkg = opts.pkg_name.as_deref().unwrap_or(&opts.bin_name);
         let pkg = raw_pkg.strip_prefix("test-").unwrap_or(raw_pkg);
+        if !exact_lib_tests.is_empty() {
+            target_runs.push((pkg.to_owned(), paths.out_bin.clone(), exact_lib_tests));
+        }
+        for (tk, tk_wanted) in integration_wanted {
+            if tk_wanted.is_empty() {
+                continue;
+            }
+            let tk_bin = ensure_integration_test_bin(&opts, &paths, &tk)?;
+            let exact_tk = crate::ci::expand_exact_tests(&tk_bin, &tk_wanted);
+            if !exact_tk.is_empty() {
+                target_runs.push((format!("{pkg}::{tk}"), tk_bin, exact_tk));
+            }
+        }
+        let total_tests: usize = target_runs.iter().map(|(_, _, t)| t.len()).sum();
+        let cfg = crate::ci::NextestConfig::load(&opts.workspace_root, opts.retries);
         let t0 = Instant::now();
         if !opts.json {
             eprintln!(
-                "    \x1b[1;32mStarting\x1b[0m {} impacted test(s) across 1 binary (isolated processes)",
-                exact_tests.len()
+                "    \x1b[1;32mStarting\x1b[0m {} impacted test(s) across {} binary(s) (isolated processes)",
+                total_tests,
+                target_runs.len().max(1)
             );
         }
-        let outcomes = crate::ci::run_isolated_test_suite(
-            pkg,
-            &paths.out_bin,
-            &exact_tests,
-            &reasons,
-            &cfg,
-            &opts.run_args,
-            opts.json,
-        );
+        let mut outcomes = Vec::with_capacity(total_tests);
+        for (run_pkg, run_bin, run_tests) in &target_runs {
+            outcomes.extend(crate::ci::run_isolated_test_suite(
+                run_pkg,
+                run_bin,
+                run_tests,
+                &reasons,
+                &cfg,
+                &opts.run_args,
+                opts.json,
+            ));
+        }
         let total_dur = t0.elapsed();
+        let zero_matched_count = outcomes.iter().filter(|o| o.zero_matched).count();
         let passed = outcomes.iter().filter(|o| o.passed).count();
-        let failed = outcomes.len() - passed;
+        let failed = outcomes
+            .iter()
+            .filter(|o| !o.passed && !o.zero_matched)
+            .count();
         if let Some(junit_path) = &opts.junit {
             crate::ci::write_junit_xml(junit_path, &outcomes, total_dur)?;
         }
@@ -1584,14 +1766,22 @@ fn cmd_test(args: &[String]) -> anyhow::Result<()> {
             crate::ci::print_json_summary(&outcomes, total_dur);
         } else {
             eprintln!(
-                "------------\n     \x1b[1;32mSummary\x1b[0m [{:>7.3}s] {} tests run: {} passed, {} failed",
+                "------------\n     \x1b[1;32mSummary\x1b[0m [{:>7.3}s] {} tests run: {} passed, {} failed{}",
                 total_dur.as_secs_f64(),
                 outcomes.len(),
                 passed,
-                failed
+                failed,
+                if zero_matched_count > 0 {
+                    format!(", {zero_matched_count} unmatched (runner error)")
+                } else {
+                    String::new()
+                }
             );
         }
         cleanup_oneshot();
+        if zero_matched_count > 0 {
+            std::process::exit(2);
+        }
         if failed > 0 {
             std::process::exit(101);
         }

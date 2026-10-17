@@ -920,6 +920,8 @@ pub struct FunctionDeps {
     pub traits: FxHashSet<hir_def::TraitId>,
     pub trait_callees: FxHashSet<(FunctionId, hir_def::AdtId)>,
     pub local_callee_count: usize,
+    pub string_lits: Vec<String>,
+    pub match_dispatch_arms: Vec<(FunctionId, String)>,
 }
 
 #[salsa::tracked(returns(ref))]
@@ -1000,6 +1002,43 @@ pub fn function_deps(db: &dyn HirDatabase, func: FunctionId) -> FunctionDeps {
         .iter()
         .filter(|&&c| c.krate(db).data(db).origin.is_local())
         .count();
+    let body = hir_def::expr_store::Body::of(db, func.into());
+    for (_, expr) in body.exprs() {
+        match expr {
+            hir_def::hir::Expr::Literal(hir_def::hir::Literal::String(s)) => {
+                let text = s.as_str();
+                if text.len() >= 3
+                    && text.len() <= 512
+                    && !deps.string_lits.iter().any(|x| x == text)
+                {
+                    deps.string_lits.push(text.to_owned());
+                }
+            }
+            hir_def::hir::Expr::Match { arms, .. } if arms.len() > 8 => {
+                for arm in arms.iter() {
+                    if let hir_def::hir::Pat::Lit(lit_expr) = body[arm.pat]
+                        && let hir_def::hir::Expr::Literal(hir_def::hir::Literal::String(s)) =
+                            &body[lit_expr]
+                    {
+                        let key = s.as_str();
+                        if key.len() >= 3 && key.len() <= 128 {
+                            let mut stack = vec![arm.expr];
+                            while let Some(cur) = stack.pop() {
+                                if let Some(ty) = infer.type_of_expr.get(cur)
+                                    && let TyKind::FnDef(callable, _) = ty.as_ref().kind()
+                                    && let CallableDefId::FunctionId(f) = callable.0
+                                {
+                                    deps.match_dispatch_arms.push((f, key.to_owned()));
+                                }
+                                body.walk_child_exprs(cur, |child| stack.push(child));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     deps
 }
 
