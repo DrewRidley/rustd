@@ -2865,7 +2865,7 @@ fn cast_kind<'db>(
     })
 }
 
-#[salsa::tracked(lru = 256, returns(as_ref), cycle_result = mir_body_for_closure_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_closure_cycle_result)]
 pub fn mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
@@ -2874,7 +2874,7 @@ pub fn mir_body_for_closure_query<'db>(
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
-#[salsa::tracked(lru = 256, returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
 pub fn mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
@@ -3121,7 +3121,7 @@ fn lower_closure_body<'db>(
     Ok(ctx.result)
 }
 
-#[salsa::tracked(lru = 256, returns(as_ref), cycle_result = mir_body_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result)]
 pub fn mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,

@@ -46,7 +46,7 @@ struct Symbol {
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
     pub(crate) fn load(files: &[PathBuf], root: &Path) -> anyhow::Result<SymbolTable> {
-        let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(16);
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut per_file: Vec<(Option<(String, PathBuf)>, Vec<String>)> =
             (0..files.len()).map(|_| (None, Vec::new())).collect();

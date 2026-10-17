@@ -1091,7 +1091,7 @@ impl PartialOrd for UpvarCapture {
 
 #[salsa::tracked]
 impl<'db> InferenceResult<'db> {
-    #[salsa::tracked(lru = 512, returns(ref), cycle_result = infer_cycle_result)]
+    #[salsa::tracked(returns(ref), cycle_result = infer_cycle_result)]
     fn for_body(db: &dyn HirDatabase, def: DefWithBodyId) -> InferenceResult<'_> {
         infer_query(db, def)
     }

@@ -810,7 +810,9 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
         .unwrap_or(&opts.bin_name)
         .replace('-', "_");
     if paths.rustd_sock.exists() {
-        let req = if paths.out_bin.exists() {
+        let is_symlink = fs::symlink_metadata(&paths.rustd_sock)
+            .is_ok_and(|m| m.file_type().is_symlink());
+        let req = if is_symlink {
             format!(
                 "switch\t{bin_crate}\t{}\t{}\t{}",
                 paths.base_o.display(),
@@ -821,8 +823,11 @@ fn ensure_daemon(opts: &CliOpts, paths: &TargetPaths) -> anyhow::Result<Option<S
             "patch".to_owned()
         };
         if let Ok(reply) = send_unix_line(&paths.rustd_sock, &req) {
-            return Ok(Some(reply));
+            if !reply.starts_with("error: unknown request") {
+                return Ok(Some(reply));
+            }
         }
+        stop_target_daemon(paths);
     }
     let _ = fs::remove_file(&paths.rustd_sock);
     let _ = fs::remove_file(&paths.ack);

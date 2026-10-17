@@ -1987,7 +1987,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// that the object has no use for is only wasted.
     fn compile_ahead(&mut self) {
         // A patch calls the base's copy of most of what it reaches.
-        if self.base.is_some() || self.pending.is_empty() {
+        if self.base.is_some() || self.patching || self.pending.is_empty() {
             return;
         }
         struct Ahead {
@@ -2021,19 +2021,21 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 state.working += 1;
                 drop(state);
                 let mut found = Vec::new();
-                if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
-                    for request in &compiled.requests.funcs {
-                        let FuncTarget::Instance(callee, asked) = &request.target else {
-                            continue;
-                        };
-                        // A function without generic arguments is a root, called by its symbol.
-                        let root = matches!(callee.def, InstanceDef::Fn(_))
-                            && callee.args.as_ref().is_empty();
-                        if !root && !rejected.contains_key(callee) {
-                            found.push((callee.clone(), homes.home(db, callee, asked)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
+                        for request in &compiled.requests.funcs {
+                            let FuncTarget::Instance(callee, asked) = &request.target else {
+                                continue;
+                            };
+                            // A function without generic arguments is a root, called by its symbol.
+                            let root = matches!(callee.def, InstanceDef::Fn(_))
+                                && callee.args.as_ref().is_empty();
+                            if !root && !rejected.contains_key(callee) {
+                                found.push((callee.clone(), homes.home(db, callee, asked)));
+                            }
                         }
                     }
-                }
+                }));
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
                 for it in found {

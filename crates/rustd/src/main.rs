@@ -793,7 +793,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     // A crate with fewer transitive dependencies must be resolved before one that depends on it.
     crates.sort_by_cached_key(|&c| c.transitive_deps(db).len());
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(16);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let db = db.clone();
@@ -3150,16 +3150,6 @@ fn main() -> anyhow::Result<()> {
         return cli::dispatch(&first, std::env::args().skip(2).collect());
     }
     let mut args = Args::parse()?;
-    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-        unsafe {
-            std::env::set_var("RAYON_NUM_THREADS", "8");
-        }
-    }
-    if std::env::var_os("RA_LRU_CAP").is_none() {
-        unsafe {
-            std::env::set_var("RA_LRU_CAP", "256");
-        }
-    }
     if args.target.as_deref().is_some_and(|t| t.starts_with("wasm32")) {
         hir_ty::mir::codegen::WASM32_TARGET.store(true, std::sync::atomic::Ordering::Relaxed);
     }

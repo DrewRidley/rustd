@@ -326,6 +326,9 @@ pub(crate) fn write_since_baseline_cache(
         put_str(&mut out, &df.abs_path.to_string_lossy());
         put_str(&mut out, &df.base_text);
     }
+    if fs::read(baseline_cache_path).ok().as_deref() == Some(out.as_slice()) {
+        return Ok(());
+    }
     fs::write(baseline_cache_path, out)?;
     Ok(())
 }
