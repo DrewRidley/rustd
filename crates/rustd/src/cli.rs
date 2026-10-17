@@ -544,6 +544,31 @@ fn features_fingerprint(opts: &CliOpts) -> String {
 }
 
 fn ensure_features_consistent(opts: &CliOpts, paths: &TargetPaths) {
+    let cur_root = opts.workspace_root.display().to_string();
+    let root_file = paths.dir.join("workspace.root");
+    if let Ok(prev_root) = fs::read_to_string(&root_file) {
+        let prev_root = prev_root.trim();
+        if !prev_root.is_empty() && prev_root != cur_root {
+            for fname in [
+                "link_args.txt",
+                "link.sh",
+                "rlibs.txt",
+                "clippy.sh",
+                "clippy_tests.sh",
+            ] {
+                let fpath = paths.dir.join(fname);
+                if let Ok(txt) = fs::read_to_string(&fpath)
+                    && txt.contains(prev_root)
+                {
+                    let _ = fs::write(&fpath, txt.replace(prev_root, &cur_root));
+                }
+            }
+            let _ = fs::remove_file(paths.dir.join("clippy.cache"));
+            let _ = fs::remove_file(paths.dir.join("clippy_tests.cache"));
+        }
+    }
+    let _ = fs::create_dir_all(&paths.dir);
+    let _ = fs::write(&root_file, format!("{cur_root}\n"));
     let feat_file = paths.dir.join("features.key");
     let ws_feat_file = opts
         .workspace_root
