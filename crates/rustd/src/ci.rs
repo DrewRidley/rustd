@@ -508,7 +508,7 @@ pub(crate) fn expand_exact_tests_with_total(
     }
     let available = list_tests_cached(test_bin);
     let Some(available) = available else {
-        return (wanted.to_vec(), usize::MAX);
+        return (Vec::new(), 0);
     };
     let total = available.len();
     let mut expanded = Vec::new();
@@ -523,6 +523,57 @@ pub(crate) fn expand_exact_tests_with_total(
         }
     }
     (expanded, total)
+}
+
+pub(crate) fn runtime_lib_env(test_bin: &Path) -> Vec<(String, String)> {
+    static SYSROOT_LIBS: std::sync::LazyLock<Vec<PathBuf>> = std::sync::LazyLock::new(|| {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let mut dirs = Vec::new();
+        for flag in ["--print=target-libdir", "--print=sysroot"] {
+            if let Ok(out) = Command::new(&rustc).arg(flag).output()
+                && out.status.success()
+            {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if !s.is_empty() {
+                    let p = if flag == "--print=sysroot" {
+                        Path::new(&s).join("lib")
+                    } else {
+                        PathBuf::from(s)
+                    };
+                    if p.is_dir() && !dirs.contains(&p) {
+                        dirs.push(p);
+                    }
+                }
+            }
+        }
+        dirs
+    });
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = test_bin.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    for d in SYSROOT_LIBS.iter() {
+        if !paths.contains(d) {
+            paths.push(d.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for var in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
+        let mut combined = paths.clone();
+        if let Some(existing) = std::env::var_os(var) {
+            for p in std::env::split_paths(&existing) {
+                if !p.as_os_str().is_empty() && !combined.contains(&p) {
+                    combined.push(p);
+                }
+            }
+        }
+        if let Ok(joined) = std::env::join_paths(&combined)
+            && let Some(s) = joined.to_str()
+        {
+            out.push((var.to_owned(), s.to_owned()));
+        }
+    }
+    out
 }
 
 pub(crate) fn list_tests_cached(test_bin: &Path) -> Option<Vec<String>> {
@@ -545,10 +596,10 @@ pub(crate) fn list_tests_cached(test_bin: &Path) -> Option<Vec<String>> {
                 .collect(),
         );
     }
-    let out = Command::new(test_bin)
-        .args(["--list", "--format=terse"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(test_bin);
+    cmd.args(["--list", "--format=terse"]);
+    cmd.envs(runtime_lib_env(test_bin));
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -621,6 +672,7 @@ pub(crate) fn run_isolated_test_suite(
                         let mut cmd = Command::new(test_bin);
                         cmd.arg("--exact").arg(test_name);
                         cmd.args(extra_args);
+                        cmd.envs(runtime_lib_env(test_bin));
                         cmd.envs(pkg_env.iter().cloned());
                         if let Some(dir) = pkg_dir {
                             cmd.current_dir(dir);

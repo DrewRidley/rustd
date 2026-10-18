@@ -331,6 +331,88 @@ pub(crate) fn select_dirty_and_tests(
         });
     }
 
+    let mut program_crates: FxHashSet<ide_db::base_db::Crate> = FxHashSet::default();
+    for krate in std::iter::once(&args.krate).chain(&args.batch) {
+        if let Ok(mut named) = crate::crates_named(db, krate, args) {
+            let linked = |krate: &Crate| {
+                let name = krate.display_name(db);
+                let root = crate::crate_root_file(db, *krate);
+                name.zip(root)
+                    .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
+            };
+            if named.iter().any(linked) {
+                named.retain(linked);
+            }
+            for c in named {
+                program_crates.insert(c.into());
+            }
+        }
+    }
+    let in_program = |krate: ide_db::base_db::Crate| {
+        program_crates.is_empty() || program_crates.contains(&krate)
+    };
+
+    // Build candidate crates in topological order (including transitive_rev_deps)
+    let mut candidate_crates = Vec::new();
+    let mut seen_crates = FxHashSet::default();
+    for &file in &dirty_files {
+        for &krate in ide_db::base_db::relevant_crates(db, file).iter() {
+            if !args.members.contains(&krate) || !in_program(krate) {
+                continue;
+            }
+            let c = Crate::from(krate);
+            if seen_crates.insert(krate) {
+                candidate_crates.push(c);
+            }
+        }
+    }
+
+    if candidate_crates.is_empty() {
+        if args.cfg_test || args.dev_deps {
+            let _ = std::fs::write(args.out.with_extension("tests.txt"), "");
+            let _ = std::fs::write(args.out.with_extension("explain.txt"), "");
+        }
+        return Ok(ImpactSelection {
+            entries: Vec::new(),
+            on_demand: Vec::new(),
+            local_crates: Vec::new(),
+        });
+    }
+
+    let bin_crate_env = std::env::var("RUSTD_BIN_CRATE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| args.krate.clone());
+    if let Ok(bin_crates) = crate::crates_named(db, &bin_crate_env, args) {
+        let mut bin_deps = FxHashSet::default();
+        for &bc_krate in &bin_crates {
+            let raw: ide_db::base_db::Crate = bc_krate.into();
+            bin_deps.extend(raw.transitive_deps(db));
+        }
+        let base_candidates = candidate_crates.clone();
+        for base_c in base_candidates {
+            let raw_base: ide_db::base_db::Crate = base_c.into();
+            for rev in raw_base.transitive_rev_deps(db) {
+                if bin_deps.contains(&rev)
+                    && args.members.contains(&rev)
+                    && in_program(rev)
+                    && seen_crates.insert(rev)
+                {
+                    candidate_crates.push(Crate::from(rev));
+                }
+            }
+        }
+        for bc_krate in bin_crates {
+            let raw: ide_db::base_db::Crate = bc_krate.into();
+            if in_program(raw) && seen_crates.insert(raw) {
+                let l = listed.of(db, bc_krate);
+                if args.cfg_test || l.functions.len() <= 500 {
+                    candidate_crates.push(bc_krate);
+                }
+            }
+        }
+    }
+
     // Identify modified ADTs and consts/statics in dirty files
     let mut changed_adts: FxHashSet<hir_def::AdtId> = FxHashSet::default();
     let mut changed_const_names: FxHashSet<String> = FxHashSet::default();
@@ -405,76 +487,6 @@ pub(crate) fn select_dirty_and_tests(
             }
         }
     });
-
-    let mut program_crates: FxHashSet<ide_db::base_db::Crate> = FxHashSet::default();
-    for krate in std::iter::once(&args.krate).chain(&args.batch) {
-        if let Ok(mut named) = crate::crates_named(db, krate, args) {
-            let linked = |krate: &Crate| {
-                let name = krate.display_name(db);
-                let root = crate::crate_root_file(db, *krate);
-                name.zip(root)
-                    .is_some_and(|(name, root)| table.links(name.crate_name().as_str(), &root))
-            };
-            if named.iter().any(linked) {
-                named.retain(linked);
-            }
-            for c in named {
-                program_crates.insert(c.into());
-            }
-        }
-    }
-    let in_program = |krate: ide_db::base_db::Crate| {
-        program_crates.is_empty() || program_crates.contains(&krate)
-    };
-
-    // Build candidate crates in topological order (including transitive_rev_deps)
-    let mut candidate_crates = Vec::new();
-    let mut seen_crates = FxHashSet::default();
-    for &file in &dirty_files {
-        for &krate in ide_db::base_db::relevant_crates(db, file).iter() {
-            if !args.members.contains(&krate) || !in_program(krate) {
-                continue;
-            }
-            let c = Crate::from(krate);
-            if seen_crates.insert(krate) {
-                candidate_crates.push(c);
-            }
-        }
-    }
-
-    let bin_crate_env = std::env::var("RUSTD_BIN_CRATE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| args.krate.clone());
-    if let Ok(bin_crates) = crate::crates_named(db, &bin_crate_env, args) {
-        let mut bin_deps = FxHashSet::default();
-        for &bc_krate in &bin_crates {
-            let raw: ide_db::base_db::Crate = bc_krate.into();
-            bin_deps.extend(raw.transitive_deps(db));
-        }
-        let base_candidates = candidate_crates.clone();
-        for base_c in base_candidates {
-            let raw_base: ide_db::base_db::Crate = base_c.into();
-            for rev in raw_base.transitive_rev_deps(db) {
-                if bin_deps.contains(&rev)
-                    && args.members.contains(&rev)
-                    && in_program(rev)
-                    && seen_crates.insert(rev)
-                {
-                    candidate_crates.push(Crate::from(rev));
-                }
-            }
-        }
-        for bc_krate in bin_crates {
-            let raw: ide_db::base_db::Crate = bc_krate.into();
-            if in_program(raw) && seen_crates.insert(raw) {
-                let l = listed.of(db, bc_krate);
-                if args.cfg_test || l.functions.len() <= 500 {
-                    candidate_crates.push(bc_krate);
-                }
-            }
-        }
-    }
 
     let mut impacted_tests = Vec::new();
     let mut impacted_explains = Vec::new();

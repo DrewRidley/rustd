@@ -680,6 +680,7 @@ fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> 
         env.push(("OUT_DIR".to_owned(), script.out_dir.to_string()));
         env.extend(script.env.iter().cloned());
     }
+    env.extend(crate::ci::runtime_lib_env(&pkg_dir));
     env
 }
 
