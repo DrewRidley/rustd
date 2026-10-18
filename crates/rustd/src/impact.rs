@@ -583,25 +583,24 @@ pub(crate) fn select_dirty_and_tests(
                         && let AssocItemContainer::Impl(imp) = assoc.container(db)
                     {
                         let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
+                        if in_dirty_changed
+                            && let Some(adt_id) = impl_adt
+                        {
+                            test_adts.insert(adt_id);
+                            let adt_name = hir::Adt::from(adt_id)
+                                .name(db)
+                                .display(db, Edition::CURRENT)
+                                .to_string();
+                            adt_reasons.entry(adt_id).or_insert_with(|| {
+                                format!("type `{adt_name}` <- `{fn_label}` edited")
+                            });
+                        }
                         if let Some(trait_) = imp.trait_(db) {
                             let trait_id = hir_def::TraitId::from(trait_);
                             let trait_name =
                                 trait_.name(db).display(db, Edition::CURRENT).to_string();
                             let is_local_trait =
                                 trait_.module(db).krate(db).origin(db).is_local();
-                            if !is_local_trait
-                                && in_dirty_changed
-                                && let Some(adt_id) = impl_adt
-                            {
-                                test_adts.insert(adt_id);
-                                let adt_name = hir::Adt::from(adt_id)
-                                    .name(db)
-                                    .display(db, Edition::CURRENT)
-                                    .to_string();
-                                adt_reasons.entry(adt_id).or_insert_with(|| {
-                                    format!("type `{adt_name}` <- `{fn_label}` edited")
-                                });
-                            }
                             let mut trait_impl_count = 0usize;
                             if is_local_trait {
                                 hir_ty::method_resolution::TraitImpls::for_crate(db, c.into())
@@ -715,6 +714,18 @@ pub(crate) fn select_dirty_and_tests(
             if !warmed {
                 warm_deps(db, &l.functions);
             }
+            let mut active_test_adts: FxHashSet<hir_def::AdtId> = global_test_adts
+                .iter()
+                .copied()
+                .filter(|adt_id| {
+                    changed_adts.contains(adt_id)
+                        || l.functions
+                            .iter()
+                            .filter(|&&f| cached_function_deps(db, f).adts.contains(adt_id))
+                            .nth(128)
+                            .is_none()
+                })
+                .collect();
             let mut test_reach = global_impacted_fns.clone();
             hir::attach_db(db, || {
                 loop {
@@ -765,7 +776,7 @@ pub(crate) fn select_dirty_and_tests(
                                 .insert(func, format!("`{fn_label}` <- calls {prev}"));
                             added.push(func);
                         } else if let Some(&adt_id) =
-                            deps.adts.iter().find(|a| global_test_adts.contains(a))
+                            deps.adts.iter().find(|a| active_test_adts.contains(a))
                         {
                             let fn_label =
                                 resolver.path(func).unwrap_or_else(|| "fn".to_owned());
@@ -818,10 +829,30 @@ pub(crate) fn select_dirty_and_tests(
                             .unwrap_or_else(|| "reached fn".to_owned());
                         if let Some(assoc) = h_fn.as_assoc_item(db)
                             && let AssocItemContainer::Impl(imp) = assoc.container(db)
-                            && let Some(trait_) = imp.trait_(db)
                         {
                             let impl_adt = imp.self_ty(db).as_adt().map(hir_def::AdtId::from);
-                            let trait_id = hir_def::TraitId::from(trait_);
+                            if let Some(adt_id) = impl_adt
+                                && !active_test_adts.contains(&adt_id)
+                                && l.functions
+                                    .iter()
+                                    .filter(|&&fn_id| {
+                                        cached_function_deps(db, fn_id).adts.contains(&adt_id)
+                                    })
+                                    .nth(64)
+                                    .is_none()
+                            {
+                                active_test_adts.insert(adt_id);
+                                global_test_adts.insert(adt_id);
+                                let adt_name = hir::Adt::from(adt_id)
+                                    .name(db)
+                                    .display(db, Edition::CURRENT)
+                                    .to_string();
+                                adt_reasons
+                                    .entry(adt_id)
+                                    .or_insert_with(|| format!("type `{adt_name}` <- {fn_why}"));
+                            }
+                            if let Some(trait_) = imp.trait_(db) {
+                                let trait_id = hir_def::TraitId::from(trait_);
                             let is_local_trait =
                                 trait_.module(db).krate(db).origin(db).is_local();
                             let mut trait_impl_count = 0usize;
@@ -866,6 +897,7 @@ pub(crate) fn select_dirty_and_tests(
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     }
