@@ -232,7 +232,13 @@ impl Built {
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
             Subcommand::Build | Subcommand::Run => cargo.arg("build"),
-            Subcommand::Test => cargo.args(["test", "--no-run"]),
+            Subcommand::Test => {
+                cargo.args(["test", "--no-run"]);
+                if asked.has_ci_test_flags() && !asked.flags.selects_targets {
+                    cargo.args(["--lib", "--tests"]);
+                }
+                &mut cargo
+            }
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
         cargo.env("RUSTC_WORKSPACE_WRAPPER", std::env::current_exe()?);
@@ -387,6 +393,11 @@ impl State {
             cfg_test: unit_test,
             dev_deps: asked.subcommand == Subcommand::Test,
             features: asked.flags.features.clone(),
+            no_default_features: asked.flags.no_default_features,
+            all_features: asked.flags.all_features,
+            workspace: asked.flags.workspace,
+            packages: asked.flags.packages.clone(),
+            exclude: asked.flags.excluded_packages.clone(),
             target: asked.target(),
             env: worker_env(),
         };
@@ -566,19 +577,22 @@ fn used_by(artifacts: &[&Artifact], records: &[Record]) -> Vec<Record> {
 /// workspace with. `Err` is why the selection is one it does not load.
 fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBuf, String> {
     let root = metadata.workspace_root.as_std_path();
-    if let Some(named) = asked.flags.packages.first() {
+    for named in &asked.flags.packages {
+        let name = named.split('@').next().unwrap_or(named);
+        if !metadata.workspace_packages().iter().any(|it| it.name.as_str() == name) {
+            return Err(format!("`-p {named}` is not a package of the workspace"));
+        }
+    }
+    if asked.flags.packages.len() == 1 && !asked.flags.workspace && !asked.flags.excludes {
+        let named = &asked.flags.packages[0];
         let name = named.split('@').next().unwrap_or(named);
         let package = metadata.workspace_packages().into_iter().find(|it| it.name.as_str() == name);
         return package
             .map(package_dir)
             .ok_or(format!("`-p {named}` is not a package of the workspace"));
     }
-    if asked.flags.workspace {
-        let virtual_root = metadata.root_package().is_none();
-        return match virtual_root || metadata.workspace_members.len() == 1 {
-            true => Ok(root.to_owned()),
-            false => Err("--workspace of a workspace whose root is a package".to_owned()),
-        };
+    if asked.flags.workspace || asked.flags.packages.len() > 1 || asked.flags.excludes {
+        return Ok(root.to_owned());
     }
     let start = match &asked.flags.manifest_path {
         Some(manifest) => cwd.join(manifest).parent().map(Path::to_owned).unwrap_or_default(),
@@ -773,8 +787,36 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
         }
     }
     if files.is_empty() && variables.is_empty() {
-        let what = format!("the build script of `{}` reruns for any change,", package.name);
-        files.push(Guard::Tree { what, dir });
+        let build_rs = package
+            .targets
+            .iter()
+            .find(|t| t.is_custom_build())
+            .map(|t| t.src_path.clone().into_std_path_buf());
+        let reads_tree = build_rs
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_none_or(|src| {
+                [
+                    "fs::",
+                    "File::",
+                    "read_to_string",
+                    "read_dir",
+                    "walkdir",
+                    "Command",
+                    "include_str!",
+                    "include_bytes!",
+                ]
+                .iter()
+                .any(|pat| src.contains(pat))
+            });
+        if !reads_tree
+            && let Some(build_rs) = build_rs
+        {
+            files.push(Guard::files(&what, [build_rs]));
+        } else {
+            let what = format!("the build script of `{}` reruns for any change,", package.name);
+            files.push(Guard::Tree { what, dir });
+        }
     }
     let out_dir = script.out_dir.clone().into_std_path_buf();
     if script::can_rerun(&out_dir) {

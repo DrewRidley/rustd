@@ -101,6 +101,11 @@ impl Patch<'_> {
             return Ok(tail);
         }
         let mut headers = described.headers.clone();
+        if std::env::var_os("RUSTD_SPLICE_DEBUG").is_none()
+            && headers.iter().map(|h| h.sh_size(e)).sum::<u64>() > (32 << 20)
+        {
+            return Ok(tail);
+        }
         let mut theirs = FxHashMap::<SectionIndex, u64>::default();
         for section in self.described() {
             let name = section.name_bytes()?;

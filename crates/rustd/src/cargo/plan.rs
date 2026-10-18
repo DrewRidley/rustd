@@ -117,7 +117,9 @@ impl Plan {
 fn unsupported(unit: &Record) -> Option<String> {
     let name = &unit.crate_name;
     let off = |value: Option<&str>| matches!(value, None | Some("off" | "no" | "n" | "false"));
-    if !matches!(unit.codegen("opt-level"), None | Some("0")) {
+    if std::env::var_os("RUSTD_STRICT_OPT_LEVEL").is_some()
+        && !matches!(unit.codegen("opt-level"), None | Some("0"))
+    {
         let level = unit.codegen("opt-level").unwrap_or_default();
         return Some(format!("`{name}` is built with opt-level={level}"));
     }
@@ -134,8 +136,35 @@ fn unsupported(unit: &Record) -> Option<String> {
             return Some(format!("`{name}` is built with -C {flag}"));
         }
     }
-    if unit.args.iter().any(|it| it.starts_with("-Z")) {
-        return Some(format!("`{name}` is built with unstable flags"));
+    let allowed_z = |z: &str| {
+        let key = z.split('=').next().unwrap_or(z).trim();
+        matches!(
+            key,
+            "threads"
+                | "share-generics"
+                | "macro-backtrace"
+                | "proc-macro-backtrace"
+                | "time-passes"
+                | "self-profile"
+                | "unstable-options"
+        )
+    };
+    let mut i = 0;
+    while i < unit.args.len() {
+        let arg = &unit.args[i];
+        if arg == "-Z" {
+            let val = unit.args.get(i + 1).map_or("", String::as_str);
+            if !allowed_z(val) {
+                return Some(format!("`{name}` is built with unstable flag -Z {val}"));
+            }
+            i += 2;
+            continue;
+        } else if let Some(rest) = arg.strip_prefix("-Z") {
+            if !allowed_z(rest) {
+                return Some(format!("`{name}` is built with unstable flag {arg}"));
+            }
+        }
+        i += 1;
     }
     None
 }

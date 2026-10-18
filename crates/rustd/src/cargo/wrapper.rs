@@ -52,6 +52,15 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     let line = copies.join("link.line");
     let mut command = Command::new(&rustc);
     command.args(&args);
+    let initial_record = unit.as_record(0, Vec::new(), None);
+    if !initial_record.runs_in_build()
+        && !matches!(initial_record.codegen("opt-level"), None | Some("0"))
+    {
+        command.arg("-Copt-level=0");
+        if initial_record.codegen("debug-assertions").is_none() {
+            command.arg("-Cdebug-assertions=yes");
+        }
+    }
     if unit.linked {
         std::fs::create_dir_all(&copies)?;
         command.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");

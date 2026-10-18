@@ -98,8 +98,17 @@ pub(crate) fn tests(
     served_by_daemon: bool,
 ) -> anyhow::Result<i32> {
     if let Some(query) = &asked.flags.explain {
+        if !served_by_daemon {
+            let why = state.refusal.as_deref().unwrap_or("the build fell back to cargo");
+            say::fallback(why, "cannot explain incremental test selection");
+            return Ok(10);
+        }
         let mut matched = false;
-        for test in state.programs.iter().filter(|it| it.test) {
+        for test in state
+            .programs
+            .iter()
+            .filter(|it| it.test && !asked.flags.excluded_packages.contains(&it.package))
+        {
             let Some(obj) = plan_object(state, test) else { continue };
             let explain_txt = obj.with_extension("explain.txt");
             if let Ok(txt) = std::fs::read_to_string(&explain_txt) {
@@ -128,8 +137,17 @@ pub(crate) fn tests(
     }
 
     if asked.flags.list_changed {
+        if !served_by_daemon {
+            let why = state.refusal.as_deref().unwrap_or("the build fell back to cargo");
+            say::fallback(why, "cannot list impacted tests incrementally");
+            return Ok(10);
+        }
         let mut printed = BTreeSet::new();
-        for test in state.programs.iter().filter(|it| it.test) {
+        for test in state
+            .programs
+            .iter()
+            .filter(|it| it.test && !asked.flags.excluded_packages.contains(&it.package))
+        {
             let Some(obj) = plan_object(state, test) else { continue };
             for line in read_lines(&obj.with_extension("tests.txt")) {
                 if printed.insert(line.clone()) {
@@ -147,15 +165,30 @@ pub(crate) fn tests(
         || asked.flags.retries.is_some();
 
     if is_ci_runner {
-        return run_ci_tests(asked, state);
+        return run_ci_tests(asked, state, served_by_daemon);
     }
 
     let mut failed = Vec::new();
     let allow_incremental = !asked.flags.full_tests
         && std::env::var_os("RUSTD_ALL_TESTS").is_none()
         && asked.positional.is_empty();
+    let any_incremental = allow_incremental
+        && state
+            .programs
+            .iter()
+            .filter(|it| it.test && !asked.flags.excluded_packages.contains(&it.package))
+            .any(|test| {
+                let Some(obj) = plan_object(state, test) else { return false };
+                !read_lines(&obj.with_extension("failed.txt")).is_empty()
+                    || (served_by_daemon
+                        && !read_lines(&obj.with_extension("tests.txt")).is_empty())
+            });
 
-    for test in state.programs.iter().filter(|it| it.test) {
+    for test in state
+        .programs
+        .iter()
+        .filter(|it| it.test && !asked.flags.excluded_packages.contains(&it.package))
+    {
         let source = test.source.strip_prefix(&test.package_dir).unwrap_or(&test.source);
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
@@ -236,6 +269,9 @@ pub(crate) fn tests(
             }
             continue;
         }
+        if any_incremental {
+            continue;
+        }
 
         say::status(asked.flags.quiet, "Running", &format!("{unit}{} ({shown})", source.display()));
         let mut command = Command::new(&test.executable);
@@ -268,7 +304,11 @@ pub(crate) fn tests(
     }
 }
 
-fn run_ci_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32> {
+fn run_ci_tests(
+    asked: &Invocation,
+    state: &State,
+    served_by_daemon: bool,
+) -> anyhow::Result<i32> {
     let mut target_runs: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
     let mut reasons = std::collections::HashMap::new();
     let also: Vec<String> = asked
@@ -278,29 +318,58 @@ fn run_ci_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32> {
         .map(read_lines)
         .unwrap_or_default();
 
-    for test in state.programs.iter().filter(|it| it.test) {
-        let Some(obj) = plan_object(state, test) else { continue };
-        if let Ok(txt) = std::fs::read_to_string(obj.with_extension("explain.txt")) {
-            for line in txt.lines() {
-                if let Some((t, r)) = line.split_once('\t') {
-                    reasons.insert(t.to_owned(), r.to_owned());
+    let fallback_pkgs: Option<Vec<String>> = if !served_by_daemon
+        && let Some(sha) = &asked.flags.since
+        && let Ok(diff_files) = crate::ci::analyze_git_diff_since(&state.root, sha)
+    {
+        Some(crate::ci::infer_packages_from_diff(&state.root, &diff_files))
+    } else {
+        None
+    };
+
+    for test in state
+        .programs
+        .iter()
+        .filter(|it| it.test && !asked.flags.excluded_packages.contains(&it.package))
+    {
+        let obj = plan_object(state, test);
+        if served_by_daemon && let Some(obj) = obj {
+            if let Ok(txt) = std::fs::read_to_string(obj.with_extension("explain.txt")) {
+                for line in txt.lines() {
+                    if let Some((t, r)) = line.split_once('\t') {
+                        reasons.insert(t.to_owned(), r.to_owned());
+                    }
                 }
             }
-        }
-        let mut wanted = read_lines(&obj.with_extension("tests.txt"));
-        for f in read_lines(&obj.with_extension("failed.txt")) {
-            if !wanted.contains(&f) {
-                wanted.push(f);
+            let mut wanted = read_lines(&obj.with_extension("tests.txt"));
+            for f in read_lines(&obj.with_extension("failed.txt")) {
+                if !wanted.contains(&f) {
+                    wanted.push(f);
+                }
             }
-        }
-        for a in &also {
-            if !wanted.contains(a) {
-                wanted.push(a.clone());
+            for a in &also {
+                if !wanted.contains(a) {
+                    wanted.push(a.clone());
+                }
             }
-        }
-        let exact = crate::ci::expand_exact_tests(&test.executable, &wanted);
-        if !exact.is_empty() {
-            target_runs.push((test.package.clone(), test.executable.clone(), exact));
+            let exact = crate::ci::expand_exact_tests(&test.executable, &wanted);
+            if !exact.is_empty() {
+                target_runs.push((test.package.clone(), test.executable.clone(), exact));
+            }
+        } else {
+            // Fallback path: the daemon did not compute `tests.txt` for this binary.
+            // Never silently select 0 tests and exit 0 — run all tests in the affected package(s).
+            if let Some(ref pkgs) = fallback_pkgs
+                && !pkgs.is_empty()
+                && !pkgs.contains(&test.package)
+            {
+                continue;
+            }
+            if let Some(all_tests) = crate::ci::list_tests_cached(&test.executable)
+                && !all_tests.is_empty()
+            {
+                target_runs.push((test.package.clone(), test.executable.clone(), all_tests));
+            }
         }
     }
 
@@ -316,7 +385,7 @@ fn run_ci_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32> {
     }
     let mut outcomes = Vec::with_capacity(total_tests);
     for (run_pkg, run_bin, run_tests) in &target_runs {
-        outcomes.extend(crate::ci::run_isolated_test_suite(
+        let bin_outcomes = crate::ci::run_isolated_test_suite(
             run_pkg,
             run_bin,
             run_tests,
@@ -324,7 +393,24 @@ fn run_ci_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32> {
             &cfg,
             &asked.trailing,
             asked.flags.json,
-        ));
+        );
+        if let Some(test_prog) = state.programs.iter().find(|p| p.executable == *run_bin)
+            && let Some(obj) = plan_object(state, test_prog)
+        {
+            let fp = obj.with_extension("failed.txt");
+            let mut prev_failed: BTreeSet<String> =
+                read_lines(&fp).into_iter().collect();
+            for o in &bin_outcomes {
+                if o.passed {
+                    prev_failed.remove(&o.name);
+                } else if !o.zero_matched {
+                    prev_failed.insert(o.name.clone());
+                }
+            }
+            let body: Vec<&str> = prev_failed.iter().map(String::as_str).collect();
+            let _ = std::fs::write(&fp, body.join("\n"));
+        }
+        outcomes.extend(bin_outcomes);
     }
     let total_dur = t0.elapsed();
     let zero_matched = outcomes.iter().filter(|o| o.zero_matched).count();

@@ -37,8 +37,18 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Build(asked) => match asked.only_cargo() {
             Some(reason) => {
                 say::fallback(&reason, &format!("this is `cargo {}`", asked.subcommand.name()));
-                let typed = std::iter::once(asked.subcommand.name().to_owned()).chain(asked.typed);
-                plain_cargo(typed.collect())?
+                if asked.flags.list_changed || asked.flags.explain.is_some() {
+                    std::process::exit(10);
+                }
+                if let Some(sha) = &asked.flags.since {
+                    let cwd = std::env::current_dir()?;
+                    let ws_root = cwd
+                        .ancestors()
+                        .find(|d| d.join(".git").exists())
+                        .unwrap_or(&cwd);
+                    let _ = crate::ci::analyze_git_diff_since(ws_root, sha)?;
+                }
+                plain_cargo(asked.cargo_args())?
             }
             None => build(&asked)?,
         },
@@ -163,6 +173,8 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
 
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
+    let initial_key = asked.key(&cwd);
+    let has_known = State::read(&initial_key).is_some();
     let mut owned_asked;
     let asked = if let Some(sha) = &asked.flags.since {
         let ws_root = cwd
@@ -170,7 +182,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             .find(|d| d.join(".git").exists())
             .unwrap_or(&cwd);
         let diff_files = crate::ci::analyze_git_diff_since(ws_root, sha)?;
-        if asked.flags.packages.is_empty() && !asked.flags.workspace {
+        if !has_known && asked.flags.packages.is_empty() && !asked.flags.workspace {
             let pkgs = crate::ci::infer_packages_from_diff(ws_root, &diff_files);
             if let Some(first_pkg) = pkgs.into_iter().find(|p| !asked.flags.excluded_packages.contains(p)) {
                 owned_asked = Invocation {
@@ -324,7 +336,11 @@ fn by_cargo(
     };
     let mut state = State::after(asked, cwd, key, built, counts)?;
     prepare_since_cache(asked, &state)?;
-    if state.refusal.is_none() {
+    if let Some(ref why) = state.refusal {
+        say::fallback(why, "the daemon has no part in the next build");
+        let why = why.clone();
+        state.count_cargo(&why);
+    } else {
         let asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
         let cold: Vec<String> = asked.filter_map(|it| warmed(it).err()).collect();
         for why in cold {
@@ -356,7 +372,9 @@ fn after_build(
             let code = run::tests(asked, state, cwd, served_by_daemon)?;
             let stopped = code != 0 && !asked.flags.no_fail_fast;
             // Cargo 1.99 runs no doc tests when tests are picked by target or by name.
-            let picked = asked.flags.selects_targets || !asked.positional.is_empty();
+            let picked = asked.flags.selects_targets
+                || !asked.positional.is_empty()
+                || asked.has_ci_test_flags();
             if stopped || picked || !state.doc_tests {
                 return Ok(code);
             }

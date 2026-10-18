@@ -104,6 +104,16 @@ pub(crate) struct WorkerConfig {
     pub(crate) cfg_test: bool,
     pub(crate) dev_deps: bool,
     pub(crate) features: Vec<String>,
+    #[serde(default)]
+    pub(crate) no_default_features: bool,
+    #[serde(default)]
+    pub(crate) all_features: bool,
+    #[serde(default)]
+    pub(crate) workspace: bool,
+    #[serde(default)]
+    pub(crate) packages: Vec<String>,
+    #[serde(default)]
+    pub(crate) exclude: Vec<String>,
     pub(crate) target: Option<String>,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
@@ -230,6 +240,21 @@ impl Worker {
         }
         if !config.features.is_empty() {
             command.args(["--features", &config.features.join(",")]);
+        }
+        if config.no_default_features {
+            command.arg("--no-default-features");
+        }
+        if config.all_features {
+            command.arg("--all-features");
+        }
+        if config.workspace {
+            command.arg("--workspace");
+        }
+        for pkg in &config.packages {
+            command.args(["--package", pkg]);
+        }
+        for exc in &config.exclude {
+            command.args(["--exclude", exc]);
         }
         for krate in &first.crates {
             command.arg("--crate").arg(krate.strip_prefix(&checkout.root).unwrap_or(krate));

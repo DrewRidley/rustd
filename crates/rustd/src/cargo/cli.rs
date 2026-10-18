@@ -96,6 +96,9 @@ const WORKER_ENV: &[&str] = &[
     "RUSTUP_HOME",
     "CARGO_HOME",
     "PATH",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
     "RUSTD_BACKEND",
     "RUSTD_OPT",
     "RUSTD_EMIT",
@@ -277,6 +280,9 @@ impl Invocation {
     pub(crate) fn only_cargo(&self) -> Option<String> {
         let flags = &self.flags;
         let set = |name: &str| std::env::var_os(name).is_some_and(|it| !it.is_empty());
+        let has_cfg = |name: &str| {
+            std::env::var(name).is_ok_and(|it| it.contains("--cfg"))
+        };
         let reason = match () {
             _ if flags.doc => "doc tests are built by rustdoc",
             _ if flags.profile.as_deref().is_some_and(|it| it != "dev" && it != "test") => {
@@ -284,19 +290,10 @@ impl Invocation {
             }
             _ if flags.message_format => "--message-format is cargo's to answer",
             _ if flags.unstable => "unstable cargo flags",
-            _ if flags.all_features => "--all-features is not loaded by the daemon yet",
-            _ if flags.no_default_features => {
-                "--no-default-features is not loaded by the daemon yet"
-            }
-            _ if flags.packages.len() > 1
-                || (flags.excludes && !self.has_ci_test_flags()) =>
-            {
-                "a selection of several packages is not loaded by the daemon yet"
-            }
             _ if flags.targets.len() > 1 => "several targets in one build",
             _ if ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"]
                 .iter()
-                .any(|it| set(it)) =>
+                .any(|it| has_cfg(it)) =>
             {
                 "RUSTFLAGS is set, and the daemon loads the workspace without it"
             }
@@ -304,6 +301,27 @@ impl Invocation {
             _ => return self.target().and_then(|it| unsupported_target(&it)),
         };
         Some(reason.to_owned())
+    }
+
+    /// Arguments to pass to plain `cargo` when falling back, without `rustd`-only flags.
+    pub(crate) fn cargo_args(&self) -> Vec<String> {
+        let mut args = vec![self.subcommand.name().to_owned()];
+        args.extend(self.build_args.iter().cloned());
+        if self.flags.no_run {
+            args.push("--no-run".to_owned());
+        }
+        if self.flags.no_fail_fast {
+            args.push("--no-fail-fast".to_owned());
+        }
+        if self.flags.doc {
+            args.push("--doc".to_owned());
+        }
+        args.extend(self.positional.iter().cloned());
+        if !self.trailing.is_empty() {
+            args.push("--".to_owned());
+            args.extend(self.trailing.iter().cloned());
+        }
+        args
     }
 
     /// The triple cargo builds for, when it is told one.
@@ -451,8 +469,6 @@ mod tests {
             "--release",
             "--profile bench",
             "--message-format json",
-            "-p a -p b",
-            "--all-features",
             "--target mips-unknown-none",
         ] {
             assert!(build("build", args).only_cargo().is_some(), "{args}");

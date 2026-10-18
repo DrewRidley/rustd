@@ -57,9 +57,104 @@ pub(crate) fn read_baseline_cache(out: &Path) -> FxHashMap<PathBuf, String> {
         let (Some(k), Some(v)) = (get_str(&bytes, &mut pos), get_str(&bytes, &mut pos)) else {
             break;
         };
-        map.insert(PathBuf::from(k), v);
+        let pb = PathBuf::from(&k);
+        if let Ok(canon) = dunce::canonicalize(&pb)
+            && canon != pb
+        {
+            map.insert(canon, v.clone());
+        }
+        map.insert(pb, v);
     }
     map
+}
+
+static DEPS_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<FxHashMap<FunctionId, std::sync::Arc<hir_ty::mir::codegen::FunctionDeps>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn invalidate_deps_for_funcs(funcs: &[FunctionId]) {
+    let mut cache = DEPS_CACHE.lock().unwrap();
+    for f in funcs {
+        cache.remove(f);
+    }
+}
+
+pub(crate) fn clear_deps_cache() {
+    DEPS_CACHE.lock().unwrap().clear();
+}
+
+fn clone_deps(
+    d: &hir_ty::mir::codegen::FunctionDeps,
+) -> std::sync::Arc<hir_ty::mir::codegen::FunctionDeps> {
+    std::sync::Arc::new(hir_ty::mir::codegen::FunctionDeps {
+        adts: d.adts.clone(),
+        callees: d.callees.clone(),
+        traits: d.traits.clone(),
+        trait_callees: d.trait_callees.clone(),
+        local_callee_count: d.local_callee_count,
+        string_lits: d.string_lits.clone(),
+        match_dispatch_arms: d.match_dispatch_arms.clone(),
+    })
+}
+
+fn cached_function_deps(
+    db: &RootDatabase,
+    func: FunctionId,
+) -> std::sync::Arc<hir_ty::mir::codegen::FunctionDeps> {
+    if let Some(deps) = DEPS_CACHE.lock().unwrap().get(&func).cloned() {
+        return deps;
+    }
+    let d = clone_deps(hir_ty::mir::codegen::function_deps(db, func));
+    DEPS_CACHE.lock().unwrap().insert(func, d.clone());
+    d
+}
+
+fn warm_deps(db: &RootDatabase, funcs: &[FunctionId]) {
+    let uncached: Vec<FunctionId> = {
+        let cache = DEPS_CACHE.lock().unwrap();
+        funcs.iter().copied().filter(|f| !cache.contains_key(f)).collect()
+    };
+    if uncached.is_empty() {
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let computed: Vec<Vec<(FunctionId, std::sync::Arc<hir_ty::mir::codegen::FunctionDeps>)>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads.min(uncached.len()))
+                .map(|part| {
+                    let (db, uncached) = (db.clone(), &uncached);
+                    scope.spawn(move || {
+                        hir::attach_db(&db, || {
+                            uncached
+                                .iter()
+                                .skip(part)
+                                .step_by(threads)
+                                .map(|&func| {
+                                    (func, clone_deps(hir_ty::mir::codegen::function_deps(&db, func)))
+                                })
+                                .collect()
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+    let mut cache = DEPS_CACHE.lock().unwrap();
+    for chunk in computed {
+        for (f, d) in chunk {
+            cache.insert(f, d);
+        }
+    }
+}
+
+pub(crate) fn warm_crate_deps(db: &RootDatabase, listed: &Listed, args: &Args) {
+    for krate in std::iter::once(&args.krate).chain(&args.batch) {
+        let Ok(named) = crate::crates_named(db, krate, args) else { continue };
+        for c in named {
+            let l = listed.of(db, c);
+            warm_deps(db, &l.functions);
+        }
+    }
 }
 
 fn non_trivia_text(node: &SyntaxNode) -> String {
@@ -199,8 +294,9 @@ pub(crate) fn select_dirty_and_tests(
                 continue;
             }
             let cur_text = db.file_text(file_id).text(db);
-            let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            if let Some(base_text) = since_map.get(path).or_else(|| since_map.get(&canonical)) {
+            if !since_map.is_empty()
+                && let Some(base_text) = since_map.get(path)
+            {
                 if &**cur_text != base_text.as_str() {
                     dirty_files.insert(file_id);
                     dirty_base_texts.insert(file_id, BaseFileAst::parse(base_text));
@@ -209,7 +305,7 @@ pub(crate) fn select_dirty_and_tests(
             }
             if let Some(inside) = args.inside(path) {
                 match args.as_compiled.get(inside) {
-                    Some(orig) if **orig != **cur_text => {
+                    Some(orig) if !triomphe::Arc::ptr_eq(orig, &cur_text) && **orig != **cur_text => {
                         dirty_files.insert(file_id);
                         dirty_base_texts.insert(file_id, BaseFileAst::parse(orig));
                     }
@@ -409,21 +505,6 @@ pub(crate) fn select_dirty_and_tests(
     for c in candidate_crates {
         local_crates.push(c);
         let l = listed.of(db, c);
-        let warm_deps = |db: &RootDatabase, funcs: &[FunctionId]| {
-            let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-            std::thread::scope(|scope| {
-                for part in 0..threads.min(funcs.len()) {
-                    let db = db.clone();
-                    scope.spawn(move || {
-                        hir::attach_db(&db, || {
-                            for &func in funcs.iter().skip(part).step_by(threads) {
-                                let _ = hir_ty::mir::codegen::function_deps(&db, func);
-                            }
-                        });
-                    });
-                }
-            });
-        };
         let mut warmed = false;
         if !global_vtable_adts.is_empty() || !global_need_callers.is_empty() {
             warm_deps(db, &l.functions);
@@ -464,8 +545,10 @@ pub(crate) fn select_dirty_and_tests(
                     let idents = hir_ty::mir::codegen::function_path_idents(db, func);
                     changed_const_names.iter().any(|n| idents.contains(n))
                 };
-                let touches_changed_adt =
-                    hir_ty::mir::codegen::function_mentions_adts(db, func, &vtable_adts);
+                let touches_changed_adt = !vtable_adts.is_empty() && {
+                    let f_adts = &cached_function_deps(db, func).adts;
+                    vtable_adts.iter().any(|adt| f_adts.contains(adt))
+                };
                 if in_dirty_changed || touches_changed_const || touches_changed_adt {
                     direct_changed.insert(func);
                     let h_fn = hir::Function::from(func);
@@ -478,7 +561,7 @@ pub(crate) fn select_dirty_and_tests(
                                 .unwrap_or_default();
                         explain_reasons.insert(func, format!("`{fn_label}` (edited in {src_p})"));
                     } else if touches_changed_adt {
-                        let deps = hir_ty::mir::codegen::function_deps(db, func);
+                        let deps = cached_function_deps(db, func);
                         let why = deps
                             .adts
                             .iter()
@@ -494,7 +577,8 @@ pub(crate) fn select_dirty_and_tests(
                         hir_ty::mir::codegen::SymbolResolver::function(resolver, func).is_none()
                             || hir_def::signatures::FunctionSignature::of(db, func).is_async()
                             || hir_def::attrs::AttrFlags::query(db, func.into())
-                                .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE);
+                                .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE)
+                            || hir_def::expr_store::Body::of(db, func.into()).exprs().nth(40).is_none();
                     if let Some(assoc) = h_fn.as_assoc_item(db)
                         && let AssocItemContainer::Impl(imp) = assoc.container(db)
                     {
@@ -551,8 +635,7 @@ pub(crate) fn select_dirty_and_tests(
                                 if let hir::AssocItem::Function(sib_fn) = sib_item
                                     && let Ok(sib_fid) = FunctionId::try_from(sib_fn)
                                 {
-                                    let sib_deps =
-                                        hir_ty::mir::codegen::function_deps(db, sib_fid);
+                                    let sib_deps = cached_function_deps(db, sib_fid);
                                     if sib_deps.string_lits.len() == 1 {
                                         let key = &sib_deps.string_lits[0];
                                         if key.contains("::") {
@@ -590,15 +673,15 @@ pub(crate) fn select_dirty_and_tests(
                 loop {
                     let mut newly_added = Vec::new();
                     for &func in &l.functions {
-                        if !direct_changed.contains(&func)
-                            && (hir_ty::mir::codegen::function_calls_any(db, func, &need_callers)
-                                || hir_ty::mir::codegen::function_mentions_adts(
-                                    db,
-                                    func,
-                                    &vtable_adts,
-                                ))
-                        {
-                            newly_added.push(func);
+                        if !direct_changed.contains(&func) {
+                            let deps = cached_function_deps(db, func);
+                            let calls_any = !need_callers.is_empty()
+                                && need_callers.iter().any(|t| deps.callees.contains(t));
+                            let mentions_adt = !vtable_adts.is_empty()
+                                && vtable_adts.iter().any(|a| deps.adts.contains(a));
+                            if calls_any || mentions_adt {
+                                newly_added.push(func);
+                            }
                         }
                     }
                     if newly_added.is_empty() {
@@ -610,6 +693,7 @@ pub(crate) fn select_dirty_and_tests(
                             || hir_def::signatures::FunctionSignature::of(db, f).is_async()
                             || hir_def::attrs::AttrFlags::query(db, f.into())
                                 .contains(hir_def::attrs::AttrFlags::RUSTC_FORCE_INLINE)
+                            || hir_def::expr_store::Body::of(db, f.into()).exprs().nth(40).is_none()
                         {
                             need_callers.insert(f);
                         }
@@ -639,7 +723,7 @@ pub(crate) fn select_dirty_and_tests(
                         if test_reach.contains(&func) {
                             continue;
                         }
-                        let deps = hir_ty::mir::codegen::function_deps(db, func);
+                        let deps = cached_function_deps(db, func);
                         for (arm_callee, arm_key) in &deps.match_dispatch_arms {
                             if test_reach.contains(arm_callee) && arm_key.contains("::") {
                                 let prev = explain_reasons
@@ -770,8 +854,7 @@ pub(crate) fn select_dirty_and_tests(
                                 if let hir::AssocItem::Function(sib_fn) = sib_item
                                     && let Ok(sib_fid) = FunctionId::try_from(sib_fn)
                                 {
-                                    let sib_deps =
-                                        hir_ty::mir::codegen::function_deps(db, sib_fid);
+                                    let sib_deps = cached_function_deps(db, sib_fid);
                                     if sib_deps.string_lits.len() == 1 {
                                         let key = &sib_deps.string_lits[0];
                                         if key.contains("::") {

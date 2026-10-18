@@ -115,6 +115,8 @@ struct Args {
     no_default_features: bool,
     /// The packages cargo is asked for with `-p`: none is what `cargo build` builds there.
     packages: Vec<String>,
+    /// The packages excluded with `--exclude`.
+    exclude: Vec<String>,
     /// Whether every member is built, as `--workspace` has it.
     workspace: bool,
     /// Build with every feature of the package, as `--all-features` does.
@@ -187,7 +189,7 @@ impl Args {
         let mut dev_deps = false;
         let mut features = Vec::new();
         let mut no_default_features = false;
-        let (mut packages, mut workspace) = (Vec::new(), false);
+        let (mut packages, mut exclude, mut workspace) = (Vec::new(), Vec::new(), false);
         let mut all_features = false;
         let mut profile = None;
         let mut also = Vec::new();
@@ -214,6 +216,7 @@ impl Args {
                 "--features" => features.extend(value()?.split(',').map(str::to_owned)),
                 "--no-default-features" => no_default_features = true,
                 "--package" | "-p" => packages.push(value()?),
+                "--exclude" => exclude.push(value()?),
                 "--workspace" => workspace = true,
                 "--all-features" => all_features = true,
                 "--release" | "--profile" if profile.is_some() => {
@@ -244,6 +247,7 @@ impl Args {
             features,
             no_default_features,
             packages,
+            exclude,
             workspace,
             all_features,
             profile: profile.unwrap_or_else(|| "dev".to_owned()),
@@ -2160,6 +2164,9 @@ fn selected(args: &Args) -> Vec<String> {
     for package in &args.packages {
         selected.extend(["--package".to_owned(), package.clone()]);
     }
+    for exclude in &args.exclude {
+        selected.extend(["--exclude".to_owned(), exclude.clone()]);
+    }
     if args.workspace {
         selected.push("--workspace".to_owned());
     }
@@ -2423,6 +2430,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             features: args.features.clone(),
             no_default_features: args.no_default_features,
             packages: args.packages.clone(),
+            exclude: args.exclude.clone(),
             workspace: args.workspace,
             all_features: args.all_features,
             profile: args.profile.clone(),
@@ -2866,6 +2874,8 @@ struct Unbuilt {
     /// Whether the last build was for a request that does not link, which leaves the
     /// executable to the next that does.
     unlinked: bool,
+    /// Whether any edit since the last build changed items or attributes outside function bodies.
+    non_body_edited: bool,
 }
 
 /// Sends `request` to the daemon listening on `socket` and waits for it. The answer is one
@@ -3066,6 +3076,7 @@ fn main() -> anyhow::Result<()> {
         no_default_features: args.no_default_features,
         all_features: args.all_features,
         packages: args.packages.clone(),
+        exclude: args.exclude.clone(),
         workspace: args.workspace,
         target: args.target.clone(),
         dev_deps: args.cfg_test || args.dev_deps,
@@ -3230,6 +3241,9 @@ fn main() -> anyhow::Result<()> {
     }
     // The first is the program asked for when a request names none.
     let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
+    if serving && args.cfg_test {
+        hir::attach_db(&db, || impact::warm_crate_deps(&db, &listed, &args));
+    }
     let tests = Some(hir::attach_db(&db, || Tests::of(&db, &listed, &args)));
     let mut programs = vec![Program {
         tests,
@@ -3493,6 +3507,7 @@ fn main() -> anyhow::Result<()> {
                                 edited: programs[0].unbuilt.edited.clone(),
                                 stale: true,
                                 unlinked: false,
+                                non_body_edited: programs[0].unbuilt.non_body_edited,
                             };
                             let mut program = Program {
                                 tests: None,
@@ -3740,18 +3755,27 @@ fn main() -> anyhow::Result<()> {
                 if std::env::var_os("RUSTD_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
+                if let Some(fids) = listed.in_file(&db, file) {
+                    impact::invalidate_deps_for_funcs(&fids);
+                }
                 programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
                 continue;
             }
+            impact::clear_deps_cache();
             let crates = ide_db::base_db::relevant_crates(&db, file);
             let crates = (!crates.is_empty()).then_some(crates);
-            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
+            programs.iter_mut().for_each(|it| {
+                it.known.touch(&db, crates);
+                it.unbuilt.non_body_edited = true;
+            });
             listed.touch(&db, crates);
         }
         if !moved.is_empty() {
+            impact::clear_deps_cache();
             programs.iter_mut().for_each(|it| {
                 it.known.touch(&db, Some(&moved));
                 it.unbuilt.stale = true;
+                it.unbuilt.non_body_edited = true;
             });
             listed.touch(&db, Some(&moved));
         }
@@ -4124,12 +4148,12 @@ impl Program {
         edited.retain(|&file| listed.sees(db, file));
         // The check of the edited files does not wait for the build: it reads other things.
         let (warm, broken) = std::thread::scope(|scope| {
-            let check = {
+            let check = (!edited.is_empty()).then(|| {
                 let (db, edited) = (db.clone(), &edited);
                 scope.spawn(move || broken_in(&db, edited))
-            };
+            });
             let warm = build(db, table, args, known, listed);
-            (warm, check.join().ok().flatten())
+            (warm, check.and_then(|c| c.join().ok().flatten()))
         });
         let warm = warm?;
         if known.stats.patched.is_none() {
@@ -4143,12 +4167,14 @@ impl Program {
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let mut failed = refusal(db, &edited, paths, out_of_date).or(broken);
-        let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
-        match tests {
-            Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
-            // The first build of the program is of the source rustc built it from.
-            None if failed.is_none() => *tests = Some(tests_now),
-            None => {}
+        if tests.is_none() || (!edited.is_empty() && unbuilt.non_body_edited) {
+            let tests_now = hir::attach_db(db, || Tests::of(db, listed, args));
+            match tests {
+                Some(first) => failed = failed.or_else(|| first.changed(&tests_now)),
+                // The first build of the program is of the source rustc built it from.
+                None if failed.is_none() => *tests = Some(tests_now),
+                None => {}
+            }
         }
         if failed.is_none() || known.stats.patched.is_none() {
             let patched = known.stats.patched.is_some();

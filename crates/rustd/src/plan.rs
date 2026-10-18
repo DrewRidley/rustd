@@ -23,6 +23,8 @@ pub(crate) struct Selection {
     pub(crate) all_features: bool,
     /// The packages asked for with `-p`: none is what `cargo build` builds where it is run.
     pub(crate) packages: Vec<String>,
+    /// The packages excluded with `--exclude`.
+    pub(crate) exclude: Vec<String>,
     /// Whether every member of the workspace is built.
     pub(crate) workspace: bool,
     /// The triple built for, when it is not the host.
@@ -39,6 +41,7 @@ impl Default for Selection {
             no_default_features: false,
             all_features: false,
             packages: Vec::new(),
+            exclude: Vec::new(),
             workspace: false,
             target: None,
             dev_deps: false,
@@ -92,7 +95,8 @@ impl Profile {
             (self.debug_assertions != unoptimized).then_some(self.debug_assertions);
         let named_overflow =
             (self.overflow_checks != self.debug_assertions).then_some(self.overflow_checks);
-        let unoptimized = flags.opt_level.as_ref().map_or(unoptimized, |it| it == "0");
+        let unoptimized = std::env::var_os("RUSTD_INCREMENTAL_ONLY").is_some()
+            || flags.opt_level.as_ref().map_or(unoptimized, |it| it == "0");
         let debug_assertions = flags.debug_assertions.or(named_assertions).unwrap_or(unoptimized);
         Profile {
             debug_assertions,
@@ -271,6 +275,9 @@ impl Plan {
         }
         for package in &selection.packages {
             command.arg("--package").arg(package);
+        }
+        for exclude in &selection.exclude {
+            command.arg("--exclude").arg(exclude);
         }
         if selection.workspace {
             command.arg("--workspace");

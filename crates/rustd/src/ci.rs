@@ -59,6 +59,12 @@ pub(crate) fn analyze_git_diff_since(
         }
     }
 
+    changed_paths.retain(|p| {
+        !p.starts_with(".rustd")
+            && !p.starts_with("target/")
+            && !p.contains("/.rustd")
+    });
+
     let mut diff_files = Vec::new();
     for rel in &changed_paths {
         if let Some(reason) = unattributable_path_reason(workspace_root, rel) {
@@ -496,21 +502,10 @@ pub(crate) fn expand_exact_tests_with_total(
     if wanted.is_empty() {
         return (Vec::new(), 0);
     }
-    let Ok(out) = Command::new(test_bin)
-        .args(["--list", "--format=terse"])
-        .output()
-    else {
+    let available = list_tests_cached(test_bin);
+    let Some(available) = available else {
         return (wanted.to_vec(), usize::MAX);
     };
-    if !out.status.success() {
-        return (wanted.to_vec(), usize::MAX);
-    }
-    let available: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_suffix(": test"))
-        .map(str::trim)
-        .map(str::to_owned)
-        .collect();
     let total = available.len();
     let mut expanded = Vec::new();
     for w in wanted {
@@ -524,6 +519,43 @@ pub(crate) fn expand_exact_tests_with_total(
         }
     }
     (expanded, total)
+}
+
+pub(crate) fn list_tests_cached(test_bin: &Path) -> Option<Vec<String>> {
+    let cache_path = test_bin.with_extension("testlist");
+    let cargo_bin = test_bin.parent().map(|p| p.join("cargo"));
+    let ref_bin = cargo_bin
+        .as_deref()
+        .filter(|p| p.exists())
+        .unwrap_or(test_bin);
+    let ref_mtime = fs::metadata(ref_bin).and_then(|m| m.modified()).ok();
+    if let (Some(rm), Ok(cm)) = (ref_mtime, fs::metadata(&cache_path).and_then(|m| m.modified()))
+        && cm >= rm
+        && let Ok(cached) = fs::read_to_string(&cache_path)
+    {
+        return Some(
+            cached
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+    let out = Command::new(test_bin)
+        .args(["--list", "--format=terse"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let available: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect();
+    let _ = fs::write(&cache_path, available.join("\n"));
+    Some(available)
 }
 
 pub(crate) fn expand_exact_tests(test_bin: &Path, wanted: &[String]) -> Vec<String> {
