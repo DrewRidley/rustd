@@ -620,7 +620,7 @@ pub(crate) fn select_dirty_and_tests(
                                             .entry((fid, adt_id))
                                             .or_insert_with(|| format!("`{fn_label}` (edited)"));
                                     }
-                                    if is_local_trait && trait_impl_count <= 16 {
+                                    if is_local_trait && trait_impl_count <= 32 {
                                         global_impacted_fns.insert(fid);
                                         explain_reasons.entry(fid).or_insert_with(|| {
                                             format!(
@@ -737,7 +737,7 @@ pub(crate) fn select_dirty_and_tests(
                                     });
                             }
                         }
-                        if deps.local_callee_count > 64
+                        if deps.local_callee_count > 160
                             && !hir_def::attrs::AttrFlags::query(db, func.into())
                                 .contains(hir_def::attrs::AttrFlags::IS_TEST)
                         {
@@ -843,7 +843,7 @@ pub(crate) fn select_dirty_and_tests(
                                             .or_insert_with(|| fn_why.clone());
                                     }
                                     if is_local_trait
-                                        && trait_impl_count <= 16
+                                        && trait_impl_count <= 32
                                         && test_reach.insert(fid)
                                     {
                                         explain_reasons.insert(fid, fn_why.clone());

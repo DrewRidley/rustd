@@ -41,6 +41,10 @@ fn address_for_func(func: FuncId) -> Address {
     Address::Symbol { symbol: func.as_u32() as usize, addend: 0 }
 }
 
+/// The personality, where the frames name the function itself and it is known only once
+/// every function of the program is declared.
+const PERSONALITY_SYMBOL: usize = usize::MAX;
+
 fn address_for_data(data: DataId) -> Address {
     Address::Symbol { symbol: data.as_u32() as usize | DATA_SYMBOL, addend: 0 }
 }
@@ -232,6 +236,8 @@ pub(super) struct UnwindContext {
     cies: Option<Cies>,
     /// The pointer to the personality the frames name, where they reach it through one.
     personality_ref: Option<DataId>,
+    /// The personality itself, where the frames name it and the linker makes the pointer.
+    personality: Option<FuncId>,
     seh: seh::Tables,
 }
 
@@ -250,10 +256,22 @@ impl UnwindContext {
         let dwarf = module.isa().triple().binary_format != target_lexicon::BinaryFormat::Coff;
         // Nothing unwinds on wasm: a panic aborts there.
         if super::Target::current().is_wasm() {
-            return Ok(UnwindContext { frame_table, cies: None, personality_ref: None, seh });
+            return Ok(UnwindContext {
+                frame_table,
+                cies: None,
+                personality_ref: None,
+                personality: None,
+                seh,
+            });
         }
         let Some(mut cie) = module.isa().create_systemv_cie().filter(|_| dwarf) else {
-            return Ok(UnwindContext { frame_table, cies: None, personality_ref: None, seh });
+            return Ok(UnwindContext {
+                frame_table,
+                cies: None,
+                personality_ref: None,
+                personality: None,
+                seh,
+            });
         };
         let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
         cie.fde_address_encoding = pcrel;
@@ -264,17 +282,17 @@ impl UnwindContext {
         // The personality is reached through a pointer, as it can live in another DSO. The
         // linker of Mach-O makes that pointer, when asked for the one among its own.
         if macho {
-            let personality = personality(module)?;
             cie.personality = Some((
                 gimli::DwEhPe(
                     gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
                 ),
-                address_for_func(personality),
+                Address::Symbol { symbol: PERSONALITY_SYMBOL, addend: 0 },
             ));
             let with_landing_pads = frame_table.add_cie(cie);
             return Ok(UnwindContext {
                 cies: Some(Cies { with_landing_pads, plain }),
                 personality_ref: None,
+                personality: None,
                 frame_table,
                 seh,
             });
@@ -297,6 +315,7 @@ impl UnwindContext {
         Ok(UnwindContext {
             cies: Some(Cies { with_landing_pads, plain }),
             personality_ref: Some(personality_ref),
+            personality: None,
             frame_table,
             seh,
         })
@@ -304,8 +323,13 @@ impl UnwindContext {
 
     /// Points the frames at the personality. Done once every function of the program is
     /// declared: a program without `std` may define the personality itself.
-    pub(super) fn name_personality(&self, module: &mut dyn Module) -> Result<(), String> {
-        let Some(personality_ref) = self.personality_ref else { return Ok(()) };
+    pub(super) fn name_personality(&mut self, module: &mut dyn Module) -> Result<(), String> {
+        let Some(personality_ref) = self.personality_ref else {
+            if self.cies.is_some() {
+                self.personality = Some(personality(module)?);
+            }
+            return Ok(());
+        };
         let personality = personality(module)?;
         let mut data = DataDescription::new();
         data.define(
@@ -367,7 +391,10 @@ impl UnwindContext {
         let section = product.object.section_id(StandardSection::EhFrame);
         product.object.section_mut(section).set_data(eh_frame.0.writer.into_vec(), 8);
         for reloc in &eh_frame.0.relocs {
-            let symbol = if reloc.symbol & DATA_SYMBOL == 0 {
+            let symbol = if reloc.symbol == PERSONALITY_SYMBOL {
+                let personality = self.personality.ok_or("frames without their personality")?;
+                product.function_symbol(personality)
+            } else if reloc.symbol & DATA_SYMBOL == 0 {
                 product.function_symbol(FuncId::from_u32(reloc.symbol as u32))
             } else {
                 product.data_symbol(DataId::from_u32((reloc.symbol & !DATA_SYMBOL) as u32))

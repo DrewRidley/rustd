@@ -7,9 +7,10 @@
 //!
 //! So the monomorphization should be called even if the substitution is empty.
 
+use rustc_next_trait_solver::placeholder::BoundVarReplacer;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use rustc_type_ir::{
-    FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt,
+    FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
 };
 
 use crate::{
@@ -23,10 +24,11 @@ use crate::{
 use crate::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
     next_solver::{
-        AliasTy, AliasTyKind, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
+        AliasTy, AliasTyKind, Binder, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         references_non_lt_error,
+        util::PlaceholderReplacer,
     },
 };
 
@@ -36,6 +38,8 @@ struct Filler<'db> {
     infcx: InferCtxt<'db>,
     trait_env: ParamEnvAndCrate<'db>,
     subst: GenericArgs<'db>,
+    /// One entry for each binder the fold is inside of, as normalization wants them.
+    universes: Vec<Option<UniverseIndex>>,
 }
 
 impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
@@ -43,6 +47,16 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
 
     fn cx(&self) -> DbInterner<'db> {
         self.infcx.interner
+    }
+
+    fn try_fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        t: Binder<'db, T>,
+    ) -> Result<Binder<'db, T>, Self::Error> {
+        self.universes.push(None);
+        let t = t.try_super_fold_with(self);
+        self.universes.pop();
+        t
     }
 
     fn try_fold_ty(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, Self::Error> {
@@ -55,18 +69,8 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
                 let ty = self.impl_opaque(ty);
-                if ty.has_escaping_bound_vars() {
-                    return Ok(ty);
-                }
 
-                let mut ocx = ObligationCtxt::new(&self.infcx);
-                let ty = ocx
-                    .structurally_normalize_ty(
-                        &ObligationCause::dummy(),
-                        self.trait_env.param_env,
-                        ty,
-                    )
-                    .map_err(|_| MirLowerError::NotSupported("can't normalize alias".to_owned()))?;
+                let ty = self.normalized(ty)?;
                 // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
                 // and we must not have infer vars in the body.
                 let ty = ty.replace_infer_with_error(self.infcx.interner);
@@ -113,10 +117,35 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
 }
 
 impl<'db> Filler<'db> {
+    /// `alias` as what it is an alias of. One that names the lifetimes of a binder around it,
+    /// like `D::Data<'a>` in `for<'a> fn(&'a mut T) -> D::Data<'a>`, is normalized with
+    /// placeholders in their place, which are put back afterwards.
+    fn normalized(&mut self, alias: Ty<'db>) -> Result<Ty<'db>, MirLowerError<'db>> {
+        let normalize = |ty| {
+            ObligationCtxt::new(&self.infcx)
+                .structurally_normalize_ty(&ObligationCause::dummy(), self.trait_env.param_env, ty)
+                .map_err(|_| MirLowerError::NotSupported("can't normalize alias".to_owned()))
+        };
+        if !alias.has_escaping_bound_vars() {
+            return normalize(alias);
+        }
+        let (alias, regions, types, consts) =
+            BoundVarReplacer::replace_bound_vars(&self.infcx, &mut self.universes, alias);
+        let ty = normalize(alias)?;
+        Ok(PlaceholderReplacer::replace_placeholders(
+            &self.infcx,
+            regions,
+            types,
+            consts,
+            &self.universes,
+            ty,
+        ))
+    }
+
     fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-        Self { infcx, trait_env: env, subst }
+        Self { infcx, trait_env: env, subst, universes: Vec::new() }
     }
 
     /// The `impl Trait` a trait method returns is the one of the impl's method once the
