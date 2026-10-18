@@ -147,14 +147,89 @@ fn prepare_since_cache(asked: &Invocation, state: &State) -> anyhow::Result<()> 
 /// Builds what `asked` names, by the daemon when it can and by cargo otherwise, and then
 /// runs what the subcommand runs.
 fn build(asked: &Invocation) -> anyhow::Result<i32> {
+    if let [pkg] = asked.flags.packages.as_slice()
+        && asked.flags.excluded_packages.contains(pkg)
+    {
+        if let Some(junit_path) = &asked.flags.junit {
+            crate::ci::write_junit_xml(junit_path, &[], std::time::Duration::ZERO)?;
+        }
+        if asked.flags.json {
+            crate::ci::print_json_summary(&[], std::time::Duration::ZERO);
+        } else {
+            eprintln!("[rustd] package `{pkg}` excluded by --exclude; 0 tests to run");
+        }
+        return Ok(0);
+    }
+
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
+    let mut owned_asked;
+    let asked = if let Some(sha) = &asked.flags.since {
+        let ws_root = cwd
+            .ancestors()
+            .find(|d| d.join(".git").exists())
+            .unwrap_or(&cwd);
+        let diff_files = crate::ci::analyze_git_diff_since(ws_root, sha)?;
+        if asked.flags.packages.is_empty() && !asked.flags.workspace {
+            let pkgs = crate::ci::infer_packages_from_diff(ws_root, &diff_files);
+            if let Some(first_pkg) = pkgs.into_iter().find(|p| !asked.flags.excluded_packages.contains(p)) {
+                owned_asked = Invocation {
+                    subcommand: asked.subcommand,
+                    typed: asked.typed.clone(),
+                    build_args: asked.build_args.clone(),
+                    positional: asked.positional.clone(),
+                    trailing: asked.trailing.clone(),
+                    flags: cli::Flags {
+                        manifest_path: asked.flags.manifest_path.clone(),
+                        packages: vec![first_pkg.clone()],
+                        workspace: asked.flags.workspace,
+                        excludes: false,
+                        excluded_packages: asked.flags.excluded_packages.clone(),
+                        features: asked.flags.features.clone(),
+                        all_features: asked.flags.all_features,
+                        no_default_features: asked.flags.no_default_features,
+                        profile: asked.flags.profile.clone(),
+                        targets: asked.flags.targets.clone(),
+                        bin: asked.flags.bin.clone(),
+                        example: asked.flags.example.clone(),
+                        message_format: asked.flags.message_format,
+                        unstable: asked.flags.unstable,
+                        quiet: asked.flags.quiet,
+                        no_run: asked.flags.no_run,
+                        no_fail_fast: asked.flags.no_fail_fast,
+                        doc: asked.flags.doc,
+                        selects_targets: asked.flags.selects_targets,
+                        since: asked.flags.since.clone(),
+                        explain: asked.flags.explain.clone(),
+                        list_changed: asked.flags.list_changed,
+                        backtest: asked.flags.backtest,
+                        faults: asked.flags.faults,
+                        junit: asked.flags.junit.clone(),
+                        json: asked.flags.json,
+                        also_run: asked.flags.also_run.clone(),
+                        retries: asked.flags.retries,
+                        full_tests: asked.flags.full_tests,
+                    },
+                };
+                owned_asked.build_args.retain(|a| a != "--exclude");
+                owned_asked.build_args.extend(["-p".to_owned(), first_pkg]);
+                &owned_asked
+            } else {
+                asked
+            }
+        } else {
+            asked
+        }
+    } else {
+        asked
+    };
+
     let key = asked.key(&cwd);
     let known = State::read(&key);
     if let Some(ref state) = known {
         prepare_since_cache(asked, state)?;
     }
-    let (state, served_by_daemon) = match known.map(by_daemon) {
+    let (state, mut served_by_daemon) = match known.map(by_daemon) {
         Some(Ok(state)) => {
             let took = started.elapsed().as_secs_f64();
             let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
@@ -166,21 +241,29 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
             match by_cargo(asked, &cwd, &key, counts)? {
-                Ok(state) => {
-                    prepare_since_cache(asked, &state)?;
-                    (state, false)
-                }
+                Ok(state) => (state, false),
                 Err(code) => return Ok(code),
             }
         }
         None => match by_cargo(asked, &cwd, &key, Counts::default())? {
-            Ok(state) => {
-                prepare_since_cache(asked, &state)?;
-                (state, false)
-            }
+            Ok(state) => (state, false),
             Err(code) => return Ok(code),
         },
     };
+    if !served_by_daemon && asked.has_ci_test_flags() && state.refusal.is_none() {
+        for _ in 0..2400 {
+            if state
+                .checkouts
+                .iter()
+                .filter(|it| !it.programs.is_empty())
+                .all(|checkout| synced(checkout).is_ok())
+            {
+                served_by_daemon = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
     state.write()?;
     after_build(asked, &state, &cwd, served_by_daemon)
 }
@@ -240,6 +323,7 @@ fn by_cargo(
         Err(code) => return Ok(Err(code)),
     };
     let mut state = State::after(asked, cwd, key, built, counts)?;
+    prepare_since_cache(asked, &state)?;
     if state.refusal.is_none() {
         let asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
         let cold: Vec<String> = asked.filter_map(|it| warmed(it).err()).collect();

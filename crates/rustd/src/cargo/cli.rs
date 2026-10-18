@@ -164,6 +164,7 @@ pub(crate) struct Flags {
     pub(crate) packages: Vec<String>,
     pub(crate) workspace: bool,
     pub(crate) excludes: bool,
+    pub(crate) excluded_packages: Vec<String>,
     pub(crate) features: Vec<String>,
     pub(crate) all_features: bool,
     pub(crate) no_default_features: bool,
@@ -287,7 +288,9 @@ impl Invocation {
             _ if flags.no_default_features => {
                 "--no-default-features is not loaded by the daemon yet"
             }
-            _ if flags.packages.len() > 1 || flags.excludes => {
+            _ if flags.packages.len() > 1
+                || (flags.excludes && !self.has_ci_test_flags()) =>
+            {
                 "a selection of several packages is not loaded by the daemon yet"
             }
             _ if flags.targets.len() > 1 => "several targets in one build",
@@ -308,6 +311,17 @@ impl Invocation {
         let told = std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
         self.flags.targets.first().cloned().or(told)
     }
+
+    pub(crate) fn has_ci_test_flags(&self) -> bool {
+        self.flags.since.is_some()
+            || self.flags.explain.is_some()
+            || self.flags.list_changed
+            || self.flags.backtest
+            || self.flags.junit.is_some()
+            || self.flags.json
+            || self.flags.also_run.is_some()
+            || self.flags.retries.is_some()
+    }
 }
 
 impl Flags {
@@ -318,7 +332,10 @@ impl Flags {
             "--manifest-path" => self.manifest_path = value.map(PathBuf::from),
             "-p" | "--package" => self.packages.extend(owned()),
             "--workspace" | "--all" => self.workspace = true,
-            "--exclude" => self.excludes = true,
+            "--exclude" => {
+                self.excludes = true;
+                self.excluded_packages.extend(owned());
+            }
             "-F" | "--features" => {
                 let features = value.unwrap_or_default().split([',', ' ']);
                 self.features.extend(features.filter(|it| !it.is_empty()).map(str::to_owned));
