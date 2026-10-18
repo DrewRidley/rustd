@@ -90,6 +90,45 @@ fn clippy_command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+
+    let unit_dir = unit.records.join(&unit.id);
+    let known_files = unit.known_clippy_files();
+    if let Some(shadow) =
+        super::clippy::prepare_shadow(&unit.cwd, &unit.source, &unit_dir, &known_files)
+    {
+        let mut shadow_args = unit.args.clone();
+        if let Some(src_idx) = (0..shadow_args.len()).find(|&at| {
+            shadow_args[at].ends_with(".rs")
+                && !(at > 0 && VALUED.contains(&shadow_args[at - 1].as_str()))
+        }) {
+            shadow_args[src_idx] = shadow.shadow_source.display().to_string();
+        }
+        shadow_args.push(format!("--remap-path-prefix={}/=", shadow.shadow_root.display()));
+        let output = Command::new(&driver)
+            .arg(&rustc)
+            .args(&shadow_args)
+            .args(&extra)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .with_context(|| format!("running {}", Path::new(&driver).display()))?;
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() || !stderr_str.contains("{ loop {}") {
+            unit.rewrite_shadow_dep_info(&shadow.shadow_root);
+            if std::env::var_os("RUSTD_CLIPPY_VERBOSE").is_some() {
+                eprintln!(
+                    "[rustd clippy] {}: linted {} changed fn(s), elided {} unchanged fn(s)",
+                    unit.crate_name, shadow.kept_changed_fns, shadow.elided_fns
+                );
+            }
+            std::io::stderr().write_all(&output.stderr)?;
+            if output.status.success() {
+                let _ = unit.record_clippy(&output.stderr);
+            }
+            std::process::exit(output.status.code().unwrap_or(1));
+        }
+    }
+
     let output = Command::new(&driver)
         .arg(&rustc)
         .args(&args)
@@ -354,6 +393,9 @@ impl Unit {
             out_dir.join(format!("{stem}.rmeta")),
         ];
         let unit_dir = self.records.join(&self.id);
+        if stderr.is_empty() {
+            super::clippy::save_snapshot(&self.cwd, &unit_dir, &inputs.files);
+        }
         let artifacts_dir = unit_dir.join("clippy-artifacts");
         std::fs::create_dir_all(&artifacts_dir)?;
         let outlines_dir = self.records.join("clippy-outlines");
@@ -382,5 +424,35 @@ impl Unit {
         std::fs::write(&new, serde_json::to_vec(&cache)?)?;
         std::fs::rename(&new, &cache_path)?;
         Ok(())
+    }
+
+    fn known_clippy_files(&self) -> Vec<PathBuf> {
+        let record = self.as_record(0, Vec::new(), None);
+        let inputs = record.inputs();
+        if !inputs.files.is_empty() {
+            return inputs.files;
+        }
+        let cache_path = self.records.join(&self.id).join("clippy-cache.json");
+        if let Ok(text) = std::fs::read_to_string(&cache_path)
+            && let Ok(cached) = serde_json::from_str::<ClippyCache>(&text)
+        {
+            return cached.files;
+        }
+        Vec::new()
+    }
+
+    fn rewrite_shadow_dep_info(&self, shadow_root: &Path) {
+        let record = self.as_record(0, Vec::new(), None);
+        let Some(out_dir) = record.out_dir() else { return };
+        let stem =
+            format!("{}{}", self.crate_name, record.codegen("extra-filename").unwrap_or_default());
+        let dep_path = out_dir.join(format!("{stem}.d"));
+        let Ok(text) = std::fs::read_to_string(&dep_path) else { return };
+        let prefix = format!("{}/", shadow_root.display());
+        let prefix_escaped = prefix.replace(' ', "\\ ");
+        let replaced = text.replace(&prefix, "").replace(&prefix_escaped, "");
+        if replaced != text {
+            let _ = std::fs::write(&dep_path, replaced);
+        }
     }
 }

@@ -6,6 +6,7 @@ pub(crate) mod wrapper;
 
 mod cli;
 mod client;
+mod clippy;
 mod plan;
 mod run;
 mod say;
