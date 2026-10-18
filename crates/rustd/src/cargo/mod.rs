@@ -248,13 +248,50 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             say::status(asked.flags.quiet, "Finished", &finished);
             (state, true)
         }
-        Some(Err((state, reason))) => {
-            say::fallback(&reason, "building with cargo");
-            let mut counts = state.counts;
-            *counts.cargo.entry(reason).or_default() += 1;
-            match by_cargo(asked, &cwd, &key, counts)? {
-                Ok(state) => (state, false),
-                Err(code) => return Ok(code),
+        Some(Err((mut state, reason))) => {
+            if (asked.flags.list_changed || asked.flags.explain.is_some())
+                && reason.contains("the list of tests is rustc's to write")
+            {
+                state.counts.served += 1;
+                let took = started.elapsed().as_secs_f64();
+                let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
+                say::status(asked.flags.quiet, "Finished", &finished);
+                (state, true)
+            } else {
+                let saved_selections: Vec<(std::path::PathBuf, Option<String>, Option<String>)> =
+                    if reason.contains("the list of tests is rustc's to write") {
+                        state
+                            .checkouts
+                            .iter()
+                            .flat_map(|c| &c.programs)
+                            .map(|p| {
+                                let t = std::fs::read_to_string(p.object.with_extension("tests.txt")).ok();
+                                let e = std::fs::read_to_string(p.object.with_extension("explain.txt")).ok();
+                                (p.object.clone(), t, e)
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                say::fallback(&reason, "building with cargo");
+                let mut counts = state.counts;
+                *counts.cargo.entry(reason).or_default() += 1;
+                match by_cargo(asked, &cwd, &key, counts)? {
+                    Ok(state) => {
+                        let mut restored = false;
+                        for (obj, t, e) in saved_selections {
+                            if let Some(t) = t {
+                                let _ = std::fs::write(obj.with_extension("tests.txt"), t);
+                                restored = true;
+                            }
+                            if let Some(e) = e {
+                                let _ = std::fs::write(obj.with_extension("explain.txt"), e);
+                            }
+                        }
+                        (state, restored)
+                    }
+                    Err(code) => return Ok(code),
+                }
             }
         }
         None => match by_cargo(asked, &cwd, &key, Counts::default())? {
