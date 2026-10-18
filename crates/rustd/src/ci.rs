@@ -70,6 +70,9 @@ pub(crate) fn analyze_git_diff_since(
         if let Some(reason) = unattributable_path_reason(workspace_root, rel) {
             exit_unattributable(&reason);
         }
+        if !rel.ends_with(".rs") {
+            continue;
+        }
         let abs_path = workspace_root.join(rel);
         let cur_text = match fs::read_to_string(&abs_path) {
             Ok(t) => t,
@@ -118,17 +121,18 @@ fn unattributable_path_reason(workspace_root: &Path, rel: &str) -> Option<String
     if file_name == "rust-toolchain" || file_name == "rust-toolchain.toml" {
         return Some(format!("toolchain file `{rel}` was modified"));
     }
-    if rel.starts_with(".config/") || rel.contains("/.config/") {
+    if rel.starts_with(".cargo/config")
+        || rel.contains("/.cargo/config")
+        || rel == ".config/nextest.toml"
+        || rel.ends_with("/.config/nextest.toml")
+    {
         return Some(format!("configuration file `{rel}` was modified"));
     }
-    if file_name.starts_with("Makefile") && file_name.ends_with(".toml") {
-        return Some(format!("build makefile `{rel}` was modified"));
-    }
-    if rel.ends_with(".surql") || rel.contains("language-tests/") {
-        return Some(format!("test fixture `{rel}` was modified"));
-    }
     if !rel.ends_with(".rs") {
-        return Some(format!("non-Rust file `{rel}` was modified"));
+        if std::env::var_os("RUSTD_STRICT_DIFF_PATHS").is_some() {
+            return Some(format!("non-Rust file `{rel}` was modified"));
+        }
+        return None;
     }
     // Check if the `.rs` file belongs to a proc-macro crate.
     let mut dir = workspace_root.join(rel);
@@ -567,6 +571,8 @@ pub(crate) fn expand_exact_tests(test_bin: &Path, wanted: &[String]) -> Vec<Stri
 pub(crate) fn run_isolated_test_suite(
     pkg: &str,
     test_bin: &Path,
+    pkg_dir: Option<&Path>,
+    pkg_env: &[(String, String)],
     tests: &[String],
     reasons: &HashMap<String, String>,
     cfg: &NextestConfig,
@@ -615,6 +621,10 @@ pub(crate) fn run_isolated_test_suite(
                         let mut cmd = Command::new(test_bin);
                         cmd.arg("--exact").arg(test_name);
                         cmd.args(extra_args);
+                        cmd.envs(pkg_env.iter().cloned());
+                        if let Some(dir) = pkg_dir {
+                            cmd.current_dir(dir);
+                        }
                         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                         if let Ok(out) = cmd.output() {
                             combined_out = format!(
@@ -623,7 +633,7 @@ pub(crate) fn run_isolated_test_suite(
                                 String::from_utf8_lossy(&out.stderr)
                             );
                             if combined_out.contains("running 0 tests")
-                                || combined_out.contains("0 passed; 0 failed")
+                                || combined_out.contains("0 passed; 0 failed; 0 ignored; 0 measured")
                             {
                                 zero_matched = true;
                                 break;

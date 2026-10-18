@@ -161,6 +161,7 @@ impl Record {
 
     pub(crate) fn is_test(&self) -> bool {
         self.args.iter().any(|it| it == "--test")
+            || self.values("--cfg").any(|it| it == "test")
     }
 
     fn crate_types(&self) -> Vec<&str> {
@@ -169,7 +170,8 @@ impl Record {
 
     /// Whether rustc links an executable from the crate.
     pub(crate) fn is_linked(&self) -> bool {
-        self.is_test() || self.crate_types() == ["bin"]
+        let types = self.crate_types();
+        self.is_test() || types.is_empty() || types == ["bin"]
     }
 
     pub(crate) fn is_rlib(&self) -> bool {

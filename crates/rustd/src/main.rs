@@ -3241,7 +3241,7 @@ fn main() -> anyhow::Result<()> {
     }
     // The first is the program asked for when a request names none.
     let (wrote, whole) = (Some(args.out.clone()), Some(args.out.clone()));
-    if serving && args.cfg_test {
+    if serving && (args.cfg_test || args.dev_deps) {
         hir::attach_db(&db, || impact::warm_crate_deps(&db, &listed, &args));
     }
     let tests = Some(hir::attach_db(&db, || Tests::of(&db, &listed, &args)));

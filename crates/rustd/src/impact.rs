@@ -320,7 +320,7 @@ pub(crate) fn select_dirty_and_tests(
     }
 
     if dirty_files.is_empty() {
-        if args.cfg_test {
+        if args.cfg_test || args.dev_deps {
             let _ = std::fs::write(args.out.with_extension("tests.txt"), "");
             let _ = std::fs::write(args.out.with_extension("explain.txt"), "");
         }
@@ -707,7 +707,7 @@ pub(crate) fn select_dirty_and_tests(
         global_test_adts.extend(&test_adts);
         global_impacted_fns.extend(&direct_changed);
 
-        if args.cfg_test
+        if (args.cfg_test || args.dev_deps)
             && (!global_impacted_fns.is_empty()
                 || !global_test_adts.is_empty()
                 || !global_test_trait_callees.is_empty())
@@ -877,33 +877,39 @@ pub(crate) fn select_dirty_and_tests(
                 } else {
                     bin_crate_env.replace('-', "_")
                 };
-                for &func in &l.functions {
-                    let flags = hir_def::attrs::AttrFlags::query(db, func.into());
-                    if test_reach.contains(&func)
-                        && flags.contains(hir_def::attrs::AttrFlags::IS_TEST)
-                        && !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE)
-                        && let Some(path) = resolver.path(func)
-                    {
-                        if table.get(&path).is_none() {
-                            direct_changed.insert(func);
-                        }
-                        let (target_krate, rel) =
-                            path.split_once("::").unwrap_or(("", path.as_str()));
-                        let entry = if !target_krate.is_empty()
-                            && !bin_crate_norm.is_empty()
-                            && target_krate != bin_crate_norm
+                let owns_tests = std::env::var_os("RUSTD_BIN_CRATE").is_some()
+                    || args.batch.is_empty()
+                    || crate::crates_named(db, &args.krate, args)
+                        .is_ok_and(|first| first.contains(&c));
+                if owns_tests {
+                    for &func in &l.functions {
+                        let flags = hir_def::attrs::AttrFlags::query(db, func.into());
+                        if test_reach.contains(&func)
+                            && flags.contains(hir_def::attrs::AttrFlags::IS_TEST)
+                            && !flags.contains(hir_def::attrs::AttrFlags::IS_IGNORE)
+                            && let Some(path) = resolver.path(func)
                         {
-                            format!("@target={target_krate}\t{rel}")
-                        } else {
-                            rel.to_owned()
-                        };
-                        if !impacted_tests.contains(&entry) {
-                            let why = explain_reasons
-                                .get(&func)
-                                .cloned()
-                                .unwrap_or_else(|| format!("`{rel}` edited"));
-                            impacted_explains.push(format!("{rel}\t{why}"));
-                            impacted_tests.push(entry);
+                            if table.get(&path).is_none() {
+                                direct_changed.insert(func);
+                            }
+                            let (target_krate, rel) =
+                                path.split_once("::").unwrap_or(("", path.as_str()));
+                            let entry = if !target_krate.is_empty()
+                                && !bin_crate_norm.is_empty()
+                                && target_krate != bin_crate_norm
+                            {
+                                format!("@target={target_krate}\t{rel}")
+                            } else {
+                                rel.to_owned()
+                            };
+                            if !impacted_tests.contains(&entry) {
+                                let why = explain_reasons
+                                    .get(&func)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("`{rel}` edited"));
+                                impacted_explains.push(format!("{rel}\t{why}"));
+                                impacted_tests.push(entry);
+                            }
                         }
                     }
                 }
@@ -925,7 +931,7 @@ pub(crate) fn select_dirty_and_tests(
         }
     }
 
-    if args.cfg_test {
+    if args.cfg_test || args.dev_deps {
         let _ = std::fs::write(args.out.with_extension("tests.txt"), impacted_tests.join("\n"));
         let _ = std::fs::write(
             args.out.with_extension("explain.txt"),

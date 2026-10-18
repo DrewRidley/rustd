@@ -385,16 +385,21 @@ fn run_ci_tests(
     }
     let mut outcomes = Vec::with_capacity(total_tests);
     for (run_pkg, run_bin, run_tests) in &target_runs {
+        let test_prog = state.programs.iter().find(|p| p.executable == *run_bin);
+        let pkg_dir = test_prog.map(|p| p.package_dir.as_path());
+        let pkg_env = test_prog.map_or(&[][..], |p| p.env.as_slice());
         let bin_outcomes = crate::ci::run_isolated_test_suite(
             run_pkg,
             run_bin,
+            pkg_dir,
+            pkg_env,
             run_tests,
             &reasons,
             &cfg,
             &asked.trailing,
             asked.flags.json,
         );
-        if let Some(test_prog) = state.programs.iter().find(|p| p.executable == *run_bin)
+        if let Some(test_prog) = test_prog
             && let Some(obj) = plan_object(state, test_prog)
         {
             let fp = obj.with_extension("failed.txt");

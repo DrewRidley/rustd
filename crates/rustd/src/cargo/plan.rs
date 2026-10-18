@@ -100,7 +100,7 @@ impl Plan {
             }
             // With `cfg(test)` the daemon has it on every crate of the workspace, and rustc
             // built the libraries of a unit test without it.
-            if unit_test {
+            if unit_test && std::env::var_os("RUSTD_FULL").is_some() {
                 plan.left_to_rustc.extend(owner.inputs().files);
             } else {
                 plan.crates.push(owner.source.clone());
@@ -142,6 +142,7 @@ fn unsupported(unit: &Record) -> Option<String> {
             key,
             "threads"
                 | "share-generics"
+                | "embed-metadata"
                 | "macro-backtrace"
                 | "proc-macro-backtrace"
                 | "time-passes"

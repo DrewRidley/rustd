@@ -644,11 +644,13 @@ fn repository(root: &Path) -> PathBuf {
 
 /// The variables cargo sets for a program of `package` when it runs it.
 fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> {
+    let pkg_dir = package_dir(package);
+    let mut env = cargo_config_env(&pkg_dir);
     let version = &package.version;
     let text = |it: &Option<String>| it.clone().unwrap_or_default();
-    let mut env = vec![
+    env.extend([
         ("CARGO".to_owned(), cargo_path().display().to_string()),
-        ("CARGO_MANIFEST_DIR".to_owned(), package_dir(package).display().to_string()),
+        ("CARGO_MANIFEST_DIR".to_owned(), pkg_dir.display().to_string()),
         ("CARGO_MANIFEST_PATH".to_owned(), package.manifest_path.to_string()),
         ("CARGO_PKG_NAME".to_owned(), package.name.to_string()),
         ("CARGO_PKG_VERSION".to_owned(), version.to_string()),
@@ -673,12 +675,64 @@ fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> 
             "CARGO_PKG_README".to_owned(),
             package.readme.as_ref().map(|it| it.to_string()).unwrap_or_default(),
         ),
-    ];
+    ]);
     for script in scripts.iter().filter(|it| it.package_id == package.id) {
         env.push(("OUT_DIR".to_owned(), script.out_dir.to_string()));
         env.extend(script.env.iter().cloned());
     }
     env
+}
+
+/// Reads `[env]` entries from `.cargo/config.toml` / `.cargo/config` above `dir`.
+fn cargo_config_env(dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut seen = FxHashSet::default();
+    for path in named_above(dir, &CONFIGS).chain(cargo_home_configs()) {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut in_env = false;
+        for raw_line in text.lines() {
+            let line = raw_line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                in_env = sec.trim() == "env";
+                continue;
+            }
+            if !in_env {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let key = k.trim().trim_matches('"').trim_matches('\'');
+            if key.is_empty() || !seen.insert(key.to_owned()) {
+                continue;
+            }
+            let val_part = v.trim();
+            let force = val_part.contains("force = true") || val_part.contains("force=true");
+            if !force && std::env::var_os(key).is_some() {
+                continue;
+            }
+            let val = if let Some(s) = val_part.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+            {
+                Some(s.to_owned())
+            } else if let Some(s) = val_part.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+                Some(s.to_owned())
+            } else if let Some(idx) = val_part.find("value")
+                && let Some(rest) = val_part[idx + 5..].trim_start().strip_prefix('=')
+            {
+                let rest = rest.trim_start();
+                rest.strip_prefix('"')
+                    .and_then(|s| s.split_once('"'))
+                    .map(|(v, _)| v.to_owned())
+            } else {
+                None
+            };
+            if let Some(val) = val {
+                out.push((key.to_owned(), val));
+            }
+        }
+    }
+    out
 }
 
 /// Everything a change to which makes the next build cargo's.
@@ -726,6 +780,25 @@ fn guards(
     }
     let left = checkouts.iter().flat_map(|it| &it.programs).flat_map(|it| it.left_to_rustc.clone());
     guards.push(Guard::files("a library its unit tests are linked with as rustc built it:", left));
+    let mut path_dep_dirs = FxHashSet::default();
+    for pkg in metadata.workspace_packages() {
+        for dep in &pkg.dependencies {
+            if let Some(dep_path) = &dep.path {
+                let dp = dep_path.as_std_path();
+                if !dp.starts_with(root) {
+                    let watch_dir = dp
+                        .parent()
+                        .filter(|p| *p != root && p.join("Cargo.toml").exists())
+                        .unwrap_or(dp);
+                    path_dep_dirs.insert(watch_dir.to_owned());
+                }
+            }
+        }
+    }
+    for dir in path_dep_dirs {
+        let what = format!("path dependency `{}` is built by cargo", dir.display());
+        guards.push(Guard::Tree { what, dir });
+    }
     guards
 }
 
