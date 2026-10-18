@@ -318,8 +318,7 @@ fn run_ci_tests(
         .map(read_lines)
         .unwrap_or_default();
 
-    let fallback_pkgs: Option<Vec<String>> = if !served_by_daemon
-        && let Some(sha) = &asked.flags.since
+    let fallback_pkgs: Option<Vec<String>> = if let Some(sha) = &asked.flags.since
         && let Ok(diff_files) = crate::ci::analyze_git_diff_since(&state.root, sha)
     {
         Some(crate::ci::infer_packages_from_diff(&state.root, &diff_files))
@@ -357,18 +356,21 @@ fn run_ci_tests(
                 target_runs.push((test.package.clone(), test.executable.clone(), exact));
             }
         } else {
-            // Fallback path: the daemon did not compute `tests.txt` for this binary.
-            // Never silently select 0 tests and exit 0 — run all tests in the affected package(s).
-            if let Some(ref pkgs) = fallback_pkgs
-                && !pkgs.is_empty()
-                && !pkgs.contains(&test.package)
-            {
-                continue;
-            }
-            if let Some(all_tests) = crate::ci::list_tests_cached(&test.executable)
-                && !all_tests.is_empty()
-            {
-                target_runs.push((test.package.clone(), test.executable.clone(), all_tests));
+            let pkg_modified = match &fallback_pkgs {
+                Some(pkgs) => pkgs.contains(&test.package),
+                None => !served_by_daemon,
+            };
+            if pkg_modified {
+                if let Some(all_tests) = crate::ci::list_tests_cached(&test.executable)
+                    && !all_tests.is_empty()
+                {
+                    target_runs.push((test.package.clone(), test.executable.clone(), all_tests));
+                }
+            } else if !also.is_empty() {
+                let exact = crate::ci::expand_exact_tests(&test.executable, &also);
+                if !exact.is_empty() {
+                    target_runs.push((test.package.clone(), test.executable.clone(), exact));
+                }
             }
         }
     }
