@@ -840,7 +840,9 @@ def picks(work):
                 unreached |= {"versioned", "answered", "runs_the_program", "golden", "ui_case"}
             picked = not ran_names & unreached
         runs = {True: "every test runs", False: "the others do not", "any": "it runs"}[everything]
-        check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {runs}", failed and picked, f"exit {code}, ran {sorted(ran_names)}")
+        # rustd says why it ran more than the edit reaches, which a check that did not hold shows.
+        said = "" if failed and picked else "; " + " | ".join(re.findall(r"rustd:\S* (.*)$", re.sub(r"\x1b\[[0-9;]*m", "", ran.stderr), re.M))
+        check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {runs}", failed and picked, f"exit {code}, ran {sorted(ran_names)}{said}")
         if failing:
             again, _, _ = test()
             check(f"{label}: run again, it fails again", again != 0, f"exit {again}")
@@ -889,7 +891,9 @@ def picks(work):
     open(path, "w").write(before.replace(PICK_CASES[0][2], PICK_CASES[0][3], 1))
     _, ran = ours.cargo("test", "--no-fail-fast", "--since", "HEAD")
     since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
-    check("--since HEAD: the edit's test fails, the others do not", ran.returncode != 0 and set(since) & ALL_PICK_TESTS == {"tests::unit"}, f"ran {sorted(since)}")
+    held = ran.returncode != 0 and set(since) & ALL_PICK_TESTS == {"tests::unit"}
+    said = "" if held else "; " + " | ".join(re.findall(r"rustd:\S* (.*)$", re.sub(r"\x1b\[[0-9;]*m", "", ran.stderr), re.M))
+    check("--since HEAD: the edit's test fails, the others do not", held, f"ran {sorted(since)}{said}")
     open(path, "w").write(before)
     wait_warm(ours, ws)
     # A variable that was not there when the tests passed, which a test reads.
