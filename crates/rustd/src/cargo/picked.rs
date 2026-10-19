@@ -11,7 +11,7 @@ use super::{
     daemon::{Checkout, Reply, Request},
     passed::{Passed, is_rust},
     say,
-    state::{Kind, State},
+    state::{Kind, Program, State},
 };
 use crate::impact::{Change, Picked};
 
@@ -29,7 +29,10 @@ const BUILDS_ALL: &[&str] =
 /// What the tests of a build run.
 pub(crate) struct Picks {
     /// What to run of each program of the state, by its place there: `None` is all of it.
-    pub(crate) programs: Vec<Option<Picked>>,
+    programs: Vec<Option<Picked>>,
+    /// Which program each is: its package, kind and name, which a build by cargo after
+    /// the picks were made keeps.
+    names: Vec<(String, Kind, String)>,
     /// The packages whose doc tests run; `None` is all that are asked for.
     pub(crate) doc_packages: Option<Vec<String>>,
     /// The source to keep as what passed, once everything ran and passed.
@@ -39,9 +42,17 @@ pub(crate) struct Picks {
 
 impl Picks {
     /// Everything, as asked.
-    fn all(state: &State, passing: Option<Passed>) -> Picks {
+    pub(crate) fn all(state: &State, passing: Option<Passed>) -> Picks {
         let programs = vec![None; state.programs.len()];
-        Picks { programs, doc_packages: None, passing, key: state.key.clone() }
+        Picks { programs, names: names(state), doc_packages: None, passing, key: state.key.clone() }
+    }
+
+    /// What to run of `program`: `None` is all of it, also for one not known when the picks
+    /// were made.
+    pub(crate) fn of(&self, program: &Program) -> Option<&Picked> {
+        let name = (program.package.clone(), program.kind, program.name.clone());
+        let at = self.names.iter().position(|it| *it == name)?;
+        self.programs[at].as_ref()
     }
 
     /// Keeps the source the tests ran on as what passed: they ran and all passed.
@@ -59,8 +70,10 @@ impl Picks {
     }
 }
 
-/// What the tests of `state`, which the daemon built when `by_daemon`, run.
-pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool) -> Picks {
+/// What the tests of `state`, which the daemon built when `by_daemon`, run. With `unsynced`,
+/// cargo builds them and the daemon has not read the source since the last build: it is
+/// asked to first.
+pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced: bool) -> Picks {
     // The tests named are the ones asked for, and not all of them ran once they did.
     if !asked.positional.is_empty() || !harmless(&asked.trailing) {
         return Picks::all(state, None);
@@ -113,6 +126,7 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool) -> Picks 
     }
     let mut picks = Picks {
         programs: vec![None; state.programs.len()],
+        names: names(state),
         doc_packages: None,
         passing: None,
         key: state.key.clone(),
@@ -158,12 +172,16 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool) -> Picks 
     picks.doc_packages = Some(documented);
     let selected = match sources.is_empty() {
         true => Vec::new(),
-        false => selected(state, &sources, &texts, &now),
+        false => selected(state, &sources, &texts, &now, unsynced),
     };
     for (at, program) in state.programs.iter().enumerate() {
         let reads_source = sources.iter().any(|it| program.inputs().contains(it));
         picks.programs[at] = Some(match (whole[at].take(), program.asked_as) {
             (Some(why), _) => Picked::Whole(why),
+            // What it is compiled from is not known, so neither is whether that changed.
+            (None, _) if program.inputs().is_empty() && !changed.is_empty() => {
+                Picked::Whole("rustd does not know what it is compiled from".to_owned())
+            }
             (None, _) if !reads_source => {
                 Picked::Nothing("nothing it is compiled from changed".to_owned())
             }
@@ -179,6 +197,10 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool) -> Picks 
     picks
 }
 
+fn names(state: &State) -> Vec<(String, Kind, String)> {
+    state.programs.iter().map(|it| (it.package.clone(), it.kind, it.name.clone())).collect()
+}
+
 /// What the daemon says to run of each program of each checkout of `state`, after the
 /// source files `sources` changed from `texts`.
 fn selected(
@@ -186,6 +208,7 @@ fn selected(
     sources: &[PathBuf],
     texts: &BTreeMap<PathBuf, Option<String>>,
     now: &Passed,
+    unsynced: bool,
 ) -> Vec<Vec<Picked>> {
     let changes: Vec<Change> = sources
         .iter()
@@ -213,6 +236,10 @@ fn selected(
             };
             if checkout.programs.is_empty() {
                 return Vec::new();
+            }
+            // What the worker builds here is not used: cargo builds.
+            if unsynced {
+                let _ = super::synced(checkout);
             }
             let asked = Checkout { sources: Vec::new(), ..super::asking(checkout) };
             match client::ask(Request::Select(asked, path), Start::Never) {

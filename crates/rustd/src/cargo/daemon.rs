@@ -593,12 +593,15 @@ impl Daemon {
         let Some(worker) = worker else {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
         };
-        let ready = lock(&worker.checkouts).get(&checkout.key).is_some_and(|loaded| {
-            loaded.generation == checkout.generation && matches!(loaded.warmth, Warmth::Ready)
-        });
-        match ready {
-            true => worker.select(checkout, changes),
-            false => Reply::Cold { reason: "the daemon has not built this checkout".to_owned() },
+        let warmth = match lock(&worker.checkouts).get(&checkout.key) {
+            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
+            Some(_) => Warmth::Failed("the daemon has another build of the checkout".to_owned()),
+            None => Warmth::Failed("the daemon has not loaded this build".to_owned()),
+        };
+        match warmth {
+            Warmth::Ready => worker.select(checkout, changes),
+            Warmth::Loading(_) => Reply::Cold { reason: "the daemon is still loading".to_owned() },
+            Warmth::Failed(reason) => Reply::Cold { reason },
         }
     }
 

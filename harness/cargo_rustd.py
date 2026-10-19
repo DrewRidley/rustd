@@ -326,6 +326,22 @@ def test_results(ran):
     return ran.returncode, tests, totals
 
 
+def picked_difference(ours, theirs):
+    """`None` when `cargo rustd test`, which runs the tests the edits since they last all
+    passed reach, ran no test cargo did not, each as cargo's ended, among them every one that
+    failed under cargo, and ended as cargo did; or the first thing that is not so."""
+    (code, mine, _), (cargo_code, other, _) = ours, theirs
+    if code != cargo_code:
+        return f"exit {code!r} for {cargo_code!r}"
+    extra = list((mine - other).items())[:3]
+    if extra:
+        return f"tests differ: rustd only {extra}"
+    missed = [name for name, outcome in other if outcome == "FAILED" and (name, "FAILED") not in mine][:3]
+    if missed:
+        return f"tests that fail under cargo were not run: {missed}"
+    return None
+
+
 def difference(ours, theirs):
     """`None` when the two are the same, or the first thing that is not."""
     if ours == theirs:
@@ -460,7 +476,8 @@ def project(name, spec, work, mode):
         (took, mine), (reference, other) = ours.cargo(command, *args), theirs.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(reference, 2))
         row["built"][label] = ours.how_built(mine.stderr)
-        wrong = difference(compare(mine), compare(other))
+        compared = picked_difference if compare is test_results else difference
+        wrong = compared(compare(mine), compare(other))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
             open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
@@ -583,7 +600,8 @@ def flags(work):
         for command, args, extra in FLAG_CASES:
             (_, mine), (_, other) = ours.cargo(command, *args, env=extra), theirs.cargo(command, *args, env=extra)
             read = test_results if command == "test" else program_output
-            differs = difference(read(mine), read(other))
+            compared = picked_difference if command == "test" else difference
+            differs = compared(read(mine), read(other))
             shown = " ".join([*(f"{k}={v}" for k, v in extra.items()), "cargo rustd", command, *args])
             rows.append((label, shown, how_built(mine.stderr), mine.returncode, differs or "same"))
             if differs:

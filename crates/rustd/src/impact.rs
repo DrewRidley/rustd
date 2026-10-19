@@ -6,7 +6,7 @@
 //! changed are found, and a test is picked when it reaches one: through the functions it
 //! calls or names, the impls of the traits it calls methods of, the impls of the types its
 //! values are of (an operator, a drop or a `?` runs those unnamed), and the statics and
-//! constants it reads. Anything this can't tell runs. `CARGO.md` has the rules.
+//! constants it reads. Anything this can't tell runs. `docs/cargo.md` has the rules.
 
 use std::path::{Path, PathBuf};
 

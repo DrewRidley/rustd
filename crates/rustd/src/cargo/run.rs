@@ -54,10 +54,8 @@ pub(crate) fn tests(
 ) -> anyhow::Result<i32> {
     let mut failed = Vec::new();
     let (mut ran, mut skipped) = (0, 0);
-    for (test, picked) in std::iter::zip(&state.programs, &picks.programs) {
-        if !test.test {
-            continue;
-        }
+    for test in state.programs.iter().filter(|it| it.test) {
+        let picked = picks.of(test);
         let source = test.source.strip_prefix(&test.package_dir).unwrap_or(&test.source);
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
