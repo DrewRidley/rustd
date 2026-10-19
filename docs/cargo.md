@@ -25,7 +25,7 @@ The project you build must use Rust 1.99.0, the toolchain rustd is pinned to. Us
 
     cargo rustd build [cargo's flags]
     cargo rustd run   [cargo's flags] [-- program arguments]
-    cargo rustd test  [cargo's flags] [test names] [-- test arguments]
+    cargo rustd test  [cargo's flags] [--since <commit>] [--full] [test names] [-- test arguments]
     cargo rustd check [cargo's flags]
     cargo rustd status
     cargo rustd stop
@@ -61,6 +61,69 @@ a build took:
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
 status.
+
+## Which tests run
+
+`cargo rustd test` runs the tests that the edits since its tests last all passed can change
+the outcome of, and says which test executables it skipped:
+
+        Running unittests src/lib.rs (target/debug/deps/core-1f2e…), 2 of its tests
+       Skipping tests/cli.rs (nothing it is compiled from changed)
+         Picked 1 test executables, 1 not reached by the edits; `--full` runs all
+
+rustd keeps, for each command line, the files of the checkout that git does not ignore, the
+files git ignores inside its packages (but what a build writes), and the files rustc read, as
+they were at the last `cargo rustd test` in which every test ran and passed, under
+`RUSTD_HOME/passed`. The files are looked at before anything is built; a run compares them
+with what passed, and is kept as passing only when they are still the same once the tests
+are done. A file is read again unless its size, its times and its inode are what they were. The daemon is then asked, for each
+test executable it built, which of its tests reach a function whose body changed: through
+the functions a test calls or names, every impl of a trait method it calls (any impl, for a
+call through `dyn` or a generic), the trait impls of the types its values have (operators,
+drops, `?` and formatting call those without naming them), and the statics and constants it
+reads. Those tests run with `--exact`. A test the harness lists that rustd does not know,
+one a macro made, always runs.
+
+A run that fails keeps the files of the last run that passed, so the next run picks the same
+tests again, and more if more changed.
+
+Whatever can't be told runs. Every test runs when:
+
+- no run of every test has passed yet (the first run of a command line, which cargo builds
+  with nothing looked at before, is not kept, so the second runs every test too), `--full`
+  or `RUSTD_ALL_TESTS` is given, or tests are
+  picked by name or with harness flags such as `--ignored` or `--skip` (and such a run is not
+  kept as one that passed);
+- `Cargo.toml`, `Cargo.lock`, a `build.rs`, a toolchain file or `.cargo/config*` changed,
+  anywhere in the checkout;
+- a file other than Rust source changed in a package with a build script, which may read it,
+  or source of a proc macro, or Rust source no test program is compiled from in a package
+  with a build script;
+- an environment variable is not what it was at the last run that passed, also with
+  `--since` (shell noise such as `PWD`, `TERM_*` or `SSH_*` is left out; `passed.rs` lists it);
+- a file changed that rustc did not read and that is outside every package, which a test
+  may read as it runs; but for a Markdown file at the root of the checkout and the files of
+  `.github`;
+- cargo built instead of the daemon, or the daemon has not loaded the workspace.
+
+All of a test executable runs when a file of a crate it is compiled from changed in more
+than function bodies: a signature, a type, a `macro_rules!`, a `cfg`, a `use`, a constant or
+static, a `const fn`, or anything inside a macro call. The same goes for a changed file that
+rustc read with `include_str!` or `include_bytes!`, any other file in its package that rustc
+did not compile (a test may read it as it runs, Rust source too), and a function the daemon
+can't place. What a linker or a runtime
+calls without a call that names it, a `#[used]` or `#[link_section]` static (as `inventory`,
+`linkme` and `ctor` write them) or a `#[no_mangle]` function, can run under any test, so an
+edit it reaches runs all of the program. A
+test target with `harness = false` runs whole when its `main` reaches an edit. Doc tests run
+for each package whose library is compiled from a changed file.
+
+`--since <commit>` picks the tests the changes since the commit reach, the committed and the
+uncommitted ones, and leaves what passed as it was.
+
+A test that reads, as it runs, a file outside the checkout, a file git ignores outside its
+package, a directory git ignores with more than 10,000 files, or the network or the clock,
+can fail after a run that skipped it.
 
 Loading takes from under a second to most of a minute depending on the workspace. Measured
 on one machine, it was 2.5 s for just, 6.9 s for ripgrep and 42.4 s for nushell (see
@@ -179,6 +242,8 @@ build a command line is, so changing one starts from a cargo build again.
 | `RUSTD_OPT` | LLVM optimisation level, 0 to 3. Functions are still compiled one at a time | 2 |
 | `RUSTD_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `RUSTD_SPLICE` | `0` links in full after every edit instead of splicing | splice |
+
+`RUSTD_ALL_TESTS`, when set, has `cargo rustd test` run every test, as `--full` does.
 
 These are read by the daemon when it starts, from the environment of whichever command
 started it. To change one, run `cargo rustd stop` first.

@@ -8,6 +8,8 @@ mod ancestor;
 mod cli;
 mod client;
 mod package;
+mod passed;
+mod picked;
 pub(crate) mod plan;
 pub(crate) mod run;
 mod say;
@@ -114,16 +116,28 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let key = asked.key(&cwd);
     let known = State::read(&key);
+    // The source the tests are picked against and kept as passing is as it was before any
+    // build reads it.
+    let testing = asked.subcommand == Subcommand::Test && !asked.flags.no_run;
+    let mut looked_at = known.as_ref().ok().filter(|_| testing).map(picked::looked_at);
+    let mut served = false;
+    // The tests to run, when the daemon told them before cargo built: it had read the edits
+    // that sent the build to cargo.
+    let mut picked_first = None;
     let state = match known.map(|state| by_daemon(state, asked)) {
         Ok(Err(Left::WithErrors(code))) => return Ok(code),
         Ok(Ok(state)) => {
             let took = started.elapsed().as_secs_f64();
             let finished = format!("`{}` profile [rustd] target(s) in {took:.2}s", state.profile);
             say::status(asked.flags.quiet, "Finished", &finished);
+            served = true;
             state
         }
         Ok(Err(Left::ToCargo(state, reason))) => {
             say::fallback(&reason, "building with cargo");
+            if asked.subcommand == Subcommand::Test && !asked.flags.no_run {
+                picked_first = Some(picked::pick(asked, &state, true, true, looked_at.take()));
+            }
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
             match by_cargo(asked, &cwd, &key, counts)? {
@@ -142,7 +156,13 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
         }
     };
     state.write()?;
-    after_build(asked, &state, &cwd)
+    let picks = match (asked.subcommand, asked.flags.no_run) {
+        (Subcommand::Test, false) => Some(
+            picked_first.unwrap_or_else(|| picked::pick(asked, &state, served, false, looked_at)),
+        ),
+        _ => None,
+    };
+    after_build(asked, &state, &cwd, picks)
 }
 
 /// Why the daemon's programs are not the build.
@@ -306,8 +326,13 @@ fn by_cargo(
     Ok(Ok(state))
 }
 
-/// What the subcommand does once the programs are built.
-fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<i32> {
+/// What the subcommand does once the programs are built: for `test`, runs what `picks` says.
+fn after_build(
+    asked: &Invocation,
+    state: &State,
+    cwd: &Path,
+    picks: Option<picked::Picks>,
+) -> anyhow::Result<i32> {
     match asked.subcommand {
         Subcommand::Build => Ok(0),
         Subcommand::Run => match run::program(asked, state, cwd)? {
@@ -319,14 +344,22 @@ fn after_build(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<
         },
         Subcommand::Test if asked.flags.no_run => Ok(0),
         Subcommand::Test => {
-            let code = run::tests(asked, state, cwd)?;
+            let picks = picks.unwrap_or_else(|| picked::Picks::all(state, None));
+            let code = run::tests(asked, state, cwd, &picks)?;
             let stopped = code != 0 && !asked.flags.no_fail_fast;
             // Cargo 1.99 runs no doc tests when tests are picked by target or by name.
             let picked = asked.flags.selects_targets || !asked.positional.is_empty();
             if stopped || picked || !state.doc_tests {
+                if code == 0 {
+                    picks.passed(state);
+                }
                 return Ok(code);
             }
-            Ok(code.max(run::doc_tests(asked)?))
+            let code = code.max(run::doc_tests(asked, picks.doc_packages.as_deref())?);
+            if code == 0 {
+                picks.passed(state);
+            }
+            Ok(code)
         }
     }
 }

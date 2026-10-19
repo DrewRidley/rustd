@@ -35,6 +35,7 @@ const VALUED: &[&str] = &[
     "--config",
     "-Z",
     "-C",
+    "--since",
 ];
 
 /// The flags that pick targets of a package, after which cargo runs no doc tests.
@@ -53,6 +54,9 @@ const TARGET_SELECTION: &[&str] = &[
 
 /// The flags of `cargo test` that are about running and not about building.
 const RUNNING: &[&str] = &["--no-run", "--no-fail-fast"];
+
+/// The flags of `cargo rustd test` that cargo does not have: which tests to run.
+const RUSTD_ONLY: &[&str] = &["--since", "--full"];
 
 /// The variables that change what cargo builds or what the daemon compiles with, by name
 /// or by what the name starts with. Their values are part of which build this is.
@@ -167,6 +171,10 @@ pub(crate) struct Flags {
     pub(crate) doc: bool,
     /// Whether a flag picks targets, so that `cargo test` runs no doc tests.
     pub(crate) selects_targets: bool,
+    /// `--since <commit>`: the tests to run are those the changes since the commit reach.
+    pub(crate) since: Option<String>,
+    /// `--full`: every test runs.
+    pub(crate) full: bool,
 }
 
 impl Asked {
@@ -212,18 +220,21 @@ pub(crate) fn of_cargo(args: &[String]) -> Option<Invocation> {
 }
 
 impl Invocation {
-    fn parse(subcommand: Subcommand, typed: &[String]) -> Invocation {
-        let (before, after) = match typed.iter().position(|it| it == "--") {
-            Some(at) => (&typed[..at], &typed[at + 1..]),
-            None => (typed, &[][..]),
+    fn parse(subcommand: Subcommand, typed_all: &[String]) -> Invocation {
+        let (before, after) = match typed_all.iter().position(|it| it == "--") {
+            Some(at) => (&typed_all[..at], &typed_all[at + 1..]),
+            None => (typed_all, &[][..]),
         };
         let mut flags = Flags::default();
         let mut build_args = Vec::new();
         let mut positional = Vec::new();
+        // What cargo is handed of what was typed, when cargo builds.
+        let mut typed: Vec<String> = Vec::new();
         let mut words = before.iter();
         while let Some(word) = words.next() {
             if !word.starts_with('-') {
                 positional.push(word.clone());
+                typed.push(word.clone());
                 continue;
             }
             let (flag, joined) = match word.split_once('=') {
@@ -234,11 +245,19 @@ impl Invocation {
                 }
                 _ => (word.as_str(), None),
             };
+            let was_joined = joined.is_some();
             let value = match joined {
                 None if VALUED.contains(&flag) => words.next().cloned(),
                 joined => joined,
             };
             flags.read(flag, value.as_deref());
+            if RUSTD_ONLY.contains(&flag) {
+                continue;
+            }
+            typed.push(word.clone());
+            if !was_joined {
+                typed.extend(value.clone());
+            }
             if RUNNING.contains(&flag) {
                 continue;
             }
@@ -246,7 +265,11 @@ impl Invocation {
             build_args.extend(value);
         }
         let trailing = after.to_vec();
-        Invocation { subcommand, typed: typed.to_vec(), build_args, positional, trailing, flags }
+        if before.len() < typed_all.len() {
+            typed.push("--".to_owned());
+            typed.extend(trailing.iter().cloned());
+        }
+        Invocation { subcommand, typed, build_args, positional, trailing, flags }
     }
 
     /// What the program or a test executable is run with: `cargo run a -- b` runs the
@@ -353,6 +376,8 @@ impl Flags {
             "--no-run" => self.no_run = true,
             "--no-fail-fast" => self.no_fail_fast = true,
             "--doc" => self.doc = true,
+            "--since" => self.since = owned(),
+            "--full" => self.full = true,
             _ => {}
         }
     }
@@ -437,6 +462,18 @@ mod tests {
             (&["filter".to_owned()][..], &["--nocapture".to_owned()][..])
         );
         assert!(test.flags.no_fail_fast && test.flags.no_run);
+    }
+
+    #[test]
+    fn the_flags_that_pick_tests_are_rustds() {
+        let test = build("test", "--since main -p a --full -- --nocapture");
+        assert_eq!(test.flags.since.as_deref(), Some("main"));
+        assert!(test.flags.full);
+        assert_eq!(test.build_args, ["-p", "a"]);
+        assert_eq!(test.typed, ["-p", "a", "--", "--nocapture"]);
+        assert!(test.positional.is_empty());
+        assert_eq!(build("test", "--since=HEAD~1").flags.since.as_deref(), Some("HEAD~1"));
+        assert_eq!(build("test", "-p a").typed, ["-p", "a"]);
     }
 
     #[test]

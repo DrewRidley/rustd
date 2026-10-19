@@ -26,6 +26,13 @@ functions the daemon compiled itself are counted.
 Flags. A small workspace made here is built and run with each flag `cargo rustd` passes
 through, cold and after an edit, and compared with cargo the same way.
 
+Picks. In a workspace made here, a failure planted where one kind of test alone reaches it
+(a unit test, an integration test, a target without the harness, a doc test, a test of a
+downstream crate, an impl called through `dyn`, a new test) is run and fails while the tests
+it does not reach are not run, and an edit to `build.rs`, a manifest, an `include_str!` file
+or a `macro_rules!` runs every test. A test step of a project or of the flags compares as a
+subset of cargo's tests with the same outcomes, among them every test that failed.
+
 Daemon. Started on demand, reused, shared by a git worktree, alive after its client is
 killed, replaced when the client is another build of rustd, gone when idle, and its workers
 gone with it.
@@ -326,6 +333,22 @@ def test_results(ran):
     return ran.returncode, tests, totals
 
 
+def picked_difference(ours, theirs):
+    """`None` when `cargo rustd test`, which runs the tests the edits since they last all
+    passed reach, ran no test cargo did not, each as cargo's ended, among them every one that
+    failed under cargo, and ended as cargo did; or the first thing that is not so."""
+    (code, mine, _), (cargo_code, other, _) = ours, theirs
+    if code != cargo_code:
+        return f"exit {code!r} for {cargo_code!r}"
+    extra = list((mine - other).items())[:3]
+    if extra:
+        return f"tests differ: rustd only {extra}"
+    missed = [name for name, outcome in other if outcome == "FAILED" and (name, "FAILED") not in mine][:3]
+    if missed:
+        return f"tests that fail under cargo were not run: {missed}"
+    return None
+
+
 def difference(ours, theirs):
     """`None` when the two are the same, or the first thing that is not."""
     if ours == theirs:
@@ -460,7 +483,8 @@ def project(name, spec, work, mode):
         (took, mine), (reference, other) = ours.cargo(command, *args), theirs.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(reference, 2))
         row["built"][label] = ours.how_built(mine.stderr)
-        wrong = difference(compare(mine), compare(other))
+        compared = picked_difference if compare is test_results else difference
+        wrong = compared(compare(mine), compare(other))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
             open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
@@ -583,7 +607,8 @@ def flags(work):
         for command, args, extra in FLAG_CASES:
             (_, mine), (_, other) = ours.cargo(command, *args, env=extra), theirs.cargo(command, *args, env=extra)
             read = test_results if command == "test" else program_output
-            differs = difference(read(mine), read(other))
+            compared = picked_difference if command == "test" else difference
+            differs = compared(read(mine), read(other))
             shown = " ".join([*(f"{k}={v}" for k, v in extra.items()), "cargo rustd", command, *args])
             rows.append((label, shown, how_built(mine.stderr), mine.returncode, differs or "same"))
             if differs:
@@ -600,6 +625,287 @@ def flags(work):
     _, counted = ours.cargo("status")
     ours.cargo("stop")
     return rows, wrong, counted.stdout
+
+
+PICK_LIB = """pub mod extra;
+
+pub static GREETING: &str = include_str!("../greeting.txt");
+
+pub fn version() -> &'static str {
+    env!("CORELIB_VERSION")
+}
+
+pub fn answer() -> u32 {
+    macros::answer!()
+}
+
+pub fn unit_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn integration_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn harnessless_only(x: u32) -> u32 {
+    x + 1
+}
+
+/// ```
+/// assert_eq!(corelib::doc_only(1), 2);
+/// ```
+pub fn doc_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn downstream_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn program_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub trait Shape {
+    fn area(&self) -> u32;
+}
+
+struct Square(u32);
+
+impl Shape for Square {
+    fn area(&self) -> u32 {
+        self.0 * self.0
+    }
+}
+
+fn square() -> Box<dyn Shape> {
+    Box::new(Square(3))
+}
+
+pub fn shapes() -> Vec<Box<dyn Shape>> {
+    vec![square()]
+}
+
+pub fn total(shapes: &[Box<dyn Shape>]) -> u32 {
+    shapes.iter().map(|it| it.area()).sum()
+}
+
+macro_rules! three {
+    () => {
+        3
+    };
+}
+
+pub fn macro_value() -> u32 {
+    three!()
+}
+
+pub fn configured() -> u32 {
+    7
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit() {
+        assert_eq!(super::unit_only(1), 2);
+    }
+
+    #[test]
+    fn unrelated() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+"""
+
+PICK_WORKSPACE = {
+    "Cargo.toml": '[workspace]\nmembers = ["corelib", "app", "macros"]\nresolver = "2"\n',
+    "corelib/Cargo.toml": '[package]\nname = "corelib"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nmacros = { path = "../macros" }\n\n[[test]]\nname = "plain"\nharness = false\n',
+    "corelib/build.rs": 'fn main() {\n    println!("cargo:rerun-if-changed=build.rs");\n    println!("cargo:rerun-if-changed=version.txt");\n    let version = std::fs::read_to_string("version.txt").unwrap();\n    println!("cargo:rustc-env=CORELIB_VERSION={}", version.trim());\n}\n',
+    "corelib/version.txt": "1\n",
+    "macros/Cargo.toml": '[package]\nname = "macros"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nproc-macro = true\n',
+    "macros/src/lib.rs": 'use proc_macro::TokenStream;\n\nfn value() -> u32 {\n    42\n}\n\n#[proc_macro]\npub fn answer(_: TokenStream) -> TokenStream {\n    value().to_string().parse().unwrap()\n}\n',
+    "corelib/greeting.txt": "hi\n",
+    "corelib/src/extra.rs": "pub fn extra() -> u32 {\n    1\n}\n",
+    "corelib/src/lib.rs": PICK_LIB,
+    "corelib/tests/it.rs": '#[test]\nfn integration() {\n    assert_eq!(corelib::integration_only(1), 2);\n}\n\n#[test]\nfn other() {\n    assert_eq!(2, 2);\n}\n',
+    "corelib/tests/plain.rs": 'fn main() {\n    assert_eq!(corelib::harnessless_only(1), 2);\n}\n',
+    "corelib/tests/shapes.rs": '#[test]\nfn dyn_area() {\n    assert_eq!(corelib::total(&corelib::shapes()), 9);\n}\n',
+    "corelib/tests/greet.rs": '#[test]\nfn greets() {\n    assert_eq!(corelib::GREETING, "hi\\n");\n}\n\n#[test]\nfn macro_three() {\n    assert_eq!(corelib::macro_value(), 3);\n}\n\n#[test]\nfn configured() {\n    assert_eq!(corelib::configured(), 7);\n}\n',
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ncorelib = { path = "../corelib" }\n',
+    "app/src/lib.rs": 'pub fn app_value() -> u32 {\n    corelib::downstream_only(1)\n}\n',
+    "app/src/main.rs": 'fn main() {\n    println!("{}", corelib::program_only(1));\n}\n',
+    "app/tests/cli.rs": '#[test]\nfn runs_the_program() {\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_app")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "2");\n}\n',
+    "testdata/golden.txt": "gold\n",
+    "app/tests/golden.rs": '#[test]\nfn golden() {\n    let text = std::fs::read_to_string("../testdata/golden.txt").unwrap();\n    assert_eq!(text.trim(), "gold");\n}\n\n#[test]\nfn ui_case() {\n    assert!(std::fs::read_to_string("tests/ui/case.rs").unwrap().contains("ok"));\n}\n',
+    "corelib/fixture.local": "ok\n",
+    "app/tests/ui/case.rs": "// ok\nfn main() {}\n",
+    "corelib/tests/local.rs": '#[test]\nfn local_fixture() {\n    assert_eq!(std::fs::read_to_string("fixture.local").unwrap().trim(), "ok");\n}\n#[test]\nfn env_free() {\n    assert!(std::env::var("PICKS_FAIL").is_err());\n}\n',
+    "app/tests/app.rs": '#[test]\nfn downstream() {\n    assert_eq!(app::app_value(), 2);\n}\n\n#[test]\nfn versioned() {\n    assert_eq!(corelib::version(), "1");\n}\n\n#[test]\nfn answered() {\n    assert_eq!(corelib::answer(), 42);\n}\n',
+}
+
+ALL_PICK_TESTS = {"golden", "local_fixture", "ui_case", "env_free", "configured", "tests::unit", "tests::unrelated", "integration", "other", "dyn_area", "greets", "macro_three", "downstream", "versioned", "answered", "runs_the_program"}
+
+# Each: what is edited, the file, the text and what takes its place, the test that is to fail
+# (`plain` for the target without the harness, `doc` for the doc test), and whether every
+# test is to run.
+PICK_CASES = [
+    ("unit test", "corelib/src/lib.rs", "unit_only(x: u32) -> u32 {\n    x + 1", "unit_only(x: u32) -> u32 {\n    x + 2", "tests::unit", False),
+    ("integration test", "corelib/src/lib.rs", "integration_only(x: u32) -> u32 {\n    x + 1", "integration_only(x: u32) -> u32 {\n    x + 2", "integration", False),
+    ("harness = false", "corelib/src/lib.rs", "harnessless_only(x: u32) -> u32 {\n    x + 1", "harnessless_only(x: u32) -> u32 {\n    x + 2", "plain", False),
+    ("doc test", "corelib/src/lib.rs", "doc_only(x: u32) -> u32 {\n    x + 1", "doc_only(x: u32) -> u32 {\n    x + 2", "doc", False),
+    ("downstream crate", "corelib/src/lib.rs", "downstream_only(x: u32) -> u32 {\n    x + 1", "downstream_only(x: u32) -> u32 {\n    x + 2", "downstream", False),
+    ("a program an integration test runs", "corelib/src/lib.rs", "program_only(x: u32) -> u32 {\n    x + 1", "program_only(x: u32) -> u32 {\n    x + 2", "runs_the_program", False),
+    ("impl called through dyn", "corelib/src/lib.rs", "self.0 * self.0", "self.0 * self.0 + 1", "dyn_area", False),
+    ("new test", "corelib/src/lib.rs", "    #[test]\n    fn unrelated()", "    #[test]\n    fn added() {\n        assert_eq!(1, 2);\n    }\n\n    #[test]\n    fn unrelated()", "tests::added", True),
+    ("include_str! data", "corelib/greeting.txt", "hi\n", "hello\n", "greets", True),
+    ("macro_rules!", "corelib/src/lib.rs", "        3\n    };", "        4\n    };", "macro_three", True),
+    ("cfg", "corelib/src/lib.rs", "pub fn configured() -> u32 {\n    7\n}", "#[cfg(not(test))]\npub fn configured() -> u32 {\n    8\n}\n\n#[cfg(test)]\npub fn configured() -> u32 {\n    7\n}", "configured", True),
+    ("proc macro", "macros/src/lib.rs", "    42", "    43", "answered", True),
+    ("a file a build script reads", "corelib/version.txt", "1\n", "2\n", "versioned", True),
+    ("build.rs", "corelib/build.rs", "fn main() {", "fn main() {\n    // edited", None, True),
+    ("workspace Cargo.toml", "Cargo.toml", 'resolver = "2"\n', 'resolver = "2"\n\n[workspace.metadata]\nedited = true\n', None, True),
+    # A file a test reads as it runs, which rustc does not: outside every package, ignored
+    # by git, and Rust source no target is compiled from.
+    ("a file outside every package", "testdata/golden.txt", "gold\n", "lead\n", "golden", "any"),
+    ("a file git ignores", "corelib/fixture.local", "ok\n", "no\n", "local_fixture", "any"),
+    ("Rust source no target is compiled from", "app/tests/ui/case.rs", "// ok", "// no", "ui_case", "any"),
+    ("Cargo.toml", "corelib/Cargo.toml", 'edition = "2021"\n', 'edition = "2021"\ndescription = "edited"\n', None, True),
+]
+
+
+def picks(work):
+    """Which tests `cargo rustd test` runs after an edit: a failure planted where one kind of
+    test alone reaches it is run and fails, the tests it does not reach are not run, and an
+    edit rustd can't attribute runs every test. The result is each check with whether it
+    held."""
+    ws = os.path.realpath(os.path.join(work, "picks"))
+    for file, text in PICK_WORKSPACE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ws, check=True, capture_output=True)
+    open(os.path.join(ws, ".gitignore"), "w").write("target\ncorelib/fixture.local\n")
+    git("init", "-q"), git("add", "."), git("commit", "-qm", "first")
+    ours = Side(ws, base_env(os.path.join(work, "home-picks")), True)
+    unit = os.path.join(ws, "corelib/src/lib.rs")
+    failing_unit = lambda text: text.replace(PICK_CASES[0][2], PICK_CASES[0][2].replace("+ 1", "+ 3"), 1)
+    checks = []
+
+    def check(name, held, detail=""):
+        checks.append((name, bool(held), detail))
+        print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+
+    def test():
+        # The next edit waits for the daemon to load what cargo built: one written while it
+        # loads has every test run, rightly but not what is checked here.
+        _, ran = ours.cargo("test", "--no-fail-fast")
+        wait_warm(ours, ws)
+        tests = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
+        doc = re.findall(r"^test \S*src/lib\.rs - doc_only .*\.\.\. (\w+)$", ran.stdout, re.M)
+        if doc:
+            tests["doc"] = doc[0]
+        if re.search(r"Running tests/plain\.rs", ran.stderr):
+            tests["plain"] = "ran"
+        return ran.returncode, tests, ran
+
+    code, tests, _ = test()
+    check("the first run runs every test", code == 0 and ALL_PICK_TESTS <= set(tests), f"{sorted(tests)}")
+    # Nothing was looked at before cargo first built, so that run is not kept as passing.
+    code, tests, _ = test()
+    check("the second run runs every test", code == 0 and ALL_PICK_TESTS <= set(tests), f"{sorted(tests)}")
+    code, tests, _ = test()
+    check("a run with nothing changed runs no test", code == 0 and not set(tests) & ALL_PICK_TESTS, f"{sorted(tests)}")
+    for label, file, old, new, failing, everything in PICK_CASES:
+        path = os.path.join(ws, file)
+        before = open(path).read()
+        open(path, "w").write(before.replace(old, new, 1))
+        code, tests, ran = test()
+        ran_names = {name for name in tests if name in ALL_PICK_TESTS}
+        if failing == "plain":
+            failed = code != 0 and re.search(r"panicked at \S*tests/plain\.rs", ran.stderr) is not None
+        elif failing:
+            failed = code != 0 and tests.get(failing) == "FAILED"
+        else:
+            failed = code == 0
+        if everything == "any":
+            picked = True
+        elif everything:
+            picked = ALL_PICK_TESTS <= ran_names
+        else:
+            # The test that fails, and none that the edit does not reach.
+            # The tests of `app` run whole when its program changed, which the test of the
+            # program is for.
+            unreached = {"tests::unrelated", "other", "greets", "macro_three", "configured", "local_fixture", "env_free"}
+            if failing != "runs_the_program":
+                unreached |= {"versioned", "answered", "runs_the_program", "golden", "ui_case"}
+            picked = not ran_names & unreached
+        runs = {True: "every test runs", False: "the others do not", "any": "it runs"}[everything]
+        # rustd says why it ran more than the edit reaches, which a check that did not hold shows.
+        said = "" if failed and picked else "; " + " | ".join(re.findall(r"rustd:\S* (.*)$", re.sub(r"\x1b\[[0-9;]*m", "", ran.stderr), re.M))
+        check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {runs}", failed and picked, f"exit {code}, ran {sorted(ran_names)}{said}")
+        if failing:
+            again, _, _ = test()
+            check(f"{label}: run again, it fails again", again != 0, f"exit {again}")
+        open(path, "w").write(before)
+        code, tests, _ = test()
+        check(f"{label}: undone, the tests pass", code == 0, f"exit {code}")
+    # An edit that leaves the size and the time of the file as they were, with one to
+    # another file of the crate that has it compiled again.
+    before = open(unit).read()
+    extra = os.path.join(ws, "corelib/src/extra.rs")
+    held = os.stat(unit)
+    open(unit, "w").write(failing_unit(before))
+    os.utime(unit, ns=(held.st_atime_ns, held.st_mtime_ns))
+    open(extra, "w").write(PICK_WORKSPACE["corelib/src/extra.rs"].replace("1", "2"))
+    code, tests, _ = test()
+    check("an edit that keeps the size and the time: the edit's test fails", code != 0 and tests.get("tests::unit") == "FAILED", f"exit {code}, ran {sorted(set(tests) & ALL_PICK_TESTS)}")
+    open(unit, "w").write(before)
+    open(extra, "w").write(PICK_WORKSPACE["corelib/src/extra.rs"])
+    test()
+    # An edit saved once the build is done, while the tests are picked and run: the tests ran on
+    # the build before it, so it is not taken as passing.
+    command = ours.argv("test", "--no-fail-fast")
+    running = subprocess.Popen(command, cwd=ws, env=ours.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in running.stderr:
+        if "Finished" in line:
+            open(unit, "w").write(failing_unit(before))
+            break
+    running.communicate()
+    wait_warm(ours, ws)
+    code, tests, _ = test()
+    check("an edit saved while the tests run: the next run runs its test, which fails", code != 0 and tests.get("tests::unit") == "FAILED", f"exit {code}, ran {sorted(set(tests) & ALL_PICK_TESTS)}")
+    open(unit, "w").write(before)
+    test()
+    # The lock file as cargo writes it, once it is there: whatever changes in it runs all.
+    lock = os.path.join(ws, "Cargo.lock")
+    before = open(lock).read()
+    open(lock, "w").write(before + "\n")
+    code, tests, _ = test()
+    check("Cargo.lock: every test runs", ALL_PICK_TESTS <= set(tests), f"exit {code}, ran {sorted(set(tests) & ALL_PICK_TESTS)}")
+    open(lock, "w").write(before)
+    test()
+    # `--since` picks what the changes since a commit reach, and leaves what passed as it was.
+    git("add", "."), git("commit", "-qm", "second")
+    path = os.path.join(ws, "corelib/src/lib.rs")
+    before = open(path).read()
+    open(path, "w").write(before.replace(PICK_CASES[0][2], PICK_CASES[0][3], 1))
+    _, ran = ours.cargo("test", "--no-fail-fast", "--since", "HEAD")
+    since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
+    held = ran.returncode != 0 and set(since) & ALL_PICK_TESTS == {"tests::unit"}
+    said = "" if held else "; " + " | ".join(re.findall(r"rustd:\S* (.*)$", re.sub(r"\x1b\[[0-9;]*m", "", ran.stderr), re.M))
+    check("--since HEAD: the edit's test fails, the others do not", held, f"ran {sorted(since)}{said}")
+    open(path, "w").write(before)
+    wait_warm(ours, ws)
+    # A variable that was not there when the tests passed, which a test reads.
+    _, ran = ours.cargo("test", "--no-fail-fast", "--since", "HEAD", env={"PICKS_FAIL": "1"})
+    since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
+    check("--since HEAD with another variable: every test runs, and the one that reads it fails", ran.returncode != 0 and since.get("env_free") == "FAILED", f"exit {ran.returncode}")
+    wait_warm(ours, ws)
+    _, ran = ours.cargo("test", "--no-fail-fast", "--since", "no-such-commit")
+    since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
+    check("--since an unknown commit: every test runs", ran.returncode == 0 and ALL_PICK_TESTS <= set(since), f"exit {ran.returncode}")
+    ours.cargo("stop")
+    return checks
 
 
 def daemon(work):
@@ -1252,6 +1558,9 @@ def main():
         rows, wrong, counted = flags(work)
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
+        print("picks:", flush=True)
+        result["picks"] = picks(work)
+        result["wrong"] += [f"picks: {name} {detail}" for name, held, detail in result["picks"] if not held]
         print("daemon:", flush=True)
         result["daemon"] = daemon(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
@@ -1265,7 +1574,7 @@ def main():
     rows = {(row["project"], row.get("mode", "rustd")): row for row in before.get("projects", []) + result["projects"]}
     result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
     if "--only-projects" in argv:
-        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon", "plain")})
+        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "picks", "daemon", "plain")})
     json.dump(result, open(stored, "w"), indent=1)
     with open(os.path.join(HERE, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
         md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, rustd / cargo alone for the same step; the steps in the second checkout (`tree`) are rustd's only. "
@@ -1280,6 +1589,8 @@ def main():
         if result["flags"]:
             md.write("## Flags\n\n| Round | Command | Built by | Exit | Against cargo |\n|---|---|---|---:|---|\n")
             md.writelines(f"| {label} | `{shown}` | {who} | {code} | {same} |\n" for label, shown, who, code, same in result["flags"])
+        if result.get("picks"):
+            md.write("\n## Which tests run\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["picks"]))
         if result["daemon"]:
             md.write("\n## Daemon\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["daemon"]))
         if result.get("plain"):

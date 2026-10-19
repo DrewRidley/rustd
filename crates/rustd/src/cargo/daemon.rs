@@ -53,6 +53,9 @@ pub(crate) enum Request {
     Sync(Checkout),
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
+    /// Say which tests of each program of a checkout the changes written to a file reach,
+    /// as the programs were last synced.
+    Select(Checkout, PathBuf),
     Status,
     Stop,
 }
@@ -70,6 +73,11 @@ pub(crate) enum Reply {
     /// What the worker said of each program, in the order asked: its `ok` line, or why it
     /// did not build it.
     Synced {
+        programs: Vec<Result<String, String>>,
+    },
+    /// What the worker said of each program, in the order asked: its `ok` line with what of
+    /// it to run, or why it can't tell.
+    Selected {
         programs: Vec<Result<String, String>>,
     },
     Warming,
@@ -153,12 +161,22 @@ impl Checkout {
 
     /// The line that asks a worker for `plan`.
     fn sync_line(&self, plan: &Plan) -> String {
+        self.line("sync", plan)
+    }
+
+    /// The line that asks a worker which tests of `plan` the changes in `changes` reach.
+    fn select_line(&self, plan: &Plan, changes: &Path) -> String {
+        self.line(&format!("select\t{}", changes.display()), plan)
+    }
+
+    /// The line of a request that names `plan`, after the words of `request`.
+    fn line(&self, request: &str, plan: &Plan) -> String {
         let named =
             |path: &PathBuf| path.strip_prefix(&self.root).unwrap_or(path).display().to_string();
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{request}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project().display(),
             crates,
             plan.object.display(),
@@ -345,6 +363,11 @@ impl Worker {
     /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
     /// the inner one its answer that it does not build this.
     fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, String>> {
+        self.ask_line(checkout, &checkout.sync_line(plan))
+    }
+
+    /// Sends `line` about `checkout` to the process and reads its answer, as [`Worker::ask`].
+    fn ask_line(&self, checkout: &Checkout, line: &str) -> anyhow::Result<Result<String, String>> {
         let failed = || match self.ended() {
             Some(how) => format!("the daemon's worker ended ({how})"),
             None => "the daemon's worker did not answer".to_owned(),
@@ -354,7 +377,7 @@ impl Worker {
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
-        stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
+        stream.write_all(line.as_bytes()).with_context(failed)?;
         stream
             .write_all(format!("{}\n", crate::process::encode(&env)).as_bytes())
             .with_context(failed)?;
@@ -390,6 +413,26 @@ impl Worker {
                 Reply::Cold { reason: format!("{why:#}") }
             }
         }
+    }
+
+    /// Asks which tests of each program of `checkout` the changes in `changes` reach.
+    fn select(&self, checkout: &Checkout, changes: &Path) -> Reply {
+        let asked: Vec<Result<String, String>> = std::thread::scope(|scope| {
+            let asking: Vec<_> = checkout
+                .programs
+                .iter()
+                .map(|plan| {
+                    scope.spawn(|| self.ask_line(checkout, &checkout.select_line(plan, changes)))
+                })
+                .collect();
+            let answer = |it: std::thread::ScopedJoinHandle<'_, _>| match it.join() {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(why)) => Err(format!("{why:#}")),
+                Err(_) => Err("asking the worker panicked".to_owned()),
+            };
+            asking.into_iter().map(answer).collect()
+        });
+        Reply::Selected { programs: asked }
     }
 
     /// Whether it is loading a checkout.
@@ -537,6 +580,7 @@ impl Daemon {
         *lock(&self.asked) = Instant::now();
         match request {
             Request::Sync(checkout) => self.sync(&checkout),
+            Request::Select(checkout, changes) => self.select(&checkout, &changes),
             Request::Warm(checkout) => match self.warm(checkout) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
@@ -548,6 +592,23 @@ impl Daemon {
                 workers: lock(&self.workers).values().map(|it| it.status()).collect(),
             }),
             Request::Stop => Reply::Stopping,
+        }
+    }
+
+    fn select(&self, checkout: &Checkout, changes: &Path) -> Reply {
+        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
+        let Some(worker) = worker else {
+            return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
+        };
+        let warmth = match lock(&worker.checkouts).get(&checkout.key) {
+            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
+            Some(_) => Warmth::Failed("the daemon has another build of the checkout".to_owned()),
+            None => Warmth::Failed("the daemon has not loaded this build".to_owned()),
+        };
+        match warmth {
+            Warmth::Ready => worker.select(checkout, changes),
+            Warmth::Loading(_) => Reply::Cold { reason: "the daemon is still loading".to_owned() },
+            Warmth::Failed(reason) => Reply::Cold { reason },
         }
     }
 

@@ -8,8 +8,11 @@ use std::{
 
 use anyhow::Context as _;
 
+use crate::impact::Picked;
+
 use super::{
     cli::Invocation,
+    picked::Picks,
     say,
     state::{Kind, Program, State, as_built, cargo_path},
 };
@@ -41,25 +44,89 @@ pub(crate) fn program(
 }
 
 /// Runs the test executables one after another, each in the directory of its package, and
-/// stops at the first that fails unless told not to. The result is cargo's exit status.
-pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Result<i32> {
+/// stops at the first that fails unless told not to. Of each, the tests `picks` has run. The
+/// result is cargo's exit status.
+pub(crate) fn tests(
+    asked: &Invocation,
+    state: &State,
+    cwd: &Path,
+    picks: &Picks,
+) -> anyhow::Result<i32> {
     let mut failed = Vec::new();
+    let (mut ran, mut skipped) = (0, 0);
     for test in state.programs.iter().filter(|it| it.test) {
+        let picked = picks.of(test);
         let source = test.source.strip_prefix(&test.package_dir).unwrap_or(&test.source);
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
-        say::status(asked.flags.quiet, "Running", &format!("{unit}{} ({shown})", source.display()));
-        let mut command = Command::new(&test.executable);
-        command.args(asked.program_args()).envs(test.env.iter().cloned());
-        command.current_dir(&test.package_dir);
-        as_built(&mut command)?;
-        let status = command.status().with_context(|| format!("could not execute {shown}"))?;
-        if !status.success() {
+        let named = match picked {
+            // The client reads what the daemon said of a program before it is here.
+            None | Some(Picked::Whole(_) | Picked::Program(_)) => None,
+            Some(Picked::Nothing(why)) => {
+                let said = format!("{unit}{} ({why})", source.display());
+                say::status(asked.flags.quiet, "Skipping", &said);
+                skipped += 1;
+                continue;
+            }
+            Some(Picked::Tests { known, run }) => match to_run(test, known, run) {
+                Ok(named) if named.is_empty() => {
+                    let said =
+                        format!("{unit}{} (no test of it reaches an edit)", source.display());
+                    say::status(asked.flags.quiet, "Skipping", &said);
+                    skipped += 1;
+                    continue;
+                }
+                Ok(named) => Some(named),
+                Err(why) => {
+                    say::fallback(&format!("{shown}: {why}"), "all of its tests run");
+                    None
+                }
+            },
+        };
+        let of = match (&named, picked) {
+            (Some(named), _) => format!(", {} of its tests", named.len()),
+            (None, Some(Picked::Whole(why))) if picks.some() => format!(", all: {why}"),
+            _ => String::new(),
+        };
+        say::status(
+            asked.flags.quiet,
+            "Running",
+            &format!("{unit}{} ({shown}){of}", source.display()),
+        );
+        ran += 1;
+        let runs: Vec<Vec<&str>> = match &named {
+            // An argument list has a limit; a few thousand names are well under it.
+            Some(named) => {
+                named.chunks(2000).map(|it| it.iter().map(String::as_str).collect()).collect()
+            }
+            None => vec![Vec::new()],
+        };
+        let mut passed = true;
+        for names in runs {
+            let mut command = harness_of(test);
+            if names.is_empty() {
+                command.args(asked.program_args());
+            } else {
+                command.arg("--exact").args(names).args(&asked.trailing);
+            }
+            as_built(&mut command)?;
+            let status = command.status().with_context(|| format!("could not execute {shown}"))?;
+            passed &= status.success();
+        }
+        if !passed {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
                 break;
             }
         }
+    }
+    if picks.some() {
+        let told =
+            picks.took.map(|it| format!(", told in {:.2}s", it.as_secs_f64())).unwrap_or_default();
+        let said = format!(
+            "{ran} test executables, {skipped} not reached by the edits{told}; `--full` runs all"
+        );
+        say::status(asked.flags.quiet, "Picked", &said);
     }
     match failed.as_slice() {
         [] => Ok(0),
@@ -75,11 +142,48 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
     }
 }
 
+/// The tests of `test` to run, by name: the ones of `run` and those its harness lists that
+/// are not `known`, which a macro made. `Err` is why all of them run.
+fn to_run(
+    test: &Program,
+    known: &[String],
+    run: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let mut command = harness_of(test);
+    command.args(["--list", "--format", "terse"]).stderr(std::process::Stdio::null());
+    as_built(&mut command).map_err(|it| it.to_string())?;
+    let out = command.output().map_err(|it| it.to_string())?;
+    if !out.status.success() {
+        return Err("its harness did not list its tests".to_owned());
+    }
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let listed: Vec<&str> = listed
+        .lines()
+        .filter_map(|it| it.strip_suffix(": test").or_else(|| it.strip_suffix(": benchmark")))
+        .collect();
+    let picked: Vec<&str> = run.iter().map(|it| it.0.as_str()).collect();
+    if let Some(missing) = picked.iter().find(|it| !listed.contains(it)) {
+        return Err(format!("its harness does not list the test `{missing}`"));
+    }
+    let made = |name: &&str| !known.iter().any(|it| it == name);
+    Ok(listed.into_iter().filter(|it| picked.contains(it) || made(it)).map(str::to_owned).collect())
+}
+
 /// Runs the doc tests with cargo, which hands them to rustd in rustdoc's place: rustd
-/// builds each example as its own program over its code of the library.
-pub(crate) fn doc_tests(asked: &Invocation) -> anyhow::Result<i32> {
+/// builds each example as its own program over its code of the library. With `packages`,
+/// the doc tests of those packages alone, when no package was named.
+pub(crate) fn doc_tests(asked: &Invocation, packages: Option<&[String]>) -> anyhow::Result<i32> {
+    let named = asked.flags.workspace || !asked.flags.packages.is_empty();
+    let packages = packages.filter(|_| !named);
+    if packages.is_some_and(|it| it.is_empty()) {
+        say::status(asked.flags.quiet, "Skipping", "doc tests (no edit reaches them)");
+        return Ok(0);
+    }
     let mut args = vec!["--doc".to_owned()];
     args.extend(asked.build_args.iter().cloned());
+    for package in packages.into_iter().flatten() {
+        args.extend(["-p".to_owned(), package.clone()]);
+    }
     if asked.flags.no_fail_fast {
         args.push("--no-fail-fast".to_owned());
     }
@@ -100,6 +204,50 @@ pub(crate) fn only_doc_tests(args: &[String]) -> anyhow::Result<i32> {
     cargo.arg("test").args(args);
     as_built(&mut cargo)?;
     Ok(exit_code(cargo.status().context("running `cargo test --doc`")?))
+}
+
+/// The test executable, to run as cargo does: in the directory of its package, with what
+/// cargo sets for it.
+fn harness_of(test: &Program) -> Command {
+    let mut command = Command::new(&test.executable);
+    command.envs(test.env.iter().cloned()).current_dir(&test.package_dir);
+    command.env(DYLIB_PATH, dylib_path(&test.executable));
+    command
+}
+
+/// The variable the loader finds shared libraries by.
+const DYLIB_PATH: &str = if cfg!(windows) {
+    "PATH"
+} else if cfg!(target_os = "macos") {
+    "DYLD_FALLBACK_LIBRARY_PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
+/// Where a test executable finds the shared libraries it links, as cargo has it: next to it,
+/// and in the toolchain's library of the host, which a proc macro's unit tests link `std`
+/// from; then where the variable said already.
+fn dylib_path(executable: &Path) -> std::ffi::OsString {
+    static HOST_LIBRARY: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let env: rustc_hash::FxHashMap<String, Option<String>> = Default::default();
+            let mut print = toolchain::command(rustc, ".", &env);
+            let out = print.args(["--print", "target-libdir"]).output().ok()?;
+            let dir = String::from_utf8(out.stdout).ok()?;
+            out.status.success().then(|| dir.trim_end().into())
+        });
+    let mut dirs: Vec<std::path::PathBuf> =
+        executable.parent().map(Path::to_owned).into_iter().collect();
+    dirs.extend(HOST_LIBRARY.clone());
+    if let Some(already) = std::env::var_os(DYLIB_PATH) {
+        dirs.extend(std::env::split_paths(&already));
+    } else if cfg!(target_os = "macos") {
+        // What the loader looks in when the variable is not set, which setting it replaces.
+        let home = std::env::var_os("HOME").map(|it| Path::new(&it).join("lib"));
+        dirs.extend(home.into_iter().chain(["/usr/local/lib".into(), "/usr/lib".into()]));
+    }
+    std::env::join_paths(dirs).unwrap_or_default()
 }
 
 /// The flags that have cargo run this test target alone.

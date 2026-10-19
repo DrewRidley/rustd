@@ -7,6 +7,7 @@ mod cargo;
 mod content;
 mod deps;
 mod doctest;
+mod impact;
 mod inputs;
 mod memory;
 mod outline;
@@ -2865,6 +2866,9 @@ enum Request {
     /// Bring the objects up to date and leave the linking to the client, which loads the
     /// patch object into a program that is running.
     Patch,
+    /// Say which tests of a program the changes in a file the client wrote reach, as the
+    /// program was last built.
+    Select,
 }
 
 impl Request {
@@ -2872,6 +2876,7 @@ impl Request {
         match line {
             "sync" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
+            "select" => Some(Request::Select),
             _ => None,
         }
     }
@@ -2880,6 +2885,7 @@ impl Request {
         match self {
             Request::Sync => "sync",
             Request::Patch => "patch",
+            Request::Select => "select",
         }
     }
 }
@@ -3107,6 +3113,30 @@ impl Tests {
     }
 }
 
+/// What of the program `target` names to run for the changes `client` wrote: of the
+/// program as it was last built, which the client asked for before.
+fn picked(
+    db: &RootDatabase,
+    programs: &[Program],
+    target: Option<&Target>,
+    client: &Client,
+    files: &[WatchedFile],
+) -> impact::Picked {
+    let program = target.and_then(|target| programs.iter().find(|it| target.is(&it.args)));
+    let Some(program) = program else {
+        return impact::Picked::Whole("the daemon has not built it".to_owned());
+    };
+    let read = client.changes.as_ref().map(|path| {
+        let text = std::fs::read(path)?;
+        anyhow::Ok(serde_json::from_slice::<Vec<impact::Change>>(&text)?)
+    });
+    match read {
+        Some(Ok(changes)) => impact::select(db, &program.args, files, &changes),
+        Some(Err(why)) => impact::Picked::Whole(format!("reading the changes: {why:#}")),
+        None => impact::Picked::Whole("no changes were named".to_owned()),
+    }
+}
+
 /// A request, the program it is for, and who waits for the answer.
 type Asked = (Request, Option<Target>, Client);
 
@@ -3114,6 +3144,8 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    /// For a request to select tests, the file the client wrote the changes to.
+    changes: Option<Box<Path>>,
 }
 
 impl std::io::Write for &Client {
@@ -3128,7 +3160,7 @@ impl std::io::Write for &Client {
 
 /// What the daemon waits for.
 enum Event {
-    Asked(Asked),
+    Asked(Box<Asked>),
     /// The build of a program is over, with what to tell its clients: nothing when a change
     /// to the source interrupted it.
     Built(usize, Box<Program>, Option<anyhow::Result<Result<String, String>>>),
@@ -3175,7 +3207,7 @@ impl Builds {
         self.stuck = false;
         let (at, program, answer) = match event {
             Event::Asked(asked) => {
-                self.waiting.push_back(asked);
+                self.waiting.push_back(*asked);
                 return Ok(());
             }
             Event::Built(at, program, answer) => (at, program, answer),
@@ -3336,12 +3368,18 @@ fn requested(stream: UnixStream) -> Option<Asked> {
             return None;
         }
     };
-    let fields: Vec<&str> = request.split('\t').collect();
+    let mut fields: Vec<&str> = request.split('\t').collect();
+    let changes = match Request::parse(fields[0]) {
+        Some(Request::Select) if fields.len() > 1 => Some(Path::new(fields.remove(1)).into()),
+        _ => None,
+    };
     let target = Target::parse(&fields[1..]);
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
+        && (request != Request::Select || target.is_some())
     {
-        return Some((request, target, Client { stream, env: process::decode(&env) }));
+        let client = Client { stream, env: process::decode(&env), changes };
+        return Some((request, target, client));
     }
     let _ = writeln!(&stream, "error: unknown request {request:?}");
     None
@@ -3682,7 +3720,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
                     let _open = open;
                     if let Some(request) = requested(stream) {
                         // The daemon is ending when nothing takes requests any more.
-                        let _ = sender.send(Event::Asked(request));
+                        let _ = sender.send(Event::Asked(Box::new(request)));
                     }
                 });
             }
@@ -3757,6 +3795,12 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
+                    if request == Request::Select {
+                        let picked = picked(&db, &programs, target.as_ref(), &stream, &files);
+                        let said = serde_json::to_string(&picked).unwrap_or_default();
+                        let _ = writeln!(&stream, "ok {said}");
+                        continue;
+                    }
                     let asked = target.clone();
                     let mut target = target;
                     // A checkout that is not what it was loaded from is loaded again before
