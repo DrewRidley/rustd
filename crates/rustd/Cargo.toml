@@ -46,6 +46,7 @@ project-model.workspace = true
 vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
+stdx.workspace = true
 syntax.workspace = true
 # Without the features that bring a second HTTP and TLS stack (`rustls`), a C library built
 # with cmake (`default-https-client`, which is aws-lc) and SigV4A. The client is hyper 1 over

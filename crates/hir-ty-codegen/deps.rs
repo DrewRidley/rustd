@@ -25,15 +25,37 @@ use crate::{
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct BodyDeps {
     /// The functions it calls or names, a trait's methods as the trait declares them.
-    pub callees: FxHashSet<FunctionId>,
+    callees: FxHashSet<FunctionId>,
     /// Each trait method it calls, with the type it is called on when that is a named type:
     /// the impl of that type is the one that runs. `None` is any.
-    pub trait_calls: FxHashSet<(FunctionId, Option<AdtId>)>,
+    trait_calls: FxHashSet<(FunctionId, Option<AdtId>)>,
     /// The types its values, and the types inside those, are of.
-    pub adts: FxHashSet<AdtId>,
+    adts: FxHashSet<AdtId>,
     /// The other bodies it reads: statics and constants it names, and the functions whose
     /// closures and `async` blocks it has values of.
-    pub bodies: FxHashSet<DefWithBodyId>,
+    bodies: FxHashSet<DefWithBodyId>,
+}
+
+impl BodyDeps {
+    /// The functions it calls or names, a trait's methods as the trait declares them.
+    pub fn callees(&self) -> impl Iterator<Item = FunctionId> + '_ {
+        self.callees.iter().copied()
+    }
+
+    /// Each trait method it calls, with the named type it is called on, if it is one.
+    pub fn trait_calls(&self) -> impl Iterator<Item = (FunctionId, Option<AdtId>)> + '_ {
+        self.trait_calls.iter().copied()
+    }
+
+    /// The named types of its values and of what is inside them.
+    pub fn adts(&self) -> impl Iterator<Item = AdtId> + '_ {
+        self.adts.iter().copied()
+    }
+
+    /// The statics, constants and closure owners it reads.
+    pub fn bodies(&self) -> impl Iterator<Item = DefWithBodyId> + '_ {
+        self.bodies.iter().copied()
+    }
 }
 
 /// What the body `def` reaches directly.

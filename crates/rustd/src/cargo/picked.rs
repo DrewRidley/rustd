@@ -8,11 +8,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rustc_hash::FxHashSet;
+
 use super::{
     cli::Invocation,
     client::{self, Start},
     daemon::{Checkout, Reply, Request},
-    passed::{Passed, is_rust},
+    passed::{Passed, canonical, is_rust},
     say,
     state::{Kind, Program, State},
 };
@@ -61,11 +63,17 @@ impl Picks {
         self.programs[at].as_ref()
     }
 
-    /// Keeps the source the tests ran on as what passed: they ran and all passed.
-    pub(crate) fn passed(self) {
-        if let Some(passing) = self.passing
-            && let Err(why) = passing.write(&self.key)
-        {
+    /// Keeps the source the tests ran on as what passed: they ran and all passed. A file of
+    /// `state` written since the source was looked at is not what they ran on, and nothing is
+    /// kept.
+    pub(crate) fn passed(self, state: &State) {
+        let Some(passing) = self.passing else { return };
+        if let Some(path) = passing.written_since(state) {
+            let why = format!("{} was written while the tests were built or ran", path.display());
+            say::fallback(&why, "the next run picks its tests from the run before");
+            return;
+        }
+        if let Err(why) = passing.write(&self.key) {
             say::fallback(&format!("{why:#}"), "the next run of tests runs them all");
         }
     }
@@ -76,19 +84,42 @@ impl Picks {
     }
 }
 
-/// What the tests of `state`, which the daemon built when `by_daemon`, run. With `unsynced`,
-/// cargo builds them and the daemon has not read the source since the last build: it is
-/// asked to first.
-pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced: bool) -> Picks {
+/// The files of `state` and the environment as they are before it is built, which is what
+/// the tests that run are picked against and what is kept once they pass: a file written
+/// after this is one the build may have read, and is not taken as passing.
+pub(crate) fn looked_at(state: &State) -> Passed {
+    Passed::now(state, Passed::read(&state.key).as_ref())
+}
+
+/// What the tests of `state`, which the daemon built when `by_daemon`, run, for the source
+/// `now` as it was before the build; with `None`, nothing was looked at then. With
+/// `unsynced`, cargo builds them and the daemon has not read the source since the last
+/// build: it is asked to first.
+pub(crate) fn pick(
+    asked: &Invocation,
+    state: &State,
+    by_daemon: bool,
+    unsynced: bool,
+    now: Option<Passed>,
+) -> Picks {
     // The tests named are the ones asked for, and not all of them ran once they did.
     if !asked.positional.is_empty() || !harmless(&asked.trailing) {
         return Picks::all(state, None);
     }
+    // What cargo built the first time, with nothing looked at before, runs whole, and passes
+    // nothing on.
+    let Some(now) = now else { return Picks::all(state, None) };
     let before = Passed::read(&state.key);
-    let now = Passed::now(state, before.as_ref());
     let all_asked = asked.flags.full || std::env::var_os("RUSTD_ALL_TESTS").is_some();
     if all_asked {
         return Picks::all(state, Some(now));
+    }
+    // The tests that passed did in another environment: any test may read a variable.
+    if let Some(name) = before.as_ref().and_then(|it| it.env_differs(&now)) {
+        let why = format!("`{name}` is not what it was when the tests last passed");
+        say::fallback(&why, "every test runs");
+        let keep = asked.flags.since.is_none();
+        return Picks::all(state, keep.then_some(now));
     }
     let (changed, texts) = match (&asked.flags.since, &before) {
         (Some(since), _) => match Passed::at_commit(state, since, &now) {
@@ -103,11 +134,6 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
             return Picks::all(state, Some(now));
         }
         (None, Some(before)) => {
-            if let Some(name) = before.env_differs(&now) {
-                let why = format!("`{name}` is not what it was when the tests last passed");
-                say::fallback(&why, "every test runs");
-                return Picks::all(state, Some(now));
-            }
             let changed = before.changed(&now);
             let texts =
                 changed.iter().filter(|it| is_rust(it)).map(|it| (it.clone(), before.text(it)));
@@ -142,32 +168,46 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
         passing: None,
         key: state.key.clone(),
     };
+    let root = canonical(&state.root);
     let mut whole: Vec<Option<String>> = vec![None; state.programs.len()];
     let mut documented: Vec<String> = Vec::new();
     let mut sources: Vec<PathBuf> = Vec::new();
+    // As `changed` names files: canonical.
+    let inputs: Vec<FxHashSet<PathBuf>> = state
+        .programs
+        .iter()
+        .map(|it| it.inputs().iter().map(|it| canonical(it)).collect())
+        .collect();
+    let package_dirs: Vec<PathBuf> =
+        state.programs.iter().map(|it| canonical(&it.package_dir)).collect();
     for path in &changed {
-        let reads: Vec<usize> = (0..state.programs.len())
-            .filter(|&at| state.programs[at].inputs().contains(path))
-            .collect();
-        let owners: Vec<usize> = (0..state.programs.len())
-            .filter(|&at| path.starts_with(&state.programs[at].package_dir))
-            .collect();
+        let reads: Vec<usize> =
+            (0..state.programs.len()).filter(|&at| inputs[at].contains(path)).collect();
+        let owners: Vec<usize> =
+            (0..state.programs.len()).filter(|&at| path.starts_with(&package_dirs[at])).collect();
         for &at in reads.iter().chain(&owners) {
             let program = &state.programs[at];
             if program.kind == Kind::Lib || owners.contains(&at) {
                 documented.push(program.package.clone());
             }
         }
-        if is_rust(path) {
-            if !reads.is_empty() {
-                sources.push(path.clone());
-            }
+        if is_rust(path) && !reads.is_empty() {
+            sources.push(path.clone());
             continue;
         }
-        let (programs, why) = match reads.is_empty() {
-            false => (reads, format!("{} changed, which rustc read", path.display())),
-            // A test may read a file of its package as it runs.
-            true => (owners, format!("{} changed, in its package", path.display())),
+        let shown = path.display();
+        let (programs, why) = match (reads.is_empty(), owners.is_empty()) {
+            (false, _) => (reads, format!("{shown} changed, which rustc read")),
+            // A test may read a file of its package as it runs, or one outside every
+            // package, as a test of the workspace's data does.
+            (true, false) => {
+                (owners, format!("{shown} changed, in its package, which it may read"))
+            }
+            (true, true) if read_by_no_test(&root, path) => continue,
+            (true, true) => {
+                let tests = (0..state.programs.len()).filter(|&at| state.programs[at].test);
+                (tests.collect(), format!("{shown} changed, which a test may read"))
+            }
         };
         for at in programs {
             whole[at].get_or_insert_with(|| why.clone());
@@ -192,7 +232,7 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
     let programs =
         state.programs.iter().enumerate().filter(|(_, it)| it.kind == Kind::Bin && !it.test);
     for (at, program) in programs {
-        let Some(path) = changed.iter().find(|it| program.inputs().contains(it)) else { continue };
+        let Some(path) = changed.iter().find(|it| inputs[at].contains(*it)) else { continue };
         let said =
             program.asked_as.and_then(|(checkout, place)| selected.get(checkout)?.get(place));
         let why = match (&whole[at], said) {
@@ -209,7 +249,7 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
         }
     }
     for (at, program) in state.programs.iter().enumerate() {
-        let reads_source = sources.iter().any(|it| program.inputs().contains(it));
+        let reads_source = sources.iter().any(|it| inputs[at].contains(it));
         picks.programs[at] = Some(match (whole[at].take(), program.asked_as) {
             (Some(why), _) => Picked::Whole(why),
             // What it is compiled from is not known, so neither is whether that changed.
@@ -249,6 +289,15 @@ fn of_program(kind: Kind, reaches: Option<String>) -> Picked {
     }
 }
 
+/// Whether a changed file outside every package is one no test reads: a Markdown file at the
+/// root of the checkout, or a file of `.github`. `docs/cargo.md` lists these.
+fn read_by_no_test(root: &Path, path: &Path) -> bool {
+    let Ok(inside) = path.strip_prefix(root) else { return false };
+    let markdown_at_root =
+        inside.components().count() == 1 && inside.extension().is_some_and(|it| it == "md");
+    markdown_at_root || inside.starts_with(".github")
+}
+
 fn names(state: &State) -> Vec<(String, Kind, String)> {
     state.programs.iter().map(|it| (it.package.clone(), it.kind, it.name.clone())).collect()
 }
@@ -257,14 +306,15 @@ fn names(state: &State) -> Vec<(String, Kind, String)> {
 /// read by a build script, whose output any crate may include, or it is source of a crate that
 /// is not compiled into the programs, as a proc macro or a build script's dependency is.
 fn builds_into_others(state: &State, path: &Path) -> Option<String> {
-    let read_by_rustc = state.programs.iter().any(|it| it.inputs().contains(&path.to_owned()));
+    let read_by_rustc =
+        state.programs.iter().any(|it| it.inputs().iter().any(|it| canonical(it) == path));
     if read_by_rustc && is_rust(path) {
         return None;
     }
     let (dir, manifest) = path
         .ancestors()
         .skip(1)
-        .take_while(|it| it.starts_with(&state.root))
+        .take_while(|it| it.starts_with(canonical(&state.root)))
         .find_map(|dir| Some((dir, std::fs::read_to_string(dir.join("Cargo.toml")).ok()?)))?;
     let words = |text: &str| text.split_whitespace().collect::<String>();
     let proc_macro = words(&manifest).contains("proc-macro=true");
@@ -342,7 +392,7 @@ fn selected(
         }
     };
     // The checkouts are of two workers, which tell their programs side by side.
-    std::thread::scope(|scope| {
+    let answers = std::thread::scope(|scope| {
         let asking: Vec<_> =
             state.checkouts.iter().map(|checkout| scope.spawn(move || ask(checkout))).collect();
         let joined = std::iter::zip(asking, &state.checkouts).map(|(it, checkout)| {
@@ -355,7 +405,11 @@ fn selected(
             it.join().unwrap_or_else(|_| panicked())
         });
         joined.collect()
-    })
+    });
+    if let Ok(path) = &written {
+        let _ = std::fs::remove_file(path);
+    }
+    answers
 }
 
 /// What a worker's `ok` line says to run.

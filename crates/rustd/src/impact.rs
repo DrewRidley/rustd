@@ -63,11 +63,14 @@ pub(crate) fn select(
     files: &[WatchedFile],
     changes: &[Change],
 ) -> Picked {
+    // A query is cancelled by an edit the daemon reads meanwhile, and unwinds.
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hir::attach_db(db, || pick(db, args, files, changes))
     }));
-    caught
-        .unwrap_or_else(|_| Picked::Whole("telling which tests an edit reaches failed".to_owned()))
+    caught.unwrap_or_else(|_| {
+        eprintln!("select {}: telling the tests panicked or was cancelled; all run", args.krate);
+        Picked::Whole("telling which tests an edit reaches failed".to_owned())
+    })
 }
 
 fn pick(db: &RootDatabase, args: &Args, files: &[WatchedFile], changes: &[Change]) -> Picked {
@@ -117,7 +120,11 @@ fn pick(db: &RootDatabase, args: &Args, files: &[WatchedFile], changes: &[Change
         }
     }
     if tests.is_empty() {
-        return Picked::Program(reaching.get(&Node::Body(roots[0].1)).cloned());
+        let Some(&(_, main)) = roots.first() else {
+            stdx::never!("a program with no tests has its `main` as the root");
+            return Picked::Whole("rustd lost the `main` it found".to_owned());
+        };
+        return Picked::Program(reaching.get(&Node::Body(main)).cloned());
     }
     let run = roots
         .iter()
@@ -168,7 +175,10 @@ fn edited_functions(
         let Some(was) = &change.was else {
             return Err(format!("{shown} is new"));
         };
-        let edition = crates[0].edition(db);
+        let Some(edition) = crates.first().map(|it| it.edition(db)) else {
+            stdx::never!("a file of no crate is passed over before");
+            return Err(format!("{shown} is of no crate"));
+        };
         let ranges = edited_bodies(was, text, edition)
             .ok_or_else(|| format!("{shown}: more than the bodies of functions changed"))?;
         for range in ranges {
@@ -517,10 +527,10 @@ impl<'a> Graph<'a> {
                     return;
                 }
                 let deps = body_deps(db, def);
-                out.extend(deps.callees.iter().map(|&it| Node::Body(it.into())));
-                out.extend(deps.adts.iter().map(|&it| Node::Adt(it)));
-                out.extend(deps.bodies.iter().map(|&it| Node::Body(it)));
-                for &(method, on) in &deps.trait_calls {
+                out.extend(deps.callees().map(|it| Node::Body(it.into())));
+                out.extend(deps.adts().map(Node::Adt));
+                out.extend(deps.bodies().map(Node::Body));
+                for (method, on) in deps.trait_calls() {
                     let ItemContainerId::TraitId(trait_id) = method.lookup(db).container else {
                         continue;
                     };
@@ -582,7 +592,10 @@ impl<'a> Graph<'a> {
             }
         }
         while let Some(node) = queue.pop() {
-            let why = reaching[&node].clone();
+            let Some(why) = reaching.get(&node).cloned() else {
+                stdx::never!("a node is queued once it reaches an edit");
+                continue;
+            };
             for &caller in callers.get(&node).into_iter().flatten() {
                 if let std::collections::hash_map::Entry::Vacant(it) = reaching.entry(caller) {
                     it.insert(why.clone());

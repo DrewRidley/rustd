@@ -71,9 +71,12 @@ the outcome of, and says which test executables it skipped:
        Skipping tests/cli.rs (nothing it is compiled from changed)
          Picked 1 test executables, 1 not reached by the edits; `--full` runs all
 
-rustd keeps, for each command line, the files of the checkout that git does not ignore and
-the files rustc read as they were at the last `cargo rustd test` in which every test ran and passed, under
-`RUSTD_HOME/passed`. A run compares the files with that. The daemon is then asked, for each
+rustd keeps, for each command line, the files of the checkout that git does not ignore, the
+files git ignores inside its packages (but what a build writes), and the files rustc read, as
+they were at the last `cargo rustd test` in which every test ran and passed, under
+`RUSTD_HOME/passed`. The files are looked at before anything is built; a run compares them
+with what passed, and is kept as passing only when they are still the same once the tests
+are done. A file is read again unless its size, its times and its inode are what they were. The daemon is then asked, for each
 test executable it built, which of its tests reach a function whose body changed: through
 the functions a test calls or names, every impl of a trait method it calls (any impl, for a
 call through `dyn` or a generic), the trait impls of the types its values have (operators,
@@ -94,15 +97,19 @@ Whatever can't be told runs. Every test runs when:
 - a file other than Rust source changed in a package with a build script, which may read it,
   or source of a proc macro, or Rust source no test program is compiled from in a package
   with a build script;
-- an environment variable is not what it was at the last run that passed (shell noise such
-  as `PWD`, `TERM_*` or `SSH_*` is left out);
+- an environment variable is not what it was at the last run that passed, also with
+  `--since` (shell noise such as `PWD`, `TERM_*` or `SSH_*` is left out; `passed.rs` lists it);
+- a file changed that rustc did not read and that is outside every package, which a test
+  may read as it runs; but for a Markdown file at the root of the checkout and the files of
+  `.github`;
 - cargo built instead of the daemon, or the daemon has not loaded the workspace.
 
 All of a test executable runs when a file of a crate it is compiled from changed in more
 than function bodies: a signature, a type, a `macro_rules!`, a `cfg`, a `use`, a constant or
 static, a `const fn`, or anything inside a macro call. The same goes for a changed file that
-rustc read with `include_str!` or `include_bytes!`, any other file in its package (a test may
-read it as it runs), and a function the daemon can't place. What a linker or a runtime
+rustc read with `include_str!` or `include_bytes!`, any other file in its package that rustc
+did not compile (a test may read it as it runs, Rust source too), and a function the daemon
+can't place. What a linker or a runtime
 calls without a call that names it, a `#[used]` or `#[link_section]` static (as `inventory`,
 `linkme` and `ctor` write them) or a `#[no_mangle]` function, can run under any test, so an
 edit it reaches runs all of the program. A
@@ -112,8 +119,9 @@ for each package whose library is compiled from a changed file.
 `--since <commit>` picks the tests the changes since the commit reach, the committed and the
 uncommitted ones, and leaves what passed as it was.
 
-A test that reads, as it runs, a file outside its package that rustc did not read, or the
-network or the clock, can fail after a run that skipped it.
+A test that reads, as it runs, a file outside the checkout, a file git ignores outside its
+package, a directory git ignores with more than 10,000 files, or the network or the clock,
+can fail after a run that skipped it.
 
 Loading takes from under a second to most of a minute depending on the workspace. Measured
 on one machine, it was 2.5 s for just, 6.9 s for ripgrep and 42.4 s for nushell (see

@@ -116,6 +116,10 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let key = asked.key(&cwd);
     let known = State::read(&key);
+    // The source the tests are picked against and kept as passing is as it was before any
+    // build reads it.
+    let testing = asked.subcommand == Subcommand::Test && !asked.flags.no_run;
+    let mut looked_at = known.as_ref().ok().filter(|_| testing).map(picked::looked_at);
     let mut served = false;
     // The tests to run, when the daemon told them before cargo built: it had read the edits
     // that sent the build to cargo.
@@ -132,7 +136,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
         Ok(Err(Left::ToCargo(state, reason))) => {
             say::fallback(&reason, "building with cargo");
             if asked.subcommand == Subcommand::Test && !asked.flags.no_run {
-                picked_first = Some(picked::pick(asked, &state, true, true));
+                picked_first = Some(picked::pick(asked, &state, true, true, looked_at.take()));
             }
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
@@ -153,9 +157,9 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     };
     state.write()?;
     let picks = match (asked.subcommand, asked.flags.no_run) {
-        (Subcommand::Test, false) => {
-            Some(picked_first.unwrap_or_else(|| picked::pick(asked, &state, served, false)))
-        }
+        (Subcommand::Test, false) => Some(
+            picked_first.unwrap_or_else(|| picked::pick(asked, &state, served, false, looked_at)),
+        ),
         _ => None,
     };
     after_build(asked, &state, &cwd, picks)
@@ -347,13 +351,13 @@ fn after_build(
             let picked = asked.flags.selects_targets || !asked.positional.is_empty();
             if stopped || picked || !state.doc_tests {
                 if code == 0 {
-                    picks.passed();
+                    picks.passed(state);
                 }
                 return Ok(code);
             }
             let code = code.max(run::doc_tests(asked, picks.doc_packages.as_deref())?);
             if code == 0 {
-                picks.passed();
+                picks.passed(state);
             }
             Ok(code)
         }
