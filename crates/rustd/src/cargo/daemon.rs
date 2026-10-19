@@ -417,14 +417,21 @@ impl Worker {
 
     /// Asks which tests of each program of `checkout` the changes in `changes` reach.
     fn select(&self, checkout: &Checkout, changes: &Path) -> Reply {
-        let asked: Vec<Result<String, String>> = checkout
-            .programs
-            .iter()
-            .map(|plan| match self.ask_line(checkout, &checkout.select_line(plan, changes)) {
-                Ok(answer) => answer,
-                Err(why) => Err(format!("{why:#}")),
-            })
-            .collect();
+        let asked: Vec<Result<String, String>> = std::thread::scope(|scope| {
+            let asking: Vec<_> = checkout
+                .programs
+                .iter()
+                .map(|plan| {
+                    scope.spawn(|| self.ask_line(checkout, &checkout.select_line(plan, changes)))
+                })
+                .collect();
+            let answer = |it: std::thread::ScopedJoinHandle<'_, _>| match it.join() {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(why)) => Err(format!("{why:#}")),
+                Err(_) => Err("asking the worker panicked".to_owned()),
+            };
+            asking.into_iter().map(answer).collect()
+        });
         Reply::Selected { programs: asked }
     }
 

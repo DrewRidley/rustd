@@ -3,7 +3,10 @@
 //! the daemon, which has the code loaded. Whatever can't be told runs: a whole program, or
 //! every test.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use super::{
     cli::Invocation,
@@ -35,6 +38,8 @@ pub(crate) struct Picks {
     names: Vec<(String, Kind, String)>,
     /// The packages whose doc tests run; `None` is all that are asked for.
     pub(crate) doc_packages: Option<Vec<String>>,
+    /// How long the daemon took to tell the tests, when it was asked.
+    pub(crate) took: Option<std::time::Duration>,
     /// The source to keep as what passed, once everything ran and passed.
     passing: Option<Passed>,
     key: String,
@@ -44,7 +49,8 @@ impl Picks {
     /// Everything, as asked.
     pub(crate) fn all(state: &State, passing: Option<Passed>) -> Picks {
         let programs = vec![None; state.programs.len()];
-        Picks { programs, names: names(state), doc_packages: None, passing, key: state.key.clone() }
+        let (names, key) = (names(state), state.key.clone());
+        Picks { programs, names, doc_packages: None, took: None, passing, key }
     }
 
     /// What to run of `program`: `None` is all of it, also for one not known when the picks
@@ -120,6 +126,10 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
         say::fallback(&why, "every test runs");
         return Picks::all(state, keep.then_some(now));
     }
+    if let Some(why) = changed.iter().find_map(|it| builds_into_others(state, it)) {
+        say::fallback(&why, "every test runs");
+        return Picks::all(state, keep.then_some(now));
+    }
     // What cargo built is all there is to run, and the daemon has not seen it.
     if !by_daemon {
         return Picks::all(state, keep.then_some(now));
@@ -128,6 +138,7 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
         programs: vec![None; state.programs.len()],
         names: names(state),
         doc_packages: None,
+        took: None,
         passing: None,
         key: state.key.clone(),
     };
@@ -170,10 +181,12 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
     documented.sort();
     documented.dedup();
     picks.doc_packages = Some(documented);
+    let asked_at = std::time::Instant::now();
     let selected = match sources.is_empty() {
         true => Vec::new(),
         false => selected(state, &sources, &texts, &now, unsynced),
     };
+    picks.took = (!sources.is_empty()).then(|| asked_at.elapsed());
     for (at, program) in state.programs.iter().enumerate() {
         let reads_source = sources.iter().any(|it| program.inputs().contains(it));
         picks.programs[at] = Some(match (whole[at].take(), program.asked_as) {
@@ -199,6 +212,36 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
 
 fn names(state: &State) -> Vec<(String, Kind, String)> {
     state.programs.iter().map(|it| (it.package.clone(), it.kind, it.name.clone())).collect()
+}
+
+/// Why the change to `path` reaches code no program's dep-info names, when it does: it is
+/// read by a build script, whose output any crate may include, or it is source of a crate that
+/// is not compiled into the programs, as a proc macro or a build script's dependency is.
+fn builds_into_others(state: &State, path: &Path) -> Option<String> {
+    let read_by_rustc = state.programs.iter().any(|it| it.inputs().contains(&path.to_owned()));
+    if read_by_rustc && is_rust(path) {
+        return None;
+    }
+    let (dir, manifest) = path
+        .ancestors()
+        .skip(1)
+        .take_while(|it| it.starts_with(&state.root))
+        .find_map(|dir| Some((dir, std::fs::read_to_string(dir.join("Cargo.toml")).ok()?)))?;
+    let words = |text: &str| text.split_whitespace().collect::<String>();
+    let proc_macro = words(&manifest).contains("proc-macro=true");
+    let script = dir.join("build.rs").exists()
+        || words(&manifest).contains("build=\"") && !words(&manifest).contains("build=false");
+    let shown = path.display();
+    match () {
+        _ if is_rust(path) && proc_macro => Some(format!("{shown} changed, of a proc macro")),
+        _ if is_rust(path) && script => Some(format!(
+            "{shown} changed, which no program is compiled from, in a package with a build script"
+        )),
+        _ if !is_rust(path) && script => {
+            Some(format!("{shown} changed, in a package whose build script may read it"))
+        }
+        _ => None,
+    }
 }
 
 /// What the daemon says to run of each program of each checkout of `state`, after the

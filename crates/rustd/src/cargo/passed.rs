@@ -162,21 +162,21 @@ impl Passed {
         since: &str,
         now: &Passed,
     ) -> anyhow::Result<(Vec<PathBuf>, BTreeMap<PathBuf, Option<String>>)> {
-        let root = git(&state.root, &["rev-parse", "--show-toplevel"])?;
-        let root = PathBuf::from(root.trim_end());
+        let root = &state.root;
         let listed = |args: &[&str]| -> anyhow::Result<Vec<PathBuf>> {
-            let out = git(&root, args)?;
+            let out = git(root, args)?;
             Ok(out.split('\0').filter(|it| !it.is_empty()).map(|it| root.join(it)).collect())
         };
-        let mut changed = listed(&["diff", "--name-only", "--no-renames", "-z", since, "--"])?;
+        let mut changed =
+            listed(&["diff", "--name-only", "--relative", "--no-renames", "-z", since, "--"])?;
         changed.extend(listed(&["ls-files", "-o", "--exclude-standard", "-z"])?);
         changed.retain(|it| now.files.contains_key(it) || !it.exists());
         changed.sort();
         changed.dedup();
         let mut texts = BTreeMap::new();
         for path in changed.iter().filter(|it| is_rust(it)) {
-            let inside = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().into_owned();
-            let text = git(&root, &["show", &format!("{since}:{inside}")]).ok();
+            let inside = path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned();
+            let text = git(root, &["show", &format!("{since}:./{inside}")]).ok();
             texts.insert(path.clone(), text);
         }
         Ok((changed, texts))
@@ -189,35 +189,31 @@ pub(crate) fn is_rust(path: &Path) -> bool {
 }
 
 /// The files the tests of `state` can read: the ones rustc read for its programs, and every
-/// file of their packages that git does not ignore, which a test may read as it runs.
+/// file of the checkout that git does not ignore: the manifests and the lock file, what build
+/// scripts read, and what a test may read as it runs.
 fn files_of(state: &State) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> =
         state.programs.iter().flat_map(|it| it.inputs().iter().cloned()).collect();
-    let mut packages: Vec<&Path> = state.programs.iter().map(|it| &*it.package_dir).collect();
-    packages.sort();
-    packages.dedup();
-    for package in packages {
-        match git(package, &["ls-files", "-co", "--exclude-standard", "-z", "--full-name", "."]) {
-            Ok(listed) => {
-                let top = git(package, &["rev-parse", "--show-toplevel"]).unwrap_or_default();
-                let top = Path::new(top.trim_end());
-                files.extend(listed.split('\0').filter(|it| !it.is_empty()).map(|it| top.join(it)));
-            }
-            Err(_) => walk(package, &mut files),
+    match git(&state.root, &["ls-files", "-co", "--exclude-standard", "-z"]) {
+        Ok(listed) => {
+            let listed = listed.split('\0').filter(|it| !it.is_empty());
+            files.extend(listed.map(|it| state.root.join(it)));
         }
+        Err(_) => walk(&state.root, &mut files),
     }
     files.sort();
     files.dedup();
     files
 }
 
-/// The files under `dir` but what a build writes and hidden ones, for a package git does not
+/// The files under `dir` but what a build writes and hidden ones, for a checkout git does not
 /// know.
 fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') || name == "target" {
+        let hidden = name.to_string_lossy().starts_with('.') && name != ".cargo";
+        if hidden || name == "target" {
             continue;
         }
         match entry.file_type() {
