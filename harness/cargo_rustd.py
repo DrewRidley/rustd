@@ -737,10 +737,10 @@ PICK_WORKSPACE = {
     "app/src/main.rs": 'fn main() {\n    println!("{}", corelib::program_only(1));\n}\n',
     "app/tests/cli.rs": '#[test]\nfn runs_the_program() {\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_app")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "2");\n}\n',
     "testdata/golden.txt": "gold\n",
-    "app/tests/golden.rs": '#[test]\nfn golden() {\n    let text = std::fs::read_to_string("../testdata/golden.txt").unwrap();\n    assert_eq!(text.trim(), "gold");\n}\n',
+    "app/tests/golden.rs": '#[test]\nfn golden() {\n    let text = std::fs::read_to_string("../testdata/golden.txt").unwrap();\n    assert_eq!(text.trim(), "gold");\n}\n\n#[test]\nfn ui_case() {\n    assert!(std::fs::read_to_string("tests/ui/case.rs").unwrap().contains("ok"));\n}\n',
     "corelib/fixture.local": "ok\n",
-    "corelib/tests/ui/case.rs": "// ok\nfn main() {}\n",
-    "corelib/tests/local.rs": '#[test]\nfn local_fixture() {\n    assert_eq!(std::fs::read_to_string("fixture.local").unwrap().trim(), "ok");\n}\n\n#[test]\nfn ui_case() {\n    assert!(std::fs::read_to_string("tests/ui/case.rs").unwrap().contains("ok"));\n}\n\n#[test]\nfn env_free() {\n    assert!(std::env::var("PICKS_FAIL").is_err());\n}\n',
+    "app/tests/ui/case.rs": "// ok\nfn main() {}\n",
+    "corelib/tests/local.rs": '#[test]\nfn local_fixture() {\n    assert_eq!(std::fs::read_to_string("fixture.local").unwrap().trim(), "ok");\n}\n#[test]\nfn env_free() {\n    assert!(std::env::var("PICKS_FAIL").is_err());\n}\n',
     "app/tests/app.rs": '#[test]\nfn downstream() {\n    assert_eq!(app::app_value(), 2);\n}\n\n#[test]\nfn versioned() {\n    assert_eq!(corelib::version(), "1");\n}\n\n#[test]\nfn answered() {\n    assert_eq!(corelib::answer(), 42);\n}\n',
 }
 
@@ -769,7 +769,7 @@ PICK_CASES = [
     # by git, and Rust source no target is compiled from.
     ("a file outside every package", "testdata/golden.txt", "gold\n", "lead\n", "golden", "any"),
     ("a file git ignores", "corelib/fixture.local", "ok\n", "no\n", "local_fixture", "any"),
-    ("Rust source no target is compiled from", "corelib/tests/ui/case.rs", "// ok", "// no", "ui_case", "any"),
+    ("Rust source no target is compiled from", "app/tests/ui/case.rs", "// ok", "// no", "ui_case", "any"),
     ("Cargo.toml", "corelib/Cargo.toml", 'edition = "2021"\n', 'edition = "2021"\ndescription = "edited"\n', None, True),
 ]
 
@@ -835,9 +835,9 @@ def picks(work):
             # The test that fails, and none that the edit does not reach.
             # The tests of `app` run whole when its program changed, which the test of the
             # program is for.
-            unreached = {"tests::unrelated", "other", "greets", "macro_three", "configured", "local_fixture", "ui_case", "env_free"}
+            unreached = {"tests::unrelated", "other", "greets", "macro_three", "configured", "local_fixture", "env_free"}
             if failing != "runs_the_program":
-                unreached |= {"versioned", "answered", "runs_the_program", "golden"}
+                unreached |= {"versioned", "answered", "runs_the_program", "golden", "ui_case"}
             picked = not ran_names & unreached
         runs = {True: "every test runs", False: "the others do not", "any": "it runs"}[everything]
         check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {runs}", failed and picked, f"exit {code}, ran {sorted(ran_names)}")
