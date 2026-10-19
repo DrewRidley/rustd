@@ -173,6 +173,16 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
             whole[at].get_or_insert_with(|| why.clone());
         }
     }
+    // An integration test runs the programs of its package, which no call of it names.
+    for program in state.programs.iter().filter(|it| it.kind == Kind::Bin && !it.test) {
+        let Some(path) = changed.iter().find(|it| program.inputs().contains(it)) else { continue };
+        let why = format!("it can run `{}`, compiled from {}", program.name, path.display());
+        for (at, test) in state.programs.iter().enumerate() {
+            if matches!(test.kind, Kind::Test | Kind::Bench) && test.package == program.package {
+                whole[at].get_or_insert_with(|| why.clone());
+            }
+        }
+    }
     // A package without the unit tests of a library is one whose doc tests rustd can't
     // tell from cargo's list; cargo refuses `--doc` for one with no library.
     let libraries =
@@ -198,16 +208,34 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
             (None, _) if !reads_source => {
                 Picked::Nothing("nothing it is compiled from changed".to_owned())
             }
-            (None, Some((checkout, place))) => selected
-                .get(checkout)
-                .and_then(|it| it.get(place))
-                .cloned()
-                .unwrap_or_else(|| Picked::Whole("the daemon did not say".to_owned())),
+            (None, Some((checkout, place))) => {
+                let said = selected.get(checkout).and_then(|it| it.get(place)).cloned();
+                match said {
+                    Some(Picked::Program(reaches)) => of_program(program.kind, reaches),
+                    Some(picked) => picked,
+                    None => Picked::Whole("the daemon did not say".to_owned()),
+                }
+            }
             (None, None) => Picked::Whole("the daemon does not build it".to_owned()),
         });
     }
     picks.passing = keep.then_some(now);
     picks
+}
+
+/// What to run of a test executable whose `main` reaches the edit `reaches`, by the kind of
+/// its target: a test target with that is one without the harness, and runs whole or not
+/// at all; unit tests with it are tests rustd could not find, and run as the harness lists.
+fn of_program(kind: Kind, reaches: Option<String>) -> Picked {
+    match (kind, reaches) {
+        (Kind::Lib | Kind::Bin | Kind::Example, _) => {
+            Picked::Tests { known: Vec::new(), run: Vec::new() }
+        }
+        (Kind::Test | Kind::Bench, Some(why)) => Picked::Whole(format!("its `main` reaches {why}")),
+        (Kind::Test | Kind::Bench, None) => {
+            Picked::Nothing("its `main` reaches no edited function".to_owned())
+        }
+    }
 }
 
 fn names(state: &State) -> Vec<(String, Kind, String)> {
@@ -268,37 +296,55 @@ fn selected(
         std::fs::write(&path, serde_json::to_vec(&changes)?)?;
         anyhow::Ok(path)
     })();
-    state
-        .checkouts
-        .iter()
-        .map(|checkout| {
-            let whole = |why: String| vec![Picked::Whole(why); checkout.programs.len()];
-            let path = match &written {
-                Ok(path) => path.clone(),
-                Err(why) => return whole(format!("writing the changes: {why:#}")),
+    let ask = |checkout: &Checkout| -> Vec<Picked> {
+        let whole = |why: String| vec![Picked::Whole(why); checkout.programs.len()];
+        let path = match &written {
+            Ok(path) => path.clone(),
+            Err(why) => return whole(format!("writing the changes: {why:#}")),
+        };
+        if checkout.programs.is_empty() {
+            return Vec::new();
+        }
+        // What the worker builds here is not used: cargo builds.
+        let started = std::time::Instant::now();
+        if unsynced {
+            let _ = super::synced(checkout);
+        }
+        let synced = started.elapsed();
+        let asked = Checkout { sources: Vec::new(), ..super::asking(checkout) };
+        let answer = client::ask(Request::Select(asked, path), Start::Never);
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            let selected = started.elapsed() - synced;
+            eprintln!("picked: synced in {synced:.1?}, told in {selected:.1?}");
+        }
+        match answer {
+            Ok(Some(Reply::Selected { programs })) => programs
+                .into_iter()
+                .map(|answer| match answer {
+                    Ok(line) => read_answer(&line),
+                    Err(why) => Picked::Whole(why),
+                })
+                .collect(),
+            Ok(Some(Reply::Cold { reason })) => whole(reason),
+            Ok(other) => whole(format!("the daemon answered {other:?}")),
+            Err(why) => whole(format!("{why:#}")),
+        }
+    };
+    // The checkouts are of two workers, which tell their programs side by side.
+    std::thread::scope(|scope| {
+        let asking: Vec<_> =
+            state.checkouts.iter().map(|checkout| scope.spawn(move || ask(checkout))).collect();
+        let joined = std::iter::zip(asking, &state.checkouts).map(|(it, checkout)| {
+            let panicked = || {
+                vec![
+                    Picked::Whole("asking the daemon panicked".to_owned());
+                    checkout.programs.len()
+                ]
             };
-            if checkout.programs.is_empty() {
-                return Vec::new();
-            }
-            // What the worker builds here is not used: cargo builds.
-            if unsynced {
-                let _ = super::synced(checkout);
-            }
-            let asked = Checkout { sources: Vec::new(), ..super::asking(checkout) };
-            match client::ask(Request::Select(asked, path), Start::Never) {
-                Ok(Some(Reply::Selected { programs })) => programs
-                    .into_iter()
-                    .map(|answer| match answer {
-                        Ok(line) => read_answer(&line),
-                        Err(why) => Picked::Whole(why),
-                    })
-                    .collect(),
-                Ok(Some(Reply::Cold { reason })) => whole(reason),
-                Ok(other) => whole(format!("the daemon answered {other:?}")),
-                Err(why) => whole(format!("{why:#}")),
-            }
-        })
-        .collect()
+            it.join().unwrap_or_else(|_| panicked())
+        });
+        joined.collect()
+    })
 }
 
 /// What a worker's `ok` line says to run.

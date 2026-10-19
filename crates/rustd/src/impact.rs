@@ -44,6 +44,11 @@ pub(crate) enum Picked {
     /// The tests of `run`, each with the edited function it reaches. A test the harness
     /// lists that is not in `known` was made by a macro, and is run too.
     Tests { known: Vec<String>, run: Vec<(String, String)> },
+    /// No test was found, and the program has a `main`, which reaches the edited function
+    /// shown when there is one. Of a test target without the harness that is all it runs;
+    /// of unit tests it says nothing, as the tests may be in code `cfg(test)` leaves out of
+    /// what the daemon loaded.
+    Program(Option<String>),
 }
 
 /// The hash a [`Change`] names a text by.
@@ -83,14 +88,15 @@ fn pick(db: &RootDatabase, args: &Args, files: &[WatchedFile], changes: &[Change
     };
     let tests = tests_of(db, &own, &functions);
     let roots: Vec<(String, DefWithBodyId)> = if tests.is_empty() {
-        // A test target without the harness is a program: what its `main` reaches is it.
+        // A test target without the harness is a program: what its `main` reaches is it. A
+        // harness with no test rustd knows has the ones the client lists run.
         let main = own
             .iter()
             .flat_map(|it| functions.of(db, *it).to_vec())
             .find(|&it| hir::Function::from(it).is_main(db));
         match main {
             Some(main) => vec![("main".to_owned(), main.into())],
-            None => return Picked::Nothing("it has no tests".to_owned()),
+            None => return Picked::Tests { known: Vec::new(), run: Vec::new() },
         }
     } else {
         tests.iter().map(|(name, func)| (name.clone(), (*func).into())).collect()
@@ -111,10 +117,7 @@ fn pick(db: &RootDatabase, args: &Args, files: &[WatchedFile], changes: &[Change
         }
     }
     if tests.is_empty() {
-        return match reaching.get(&Node::Body(roots[0].1)) {
-            Some(why) => Picked::Whole(format!("its `main` reaches {why}")),
-            None => Picked::Nothing("its `main` reaches no edited function".to_owned()),
-        };
+        return Picked::Program(reaching.get(&Node::Body(roots[0].1)).cloned());
     }
     let run = roots
         .iter()

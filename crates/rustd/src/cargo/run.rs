@@ -60,7 +60,8 @@ pub(crate) fn tests(
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
         let named = match picked {
-            None | Some(Picked::Whole(_)) => None,
+            // The client reads what the daemon said of a program before it is here.
+            None | Some(Picked::Whole(_) | Picked::Program(_)) => None,
             Some(Picked::Nothing(why)) => {
                 let said = format!("{unit}{} ({why})", source.display());
                 say::status(asked.flags.quiet, "Skipping", &said);

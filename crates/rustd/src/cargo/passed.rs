@@ -39,6 +39,7 @@ const PASSING_ENV: &[&str] = &[
     "CLAUDECODE",
     "COMMAND_MODE",
     "RUSTD_ALL_TESTS",
+    "RUSTD_STATS",
     "CARGO_MAKEFLAGS",
 ];
 
