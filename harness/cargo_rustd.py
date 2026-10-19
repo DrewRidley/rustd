@@ -26,6 +26,13 @@ functions the daemon compiled itself are counted.
 Flags. A small workspace made here is built and run with each flag `cargo rustd` passes
 through, cold and after an edit, and compared with cargo the same way.
 
+Picks. In a workspace made here, a failure planted where one kind of test alone reaches it
+(a unit test, an integration test, a target without the harness, a doc test, a test of a
+downstream crate, an impl called through `dyn`, a new test) is run and fails while the tests
+it does not reach are not run, and an edit to `build.rs`, a manifest, an `include_str!` file
+or a `macro_rules!` runs every test. A test step of a project or of the flags compares as a
+subset of cargo's tests with the same outcomes, among them every test that failed.
+
 Daemon. Started on demand, reused, shared by a git worktree, alive after its client is
 killed, replaced when the client is another build of rustd, gone when idle, and its workers
 gone with it.
@@ -618,6 +625,177 @@ def flags(work):
     _, counted = ours.cargo("status")
     ours.cargo("stop")
     return rows, wrong, counted.stdout
+
+
+PICK_LIB = """pub static GREETING: &str = include_str!("../greeting.txt");
+
+pub fn unit_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn integration_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn harnessless_only(x: u32) -> u32 {
+    x + 1
+}
+
+/// ```
+/// assert_eq!(corelib::doc_only(1), 2);
+/// ```
+pub fn doc_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub fn downstream_only(x: u32) -> u32 {
+    x + 1
+}
+
+pub trait Shape {
+    fn area(&self) -> u32;
+}
+
+struct Square(u32);
+
+impl Shape for Square {
+    fn area(&self) -> u32 {
+        self.0 * self.0
+    }
+}
+
+fn square() -> Box<dyn Shape> {
+    Box::new(Square(3))
+}
+
+pub fn shapes() -> Vec<Box<dyn Shape>> {
+    vec![square()]
+}
+
+pub fn total(shapes: &[Box<dyn Shape>]) -> u32 {
+    shapes.iter().map(|it| it.area()).sum()
+}
+
+macro_rules! three {
+    () => {
+        3
+    };
+}
+
+pub fn macro_value() -> u32 {
+    three!()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit() {
+        assert_eq!(super::unit_only(1), 2);
+    }
+
+    #[test]
+    fn unrelated() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+"""
+
+PICK_WORKSPACE = {
+    "Cargo.toml": '[workspace]\nmembers = ["corelib", "app"]\nresolver = "2"\n',
+    "corelib/Cargo.toml": '[package]\nname = "corelib"\nversion = "0.1.0"\nedition = "2021"\n\n[[test]]\nname = "plain"\nharness = false\n',
+    "corelib/build.rs": 'fn main() {\n    println!("cargo:rerun-if-changed=build.rs");\n}\n',
+    "corelib/greeting.txt": "hi\n",
+    "corelib/src/lib.rs": PICK_LIB,
+    "corelib/tests/it.rs": '#[test]\nfn integration() {\n    assert_eq!(corelib::integration_only(1), 2);\n}\n\n#[test]\nfn other() {\n    assert_eq!(2, 2);\n}\n',
+    "corelib/tests/plain.rs": 'fn main() {\n    assert_eq!(corelib::harnessless_only(1), 2);\n}\n',
+    "corelib/tests/shapes.rs": '#[test]\nfn dyn_area() {\n    assert_eq!(corelib::total(&corelib::shapes()), 9);\n}\n',
+    "corelib/tests/greet.rs": '#[test]\nfn greets() {\n    assert_eq!(corelib::GREETING, "hi\\n");\n}\n\n#[test]\nfn macro_three() {\n    assert_eq!(corelib::macro_value(), 3);\n}\n',
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ncorelib = { path = "../corelib" }\n',
+    "app/src/lib.rs": 'pub fn app_value() -> u32 {\n    corelib::downstream_only(1)\n}\n',
+    "app/tests/app.rs": '#[test]\nfn downstream() {\n    assert_eq!(app::app_value(), 2);\n}\n',
+}
+
+ALL_PICK_TESTS = {"tests::unit", "tests::unrelated", "integration", "other", "dyn_area", "greets", "macro_three", "downstream"}
+
+# Each: what is edited, the file, the text and what takes its place, the test that is to fail
+# (`plain` for the target without the harness, `doc` for the doc test), and whether every
+# test is to run.
+PICK_CASES = [
+    ("unit test", "corelib/src/lib.rs", "unit_only(x: u32) -> u32 {\n    x + 1", "unit_only(x: u32) -> u32 {\n    x + 2", "tests::unit", False),
+    ("integration test", "corelib/src/lib.rs", "integration_only(x: u32) -> u32 {\n    x + 1", "integration_only(x: u32) -> u32 {\n    x + 2", "integration", False),
+    ("harness = false", "corelib/src/lib.rs", "harnessless_only(x: u32) -> u32 {\n    x + 1", "harnessless_only(x: u32) -> u32 {\n    x + 2", "plain", False),
+    ("doc test", "corelib/src/lib.rs", "doc_only(x: u32) -> u32 {\n    x + 1", "doc_only(x: u32) -> u32 {\n    x + 2", "doc", False),
+    ("downstream crate", "corelib/src/lib.rs", "downstream_only(x: u32) -> u32 {\n    x + 1", "downstream_only(x: u32) -> u32 {\n    x + 2", "downstream", False),
+    ("impl called through dyn", "corelib/src/lib.rs", "self.0 * self.0", "self.0 * self.0 + 1", "dyn_area", False),
+    ("new test", "corelib/src/lib.rs", "    #[test]\n    fn unrelated()", "    #[test]\n    fn added() {\n        assert_eq!(1, 2);\n    }\n\n    #[test]\n    fn unrelated()", "tests::added", True),
+    ("include_str! data", "corelib/greeting.txt", "hi\n", "hello\n", "greets", True),
+    ("macro_rules!", "corelib/src/lib.rs", "        3\n    };", "        4\n    };", "macro_three", True),
+    ("build.rs", "corelib/build.rs", "fn main() {", "fn main() {\n    // edited", None, True),
+    ("Cargo.toml", "corelib/Cargo.toml", 'edition = "2021"\n', 'edition = "2021"\ndescription = "edited"\n', None, True),
+]
+
+
+def picks(work):
+    """Which tests `cargo rustd test` runs after an edit: a failure planted where one kind of
+    test alone reaches it is run and fails, the tests it does not reach are not run, and an
+    edit rustd can't attribute runs every test. The result is each check with whether it
+    held."""
+    ws = os.path.realpath(os.path.join(work, "picks"))
+    for file, text in PICK_WORKSPACE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ws, check=True, capture_output=True)
+    open(os.path.join(ws, ".gitignore"), "w").write("target\n")
+    git("init", "-q"), git("add", "."), git("commit", "-qm", "first")
+    ours = Side(ws, base_env(os.path.join(work, "home-picks")), True)
+    checks = []
+
+    def check(name, held, detail=""):
+        checks.append((name, bool(held), detail))
+        print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+
+    def test():
+        wait_warm(ours, ws)
+        _, ran = ours.cargo("test", "--no-fail-fast")
+        wait_warm(ours, ws)
+        tests = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
+        doc = re.findall(r"^test \S*src/lib\.rs - doc_only .*\.\.\. (\w+)$", ran.stdout, re.M)
+        if doc:
+            tests["doc"] = doc[0]
+        if re.search(r"Running tests/plain\.rs", ran.stderr):
+            tests["plain"] = "ran"
+        return ran.returncode, tests, ran
+
+    code, tests, _ = test()
+    check("the first run runs every test", code == 0 and ALL_PICK_TESTS <= set(tests), f"{sorted(tests)}")
+    code, tests, _ = test()
+    check("a run with nothing changed runs no test", code == 0 and not set(tests) & ALL_PICK_TESTS, f"{sorted(tests)}")
+    for label, file, old, new, failing, everything in PICK_CASES:
+        path = os.path.join(ws, file)
+        before = open(path).read()
+        open(path, "w").write(before.replace(old, new, 1))
+        code, tests, ran = test()
+        ran_names = {name for name in tests if name in ALL_PICK_TESTS}
+        if failing == "plain":
+            failed = code != 0 and re.search(r"panicked at tests/plain\.rs", ran.stderr) is not None
+        elif failing:
+            failed = code != 0 and tests.get(failing) == "FAILED"
+        else:
+            failed = code == 0
+        if everything:
+            picked = ALL_PICK_TESTS <= ran_names
+        else:
+            # The test that fails, and none that the edit does not reach.
+            picked = not ran_names & {"tests::unrelated", "other", "greets", "macro_three"}
+        check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {'every test runs' if everything else 'the others do not'}", failed and picked, f"exit {code}, ran {sorted(ran_names)}")
+        if failing:
+            again, _, _ = test()
+            check(f"{label}: run again, it fails again", again != 0, f"exit {again}")
+        open(path, "w").write(before)
+        code, tests, _ = test()
+        check(f"{label}: undone, the tests pass", code == 0, f"exit {code}")
+    ours.cargo("stop")
+    return checks
 
 
 def daemon(work):
@@ -1270,6 +1448,9 @@ def main():
         rows, wrong, counted = flags(work)
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
+        print("picks:", flush=True)
+        result["picks"] = picks(work)
+        result["wrong"] += [f"picks: {name} {detail}" for name, held, detail in result["picks"] if not held]
         print("daemon:", flush=True)
         result["daemon"] = daemon(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
@@ -1283,7 +1464,7 @@ def main():
     rows = {(row["project"], row.get("mode", "rustd")): row for row in before.get("projects", []) + result["projects"]}
     result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
     if "--only-projects" in argv:
-        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon", "plain")})
+        result.update({part: before.get(part, []) for part in ("flags", "flags_status", "picks", "daemon", "plain")})
     json.dump(result, open(stored, "w"), indent=1)
     with open(os.path.join(HERE, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
         md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, rustd / cargo alone for the same step; the steps in the second checkout (`tree`) are rustd's only. "
@@ -1298,6 +1479,8 @@ def main():
         if result["flags"]:
             md.write("## Flags\n\n| Round | Command | Built by | Exit | Against cargo |\n|---|---|---|---:|---|\n")
             md.writelines(f"| {label} | `{shown}` | {who} | {code} | {same} |\n" for label, shown, who, code, same in result["flags"])
+        if result.get("picks"):
+            md.write("\n## Which tests run\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["picks"]))
         if result["daemon"]:
             md.write("\n## Daemon\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["daemon"]))
         if result.get("plain"):

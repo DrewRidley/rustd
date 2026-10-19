@@ -5,7 +5,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::Command,
     time::SystemTime,
 };
 
@@ -230,7 +229,8 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
+    let env: rustc_hash::FxHashMap<String, Option<String>> = Default::default();
+    let out = toolchain::command("git", dir, &env).args(args).output().context("running git")?;
     anyhow::ensure!(
         out.status.success(),
         "git {}: {}",

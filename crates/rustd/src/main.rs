@@ -3145,7 +3145,7 @@ struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
     /// For a request to select tests, the file the client wrote the changes to.
-    changes: Option<PathBuf>,
+    changes: Option<Box<Path>>,
 }
 
 impl std::io::Write for &Client {
@@ -3160,7 +3160,7 @@ impl std::io::Write for &Client {
 
 /// What the daemon waits for.
 enum Event {
-    Asked(Asked),
+    Asked(Box<Asked>),
     /// The build of a program is over, with what to tell its clients: nothing when a change
     /// to the source interrupted it.
     Built(usize, Box<Program>, Option<anyhow::Result<Result<String, String>>>),
@@ -3207,7 +3207,7 @@ impl Builds {
         self.stuck = false;
         let (at, program, answer) = match event {
             Event::Asked(asked) => {
-                self.waiting.push_back(asked);
+                self.waiting.push_back(*asked);
                 return Ok(());
             }
             Event::Built(at, program, answer) => (at, program, answer),
@@ -3370,7 +3370,7 @@ fn requested(stream: UnixStream) -> Option<Asked> {
     };
     let mut fields: Vec<&str> = request.split('\t').collect();
     let changes = match Request::parse(fields[0]) {
-        Some(Request::Select) if fields.len() > 1 => Some(PathBuf::from(fields.remove(1))),
+        Some(Request::Select) if fields.len() > 1 => Some(Path::new(fields.remove(1)).into()),
         _ => None,
     };
     let target = Target::parse(&fields[1..]);
@@ -3720,7 +3720,7 @@ fn run(mut args: Args, doc: Option<&doctest::Asked>) -> anyhow::Result<()> {
                     let _open = open;
                     if let Some(request) = requested(stream) {
                         // The daemon is ending when nothing takes requests any more.
-                        let _ = sender.send(Event::Asked(request));
+                        let _ = sender.send(Event::Asked(Box::new(request)));
                     }
                 });
             }

@@ -76,16 +76,17 @@ fn pick(db: &RootDatabase, args: &Args, files: &[WatchedFile], changes: &[Change
         let base = ide_db::base_db::Crate::from(*krate);
         seen.extend(base.transitive_deps(db).into_iter().map(Crate::from));
     }
-    let edited = match edited_functions(db, files, changes, &seen) {
+    let functions = Functions::default();
+    let edited = match edited_functions(db, files, changes, &seen, &functions) {
         Ok(edited) => edited,
         Err(why) => return Picked::Whole(why),
     };
-    let tests = tests_of(db, &own);
+    let tests = tests_of(db, &own, &functions);
     let roots: Vec<(String, DefWithBodyId)> = if tests.is_empty() {
         // A test target without the harness is a program: what its `main` reaches is it.
         let main = own
             .iter()
-            .flat_map(|it| crate::functions_of(db, *it))
+            .flat_map(|it| functions.of(db, *it).to_vec())
             .find(|&it| hir::Function::from(it).is_main(db));
         match main {
             Some(main) => vec![("main".to_owned(), main.into())],
@@ -97,8 +98,18 @@ fn pick(db: &RootDatabase, args: &Args, files: &[WatchedFile], changes: &[Change
     if edited.is_empty() {
         return Picked::Nothing("no function it is compiled from was edited".to_owned());
     }
-    let graph = Graph::new(db, &seen);
-    let reaching = graph.reaching(roots.iter().map(|it| Node::Body(it.1)), &edited);
+    let graph = Graph::new(db, &seen, &functions);
+    let anywhere = run_unnamed(db, &seen, &functions);
+    let all_roots = roots.iter().map(|it| it.1).chain(anywhere.iter().map(|it| it.1));
+    let reaching = graph.reaching(all_roots.map(Node::Body), &edited);
+    // What runs without a call can run under any test.
+    for (shown, body) in &anywhere {
+        if let Some(why) = reaching.get(&Node::Body(*body)) {
+            return Picked::Whole(format!(
+                "{shown} runs without a call that names it, and reaches {why}"
+            ));
+        }
+    }
     if tests.is_empty() {
         return match reaching.get(&Node::Body(roots[0].1)) {
             Some(why) => Picked::Whole(format!("its `main` reaches {why}")),
@@ -119,6 +130,7 @@ fn edited_functions(
     files: &[WatchedFile],
     changes: &[Change],
     seen: &FxHashSet<Crate>,
+    functions: &Functions,
 ) -> Result<FxHashMap<DefWithBodyId, String>, String> {
     let ids: FxHashMap<&Path, vfs::FileId> = files
         .iter()
@@ -157,7 +169,7 @@ fn edited_functions(
         let ranges = edited_bodies(was, text, edition)
             .ok_or_else(|| format!("{shown}: more than the bodies of functions changed"))?;
         for range in ranges {
-            let found = functions_at(db, &crates, file, range);
+            let found = functions_at(db, &crates, file, range, functions);
             if found.is_empty() {
                 return Err(format!("{shown}: an edited function is not one the daemon knows"));
             }
@@ -177,10 +189,11 @@ fn functions_at(
     crates: &[Crate],
     file: vfs::FileId,
     range: TextRange,
+    functions: &Functions,
 ) -> Vec<FunctionId> {
     let mut found = Vec::new();
     for &krate in crates {
-        for func in crate::functions_of(db, krate) {
+        for &func in functions.of(db, krate).iter() {
             if body_file(db, func.into()) != file {
                 continue;
             }
@@ -196,11 +209,90 @@ fn functions_at(
     found
 }
 
+/// The functions of each crate that are asked for, listed once: every function written in
+/// it, the methods of its traits too.
+#[derive(Default)]
+struct Functions(std::cell::RefCell<FxHashMap<Crate, std::rc::Rc<[FunctionId]>>>);
+
+impl Functions {
+    fn of(&self, db: &RootDatabase, krate: Crate) -> std::rc::Rc<[FunctionId]> {
+        if let Some(listed) = self.0.borrow().get(&krate) {
+            return listed.clone();
+        }
+        let mut listed = crate::functions_of(db, krate);
+        for module in krate.modules(db) {
+            let id = hir_def::ModuleId::from(module);
+            for def in id.def_map(db).module(db, id).scope(db).declarations() {
+                let hir_def::ModuleDefId::TraitId(it) = def else { continue };
+                listed.extend(it.trait_items(db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        hir_def::AssocItemId::FunctionId(func) => Some(func),
+                        _ => None,
+                    },
+                ));
+            }
+        }
+        listed.sort_unstable();
+        listed.dedup();
+        let listed: std::rc::Rc<[FunctionId]> = listed.into();
+        self.0.borrow_mut().insert(krate, listed.clone());
+        listed
+    }
+}
+
+/// What runs without a call any test makes that names it, each with how it is shown: the
+/// statics a linker or a runtime finds by their section (`#[used]`, `#[link_section]`, as
+/// `inventory`, `linkme` and `ctor` write them) and the functions exported by name.
+fn run_unnamed(
+    db: &RootDatabase,
+    seen: &FxHashSet<Crate>,
+    functions: &Functions,
+) -> Vec<(String, DefWithBodyId)> {
+    const BY_NAME: &[&str] = &["used", "link_section", "no_mangle", "export_name"];
+    let mut found = Vec::new();
+    for &krate in seen.iter().filter(|it| it.origin(db).is_local()) {
+        for &func in functions.of(db, krate).iter() {
+            if hir_ty::mir::codegen::exported_symbol(db, func).is_some() {
+                let name = hir::Function::from(func).name(db).as_str().to_owned();
+                found.push((format!("the exported `{name}`"), func.into()));
+            }
+        }
+        let mut declared = crate::Declared::default();
+        declared.in_modules(db, krate);
+        while !declared.bodies.is_empty() {
+            for body in std::mem::take(&mut declared.bodies) {
+                if let DefWithBodyId::StaticId(id) = body
+                    && let Some(source) = hir::Static::from(id).source(db)
+                {
+                    let found_by_name = source.value.attrs().any(|attr| {
+                        let text = attr.syntax().text().to_string();
+                        BY_NAME.iter().any(|it| text.contains(it))
+                    });
+                    if found_by_name {
+                        let name = hir::Static::from(id).name(db).as_str().to_owned();
+                        found.push((format!("the static `{name}`"), body));
+                    }
+                }
+                for (_, def_map) in hir_def::expr_store::Body::of(db, body).blocks(db) {
+                    for (_, module) in def_map.modules(db) {
+                        declared.in_scope(db, module.scope(db));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// The tests of the program's crates, by the names the harness gives them.
-fn tests_of(db: &RootDatabase, crates: &[Crate]) -> Vec<(String, FunctionId)> {
+fn tests_of(
+    db: &RootDatabase,
+    crates: &[Crate],
+    functions: &Functions,
+) -> Vec<(String, FunctionId)> {
     let mut tests = Vec::new();
     for &krate in crates {
-        for id in crate::functions_of(db, krate) {
+        for &id in functions.of(db, krate).iter() {
             let function = hir::Function::from(id);
             if !function.is_test(db) && !function.is_bench(db) {
                 continue;
@@ -377,7 +469,7 @@ struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
-    fn new(db: &'a RootDatabase, seen: &'a FxHashSet<Crate>) -> Graph<'a> {
+    fn new(db: &'a RootDatabase, seen: &'a FxHashSet<Crate>, functions: &Functions) -> Graph<'a> {
         let mut graph = Graph {
             db,
             seen,
@@ -388,7 +480,7 @@ impl<'a> Graph<'a> {
         let mut headers: FxHashMap<ImplId, (Option<AdtId>, FxHashSet<AdtId>, bool)> =
             FxHashMap::default();
         for &krate in seen.iter().filter(|it| it.origin(db).is_local()) {
-            for func in crate::functions_of(db, krate) {
+            for &func in functions.of(db, krate).iter() {
                 let ItemContainerId::ImplId(id) = func.lookup(db).container else { continue };
                 let Some(trait_ref) = db.impl_trait(id) else { continue };
                 let trait_id = trait_ref.skip_binder().def_id.0;
@@ -489,8 +581,8 @@ impl<'a> Graph<'a> {
         while let Some(node) = queue.pop() {
             let why = reaching[&node].clone();
             for &caller in callers.get(&node).into_iter().flatten() {
-                if !reaching.contains_key(&caller) {
-                    reaching.insert(caller, why.clone());
+                if let std::collections::hash_map::Entry::Vacant(it) = reaching.entry(caller) {
+                    it.insert(why.clone());
                     queue.push(caller);
                 }
             }

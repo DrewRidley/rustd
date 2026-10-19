@@ -102,13 +102,12 @@ pub(crate) fn tests(
         };
         let mut passed = true;
         for names in runs {
-            let mut command = Command::new(&test.executable);
+            let mut command = harness_of(test);
             if names.is_empty() {
                 command.args(asked.program_args());
             } else {
                 command.arg("--exact").args(names).args(&asked.trailing);
             }
-            command.envs(test.env.iter().cloned()).current_dir(&test.package_dir);
             as_built(&mut command)?;
             let status = command.status().with_context(|| format!("could not execute {shown}"))?;
             passed &= status.success();
@@ -147,9 +146,8 @@ fn to_run(
     known: &[String],
     run: &[(String, String)],
 ) -> Result<Vec<String>, String> {
-    let mut command = Command::new(&test.executable);
-    command.args(["--list", "--format", "terse"]).envs(test.env.iter().cloned());
-    command.current_dir(&test.package_dir).stderr(std::process::Stdio::null());
+    let mut command = harness_of(test);
+    command.args(["--list", "--format", "terse"]).stderr(std::process::Stdio::null());
     as_built(&mut command).map_err(|it| it.to_string())?;
     let out = command.output().map_err(|it| it.to_string())?;
     if !out.status.success() {
@@ -203,6 +201,14 @@ pub(crate) fn only_doc_tests(args: &[String]) -> anyhow::Result<i32> {
     cargo.arg("test").args(args);
     as_built(&mut cargo)?;
     Ok(exit_code(cargo.status().context("running `cargo test --doc`")?))
+}
+
+/// The test executable, to run as cargo does: in the directory of its package, with what
+/// cargo sets for it.
+fn harness_of(test: &Program) -> Command {
+    let mut command = Command::new(&test.executable);
+    command.envs(test.env.iter().cloned()).current_dir(&test.package_dir);
+    command
 }
 
 /// The flags that have cargo run this test target alone.
