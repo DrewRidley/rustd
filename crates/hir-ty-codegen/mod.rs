@@ -90,8 +90,8 @@ use backend::Step;
 mod cached;
 mod debuginfo;
 mod deps;
-pub use deps::{BodyDeps, body_deps, field_adts, impl_header_adts};
 pub use debuginfo::Sidecar;
+pub use deps::{BodyDeps, body_deps, field_adts, impl_header_adts};
 mod float_pair;
 mod fragment;
 #[cfg(test)]

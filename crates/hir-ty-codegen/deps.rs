@@ -12,10 +12,7 @@ use hir_def::{
     resolver::{HasResolver, ValueNs},
 };
 use rustc_hash::FxHashSet;
-use rustc_type_ir::{
-    TypeSuperVisitable, TypeVisitable, TypeVisitor,
-    inherent::IntoKind,
-};
+use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor, inherent::IntoKind};
 
 use crate::{
     InferBodyId, InferenceResult,
@@ -69,7 +66,12 @@ pub fn body_deps(db: &dyn HirDatabase, def: DefWithBodyId) -> BodyDeps {
 }
 
 /// Adds the statics and constants the body names to `deps`.
-fn named(db: &dyn HirDatabase, def: DefWithBodyId, infer: &InferenceResult<'_>, deps: &mut BodyDeps) {
+fn named(
+    db: &dyn HirDatabase,
+    def: DefWithBodyId,
+    infer: &InferenceResult<'_>,
+    deps: &mut BodyDeps,
+) {
     let body = Body::of(db, def);
     let mut resolver = def.resolver(db);
     let read = |value: Option<ValueNs>, deps: &mut BodyDeps| match value {
