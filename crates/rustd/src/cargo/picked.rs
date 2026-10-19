@@ -173,16 +173,6 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
             whole[at].get_or_insert_with(|| why.clone());
         }
     }
-    // An integration test runs the programs of its package, which no call of it names.
-    for program in state.programs.iter().filter(|it| it.kind == Kind::Bin && !it.test) {
-        let Some(path) = changed.iter().find(|it| program.inputs().contains(it)) else { continue };
-        let why = format!("it can run `{}`, compiled from {}", program.name, path.display());
-        for (at, test) in state.programs.iter().enumerate() {
-            if matches!(test.kind, Kind::Test | Kind::Bench) && test.package == program.package {
-                whole[at].get_or_insert_with(|| why.clone());
-            }
-        }
-    }
     // A package without the unit tests of a library is one whose doc tests rustd can't
     // tell from cargo's list; cargo refuses `--doc` for one with no library.
     let libraries =
@@ -197,6 +187,27 @@ pub(crate) fn pick(asked: &Invocation, state: &State, by_daemon: bool, unsynced:
         false => selected(state, &sources, &texts, &now, unsynced),
     };
     picks.took = (!sources.is_empty()).then(|| asked_at.elapsed());
+    // An integration test runs the programs of its package, which no call of it names: it
+    // runs whole when the `main` of one reaches an edit.
+    let programs =
+        state.programs.iter().enumerate().filter(|(_, it)| it.kind == Kind::Bin && !it.test);
+    for (at, program) in programs {
+        let Some(path) = changed.iter().find(|it| program.inputs().contains(it)) else { continue };
+        let said =
+            program.asked_as.and_then(|(checkout, place)| selected.get(checkout)?.get(place));
+        let why = match (&whole[at], said) {
+            (None, Some(Picked::Program(None) | Picked::Nothing(_))) => continue,
+            (None, Some(Picked::Program(Some(reaches)))) => {
+                format!("it can run `{}`, whose `main` reaches {reaches}", program.name)
+            }
+            _ => format!("it can run `{}`, compiled from {}", program.name, path.display()),
+        };
+        for (at, test) in state.programs.iter().enumerate() {
+            if matches!(test.kind, Kind::Test | Kind::Bench) && test.package == program.package {
+                whole[at].get_or_insert_with(|| why.clone());
+            }
+        }
+    }
     for (at, program) in state.programs.iter().enumerate() {
         let reads_source = sources.iter().any(|it| program.inputs().contains(it));
         picks.programs[at] = Some(match (whole[at].take(), program.asked_as) {

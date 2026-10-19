@@ -660,6 +660,10 @@ pub fn downstream_only(x: u32) -> u32 {
     x + 1
 }
 
+pub fn program_only(x: u32) -> u32 {
+    x + 1
+}
+
 pub trait Shape {
     fn area(&self) -> u32;
 }
@@ -694,6 +698,10 @@ pub fn macro_value() -> u32 {
     three!()
 }
 
+pub fn configured() -> u32 {
+    7
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -720,13 +728,15 @@ PICK_WORKSPACE = {
     "corelib/tests/it.rs": '#[test]\nfn integration() {\n    assert_eq!(corelib::integration_only(1), 2);\n}\n\n#[test]\nfn other() {\n    assert_eq!(2, 2);\n}\n',
     "corelib/tests/plain.rs": 'fn main() {\n    assert_eq!(corelib::harnessless_only(1), 2);\n}\n',
     "corelib/tests/shapes.rs": '#[test]\nfn dyn_area() {\n    assert_eq!(corelib::total(&corelib::shapes()), 9);\n}\n',
-    "corelib/tests/greet.rs": '#[test]\nfn greets() {\n    assert_eq!(corelib::GREETING, "hi\\n");\n}\n\n#[test]\nfn macro_three() {\n    assert_eq!(corelib::macro_value(), 3);\n}\n',
+    "corelib/tests/greet.rs": '#[test]\nfn greets() {\n    assert_eq!(corelib::GREETING, "hi\\n");\n}\n\n#[test]\nfn macro_three() {\n    assert_eq!(corelib::macro_value(), 3);\n}\n\n#[test]\nfn configured() {\n    assert_eq!(corelib::configured(), 7);\n}\n',
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ncorelib = { path = "../corelib" }\n',
     "app/src/lib.rs": 'pub fn app_value() -> u32 {\n    corelib::downstream_only(1)\n}\n',
+    "app/src/main.rs": 'fn main() {\n    println!("{}", corelib::program_only(1));\n}\n',
+    "app/tests/cli.rs": '#[test]\nfn runs_the_program() {\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_app")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "2");\n}\n',
     "app/tests/app.rs": '#[test]\nfn downstream() {\n    assert_eq!(app::app_value(), 2);\n}\n\n#[test]\nfn versioned() {\n    assert_eq!(corelib::version(), "1");\n}\n\n#[test]\nfn answered() {\n    assert_eq!(corelib::answer(), 42);\n}\n',
 }
 
-ALL_PICK_TESTS = {"tests::unit", "tests::unrelated", "integration", "other", "dyn_area", "greets", "macro_three", "downstream", "versioned", "answered"}
+ALL_PICK_TESTS = {"configured", "tests::unit", "tests::unrelated", "integration", "other", "dyn_area", "greets", "macro_three", "downstream", "versioned", "answered", "runs_the_program"}
 
 # Each: what is edited, the file, the text and what takes its place, the test that is to fail
 # (`plain` for the target without the harness, `doc` for the doc test), and whether every
@@ -737,10 +747,12 @@ PICK_CASES = [
     ("harness = false", "corelib/src/lib.rs", "harnessless_only(x: u32) -> u32 {\n    x + 1", "harnessless_only(x: u32) -> u32 {\n    x + 2", "plain", False),
     ("doc test", "corelib/src/lib.rs", "doc_only(x: u32) -> u32 {\n    x + 1", "doc_only(x: u32) -> u32 {\n    x + 2", "doc", False),
     ("downstream crate", "corelib/src/lib.rs", "downstream_only(x: u32) -> u32 {\n    x + 1", "downstream_only(x: u32) -> u32 {\n    x + 2", "downstream", False),
+    ("a program an integration test runs", "corelib/src/lib.rs", "program_only(x: u32) -> u32 {\n    x + 1", "program_only(x: u32) -> u32 {\n    x + 2", "runs_the_program", False),
     ("impl called through dyn", "corelib/src/lib.rs", "self.0 * self.0", "self.0 * self.0 + 1", "dyn_area", False),
     ("new test", "corelib/src/lib.rs", "    #[test]\n    fn unrelated()", "    #[test]\n    fn added() {\n        assert_eq!(1, 2);\n    }\n\n    #[test]\n    fn unrelated()", "tests::added", True),
     ("include_str! data", "corelib/greeting.txt", "hi\n", "hello\n", "greets", True),
     ("macro_rules!", "corelib/src/lib.rs", "        3\n    };", "        4\n    };", "macro_three", True),
+    ("cfg", "corelib/src/lib.rs", "pub fn configured() -> u32 {\n    7\n}", "#[cfg(not(test))]\npub fn configured() -> u32 {\n    8\n}\n\n#[cfg(test)]\npub fn configured() -> u32 {\n    7\n}", "configured", True),
     ("proc macro", "macros/src/lib.rs", "    42", "    43", "answered", True),
     ("a file a build script reads", "corelib/version.txt", "1\n", "2\n", "versioned", True),
     ("build.rs", "corelib/build.rs", "fn main() {", "fn main() {\n    // edited", None, True),
@@ -801,7 +813,12 @@ def picks(work):
             picked = ALL_PICK_TESTS <= ran_names
         else:
             # The test that fails, and none that the edit does not reach.
-            picked = not ran_names & {"tests::unrelated", "other", "greets", "macro_three", "versioned", "answered"}
+            # The tests of `app` run whole when its program changed, which the test of the
+            # program is for.
+            unreached = {"tests::unrelated", "other", "greets", "macro_three", "configured"}
+            if failing != "runs_the_program":
+                unreached |= {"versioned", "answered", "runs_the_program"}
+            picked = not ran_names & unreached
         check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {'every test runs' if everything else 'the others do not'}", failed and picked, f"exit {code}, ran {sorted(ran_names)}")
         if failing:
             again, _, _ = test()
