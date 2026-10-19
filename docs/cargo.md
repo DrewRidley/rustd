@@ -89,7 +89,9 @@ tests again, and more if more changed.
 
 Whatever can't be told runs. Every test runs when:
 
-- no run of every test has passed yet, `--full` or `RUSTD_ALL_TESTS` is given, or tests are
+- no run of every test has passed yet (the first run of a command line, which cargo builds
+  with nothing looked at before, is not kept, so the second runs every test too), `--full`
+  or `RUSTD_ALL_TESTS` is given, or tests are
   picked by name or with harness flags such as `--ignored` or `--skip` (and such a run is not
   kept as one that passed);
 - `Cargo.toml`, `Cargo.lock`, a `build.rs`, a toolchain file or `.cargo/config*` changed,

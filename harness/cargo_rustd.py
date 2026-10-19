@@ -627,7 +627,9 @@ def flags(work):
     return rows, wrong, counted.stdout
 
 
-PICK_LIB = """pub static GREETING: &str = include_str!("../greeting.txt");
+PICK_LIB = """pub mod extra;
+
+pub static GREETING: &str = include_str!("../greeting.txt");
 
 pub fn version() -> &'static str {
     env!("CORELIB_VERSION")
@@ -724,6 +726,7 @@ PICK_WORKSPACE = {
     "macros/Cargo.toml": '[package]\nname = "macros"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nproc-macro = true\n',
     "macros/src/lib.rs": 'use proc_macro::TokenStream;\n\nfn value() -> u32 {\n    42\n}\n\n#[proc_macro]\npub fn answer(_: TokenStream) -> TokenStream {\n    value().to_string().parse().unwrap()\n}\n',
     "corelib/greeting.txt": "hi\n",
+    "corelib/src/extra.rs": "pub fn extra() -> u32 {\n    1\n}\n",
     "corelib/src/lib.rs": PICK_LIB,
     "corelib/tests/it.rs": '#[test]\nfn integration() {\n    assert_eq!(corelib::integration_only(1), 2);\n}\n\n#[test]\nfn other() {\n    assert_eq!(2, 2);\n}\n',
     "corelib/tests/plain.rs": 'fn main() {\n    assert_eq!(corelib::harnessless_only(1), 2);\n}\n',
@@ -733,10 +736,15 @@ PICK_WORKSPACE = {
     "app/src/lib.rs": 'pub fn app_value() -> u32 {\n    corelib::downstream_only(1)\n}\n',
     "app/src/main.rs": 'fn main() {\n    println!("{}", corelib::program_only(1));\n}\n',
     "app/tests/cli.rs": '#[test]\nfn runs_the_program() {\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_app")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "2");\n}\n',
+    "testdata/golden.txt": "gold\n",
+    "app/tests/golden.rs": '#[test]\nfn golden() {\n    let text = std::fs::read_to_string("../testdata/golden.txt").unwrap();\n    assert_eq!(text.trim(), "gold");\n}\n',
+    "corelib/fixture.local": "ok\n",
+    "corelib/tests/ui/case.rs": "// ok\nfn main() {}\n",
+    "corelib/tests/local.rs": '#[test]\nfn local_fixture() {\n    assert_eq!(std::fs::read_to_string("fixture.local").unwrap().trim(), "ok");\n}\n\n#[test]\nfn ui_case() {\n    assert!(std::fs::read_to_string("tests/ui/case.rs").unwrap().contains("ok"));\n}\n\n#[test]\nfn env_free() {\n    assert!(std::env::var("PICKS_FAIL").is_err());\n}\n',
     "app/tests/app.rs": '#[test]\nfn downstream() {\n    assert_eq!(app::app_value(), 2);\n}\n\n#[test]\nfn versioned() {\n    assert_eq!(corelib::version(), "1");\n}\n\n#[test]\nfn answered() {\n    assert_eq!(corelib::answer(), 42);\n}\n',
 }
 
-ALL_PICK_TESTS = {"configured", "tests::unit", "tests::unrelated", "integration", "other", "dyn_area", "greets", "macro_three", "downstream", "versioned", "answered", "runs_the_program"}
+ALL_PICK_TESTS = {"golden", "local_fixture", "ui_case", "env_free", "configured", "tests::unit", "tests::unrelated", "integration", "other", "dyn_area", "greets", "macro_three", "downstream", "versioned", "answered", "runs_the_program"}
 
 # Each: what is edited, the file, the text and what takes its place, the test that is to fail
 # (`plain` for the target without the harness, `doc` for the doc test), and whether every
@@ -757,6 +765,11 @@ PICK_CASES = [
     ("a file a build script reads", "corelib/version.txt", "1\n", "2\n", "versioned", True),
     ("build.rs", "corelib/build.rs", "fn main() {", "fn main() {\n    // edited", None, True),
     ("workspace Cargo.toml", "Cargo.toml", 'resolver = "2"\n', 'resolver = "2"\n\n[workspace.metadata]\nedited = true\n', None, True),
+    # A file a test reads as it runs, which rustc does not: outside every package, ignored
+    # by git, and Rust source no target is compiled from.
+    ("a file outside every package", "testdata/golden.txt", "gold\n", "lead\n", "golden", "any"),
+    ("a file git ignores", "corelib/fixture.local", "ok\n", "no\n", "local_fixture", "any"),
+    ("Rust source no target is compiled from", "corelib/tests/ui/case.rs", "// ok", "// no", "ui_case", "any"),
     ("Cargo.toml", "corelib/Cargo.toml", 'edition = "2021"\n', 'edition = "2021"\ndescription = "edited"\n', None, True),
 ]
 
@@ -771,9 +784,11 @@ def picks(work):
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
     git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ws, check=True, capture_output=True)
-    open(os.path.join(ws, ".gitignore"), "w").write("target\n")
+    open(os.path.join(ws, ".gitignore"), "w").write("target\ncorelib/fixture.local\n")
     git("init", "-q"), git("add", "."), git("commit", "-qm", "first")
     ours = Side(ws, base_env(os.path.join(work, "home-picks")), True)
+    unit = os.path.join(ws, "corelib/src/lib.rs")
+    failing_unit = lambda text: text.replace(PICK_CASES[0][2], PICK_CASES[0][2].replace("+ 1", "+ 3"), 1)
     checks = []
 
     def check(name, held, detail=""):
@@ -795,6 +810,9 @@ def picks(work):
 
     code, tests, _ = test()
     check("the first run runs every test", code == 0 and ALL_PICK_TESTS <= set(tests), f"{sorted(tests)}")
+    # Nothing was looked at before cargo first built, so that run is not kept as passing.
+    code, tests, _ = test()
+    check("the second run runs every test", code == 0 and ALL_PICK_TESTS <= set(tests), f"{sorted(tests)}")
     code, tests, _ = test()
     check("a run with nothing changed runs no test", code == 0 and not set(tests) & ALL_PICK_TESTS, f"{sorted(tests)}")
     for label, file, old, new, failing, everything in PICK_CASES:
@@ -809,23 +827,53 @@ def picks(work):
             failed = code != 0 and tests.get(failing) == "FAILED"
         else:
             failed = code == 0
-        if everything:
+        if everything == "any":
+            picked = True
+        elif everything:
             picked = ALL_PICK_TESTS <= ran_names
         else:
             # The test that fails, and none that the edit does not reach.
             # The tests of `app` run whole when its program changed, which the test of the
             # program is for.
-            unreached = {"tests::unrelated", "other", "greets", "macro_three", "configured"}
+            unreached = {"tests::unrelated", "other", "greets", "macro_three", "configured", "local_fixture", "ui_case", "env_free"}
             if failing != "runs_the_program":
-                unreached |= {"versioned", "answered", "runs_the_program"}
+                unreached |= {"versioned", "answered", "runs_the_program", "golden"}
             picked = not ran_names & unreached
-        check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {'every test runs' if everything else 'the others do not'}", failed and picked, f"exit {code}, ran {sorted(ran_names)}")
+        runs = {True: "every test runs", False: "the others do not", "any": "it runs"}[everything]
+        check(f"{label}: the edit's test {'fails' if failing else 'passes'}, {runs}", failed and picked, f"exit {code}, ran {sorted(ran_names)}")
         if failing:
             again, _, _ = test()
             check(f"{label}: run again, it fails again", again != 0, f"exit {again}")
         open(path, "w").write(before)
         code, tests, _ = test()
         check(f"{label}: undone, the tests pass", code == 0, f"exit {code}")
+    # An edit that leaves the size and the time of the file as they were, with one to
+    # another file of the crate that has it compiled again.
+    before = open(unit).read()
+    extra = os.path.join(ws, "corelib/src/extra.rs")
+    held = os.stat(unit)
+    open(unit, "w").write(failing_unit(before))
+    os.utime(unit, ns=(held.st_atime_ns, held.st_mtime_ns))
+    open(extra, "w").write(PICK_WORKSPACE["corelib/src/extra.rs"].replace("1", "2"))
+    code, tests, _ = test()
+    check("an edit that keeps the size and the time: the edit's test fails", code != 0 and tests.get("tests::unit") == "FAILED", f"exit {code}, ran {sorted(set(tests) & ALL_PICK_TESTS)}")
+    open(unit, "w").write(before)
+    open(extra, "w").write(PICK_WORKSPACE["corelib/src/extra.rs"])
+    test()
+    # An edit saved once the build is done, while the tests are picked and run: the tests ran on
+    # the build before it, so it is not taken as passing.
+    command = ours.argv("test", "--no-fail-fast")
+    running = subprocess.Popen(command, cwd=ws, env=ours.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in running.stderr:
+        if "Finished" in line:
+            open(unit, "w").write(failing_unit(before))
+            break
+    running.communicate()
+    wait_warm(ours, ws)
+    code, tests, _ = test()
+    check("an edit saved while the tests run: the next run runs its test, which fails", code != 0 and tests.get("tests::unit") == "FAILED", f"exit {code}, ran {sorted(set(tests) & ALL_PICK_TESTS)}")
+    open(unit, "w").write(before)
+    test()
     # The lock file as cargo writes it, once it is there: whatever changes in it runs all.
     lock = os.path.join(ws, "Cargo.lock")
     before = open(lock).read()
@@ -843,6 +891,11 @@ def picks(work):
     since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
     check("--since HEAD: the edit's test fails, the others do not", ran.returncode != 0 and set(since) & ALL_PICK_TESTS == {"tests::unit"}, f"ran {sorted(since)}")
     open(path, "w").write(before)
+    wait_warm(ours, ws)
+    # A variable that was not there when the tests passed, which a test reads.
+    _, ran = ours.cargo("test", "--no-fail-fast", "--since", "HEAD", env={"PICKS_FAIL": "1"})
+    since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
+    check("--since HEAD with another variable: every test runs, and the one that reads it fails", ran.returncode != 0 and since.get("env_free") == "FAILED", f"exit {ran.returncode}")
     wait_warm(ours, ws)
     _, ran = ours.cargo("test", "--no-fail-fast", "--since", "no-such-commit")
     since = dict(re.findall(r"^test (\S+) \.\.\. (\w+)$", ran.stdout, re.M))
