@@ -120,8 +120,10 @@ pub(crate) fn tests(
         }
     }
     if picks.some() {
+        let told =
+            picks.took.map(|it| format!(", told in {:.2}s", it.as_secs_f64())).unwrap_or_default();
         let said = format!(
-            "{ran} test executables, {skipped} not reached by the edits; `--full` runs all"
+            "{ran} test executables, {skipped} not reached by the edits{told}; `--full` runs all"
         );
         say::status(asked.flags.quiet, "Picked", &said);
     }
@@ -208,7 +210,43 @@ pub(crate) fn only_doc_tests(args: &[String]) -> anyhow::Result<i32> {
 fn harness_of(test: &Program) -> Command {
     let mut command = Command::new(&test.executable);
     command.envs(test.env.iter().cloned()).current_dir(&test.package_dir);
+    command.env(DYLIB_PATH, dylib_path(&test.executable));
     command
+}
+
+/// The variable the loader finds shared libraries by.
+const DYLIB_PATH: &str = if cfg!(windows) {
+    "PATH"
+} else if cfg!(target_os = "macos") {
+    "DYLD_FALLBACK_LIBRARY_PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
+/// Where a test executable finds the shared libraries it links, as cargo has it: next to it,
+/// and in the toolchain's library of the host, which a proc macro's unit tests link `std`
+/// from; then where the variable said already.
+fn dylib_path(executable: &Path) -> std::ffi::OsString {
+    static HOST_LIBRARY: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let env: rustc_hash::FxHashMap<String, Option<String>> = Default::default();
+            let mut print = toolchain::command(rustc, ".", &env);
+            let out = print.args(["--print", "target-libdir"]).output().ok()?;
+            let dir = String::from_utf8(out.stdout).ok()?;
+            out.status.success().then(|| dir.trim_end().into())
+        });
+    let mut dirs: Vec<std::path::PathBuf> =
+        executable.parent().map(Path::to_owned).into_iter().collect();
+    dirs.extend(HOST_LIBRARY.clone());
+    if let Some(already) = std::env::var_os(DYLIB_PATH) {
+        dirs.extend(std::env::split_paths(&already));
+    } else if cfg!(target_os = "macos") {
+        // What the loader looks in when the variable is not set, which setting it replaces.
+        let home = std::env::var_os("HOME").map(|it| Path::new(&it).join("lib"));
+        dirs.extend(home.into_iter().chain(["/usr/local/lib".into(), "/usr/lib".into()]));
+    }
+    std::env::join_paths(dirs).unwrap_or_default()
 }
 
 /// The flags that have cargo run this test target alone.
