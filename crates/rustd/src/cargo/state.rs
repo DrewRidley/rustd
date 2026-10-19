@@ -637,6 +637,11 @@ impl Program {
         std::iter::once(&*self.executable).chain(self.names.iter().map(|it| &**it))
     }
 
+    /// The source files of the workspace it is compiled from, its libraries' too.
+    pub(crate) fn inputs(&self) -> &[PathBuf] {
+        &self.inputs
+    }
+
     /// The first of its source files that was written after `built_at`.
     fn newer_input(&self, built_at: u128) -> Option<&Path> {
         let newer = |file: &&PathBuf| written_at(file).is_some_and(|it| it > built_at);
